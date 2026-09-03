@@ -1,0 +1,209 @@
+from __future__ import annotations
+
+import unittest
+from copy import deepcopy
+from dataclasses import dataclass
+from datetime import datetime, timezone
+
+from backend.flask.competitors.repository import CompetitorRepository
+from backend.flask.database.connection import MongoConfigurationError, MongoSettings
+from backend.flask.website_monitoring.repository import MonitoringTargetRepository
+
+try:
+    from bson import ObjectId
+except ImportError:
+    ObjectId = None
+
+
+@dataclass
+class _InsertResult:
+    inserted_id: str
+
+
+@dataclass
+class _WriteResult:
+    matched_count: int = 1
+    deleted_count: int = 1
+
+
+class _Cursor(list):
+    def sort(self, fields):
+        for field, direction in reversed(fields):
+            super().sort(key=lambda document: document.get(field), reverse=direction < 0)
+        return self
+
+
+class _FakeCollection:
+    def __init__(self):
+        self.documents = []
+        self.indexes = []
+        self._next_id = 1
+
+    def create_index(self, keys, **options):
+        self.indexes.append((keys, options))
+        return options.get("name")
+
+    def insert_one(self, document):
+        stored = deepcopy(document)
+        raw_id = f"{self._next_id:024x}"
+        stored["_id"] = ObjectId(raw_id) if ObjectId else f"id-{self._next_id}"
+        self._next_id += 1
+        self.documents.append(stored)
+        return _InsertResult(stored["_id"])
+
+    def find_one(self, query):
+        for document in self.documents:
+            if _matches(document, query):
+                return deepcopy(document)
+        return None
+
+    def find(self, query):
+        return _Cursor(
+            deepcopy(document)
+            for document in self.documents
+            if _matches(document, query)
+        )
+
+    def update_one(self, query, update):
+        for document in self.documents:
+            if _matches(document, query):
+                document.update(deepcopy(update["$set"]))
+                return _WriteResult(matched_count=1)
+        return _WriteResult(matched_count=0)
+
+    def delete_one(self, query):
+        for index, document in enumerate(self.documents):
+            if _matches(document, query):
+                del self.documents[index]
+                return _WriteResult(deleted_count=1)
+        return _WriteResult(deleted_count=0)
+
+
+class _FakeDatabase:
+    def __init__(self):
+        self.collections = {}
+
+    def __getitem__(self, name):
+        return self.collections.setdefault(name, _FakeCollection())
+
+
+def _matches(document, query):
+    return all(document.get(field) == value for field, value in query.items())
+
+
+class RepositoryTests(unittest.TestCase):
+    def setUp(self):
+        database = _FakeDatabase()
+        self.competitors = CompetitorRepository.from_database(database)
+        self.targets = MonitoringTargetRepository.from_database(database)
+        self.timestamp = datetime(2026, 9, 3, tzinfo=timezone.utc)
+
+    def test_ensure_indexes_defines_tenant_and_target_indexes(self):
+        self.competitors.ensure_indexes()
+        self.targets.ensure_indexes()
+
+        competitor_names = {options["name"] for _, options in self.competitors.collection.indexes}
+        target_names = {options["name"] for _, options in self.targets.collection.indexes}
+        self.assertEqual(
+            competitor_names,
+            {"uq_competitors_user_website_url", "ix_competitors_user_active"},
+        )
+        self.assertEqual(
+            target_names,
+            {
+                "uq_monitoring_targets_competitor_url",
+                "ix_monitoring_targets_competitor_active",
+                "ix_monitoring_targets_competitor_discovery_status",
+                "ix_monitoring_targets_scheduler",
+            },
+        )
+
+    def test_competitor_crud_is_tenant_scoped(self):
+        created = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+
+        self.assertTrue(created["id"])
+        self.assertEqual(self.competitors.get(created["id"], user_id="company-b"), None)
+        self.assertEqual(len(self.competitors.list_for_user("company-a")), 1)
+
+        updated = self.competitors.update(
+            created["id"],
+            user_id="company-a",
+            name="Updated Example",
+            active=False,
+        )
+        self.assertEqual(updated["name"], "Updated Example")
+        self.assertFalse(updated["active"])
+        self.assertEqual(len(self.competitors.list_for_user("company-a", active=True)), 0)
+        self.assertTrue(self.competitors.delete(created["id"], user_id="company-a"))
+        self.assertIsNone(self.competitors.get(created["id"], user_id="company-a"))
+
+    def test_monitoring_target_preserves_discovery_metadata(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+        target = self.targets.create(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/blog/123",
+            url="https://example.com/blog",
+            page_type="BLOG",
+            discovery_source="SITEMAP",
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+            check_interval_minutes=180,
+            now=self.timestamp,
+        )
+
+        self.assertEqual(target["competitor_id"], competitor["id"])
+        self.assertEqual(target["raw_url"], "https://example.com/blog/123")
+        self.assertEqual(target["discovery_status"], "SUGGESTED")
+        self.assertEqual(
+            self.targets.list_for_competitor(
+                competitor["id"], discovery_status="SUGGESTED"
+            )[0]["id"],
+            target["id"],
+        )
+
+        updated = self.targets.update(
+            target["id"],
+            competitor_id=competitor["id"],
+            active=True,
+            check_interval_minutes=60,
+        )
+        self.assertEqual(updated["check_interval_minutes"], 60)
+        self.assertTrue(updated["active"])
+
+    def test_invalid_persisted_values_are_rejected(self):
+        with self.assertRaises(ValueError):
+            self.competitors.create(
+                user_id="company-a",
+                name="",
+                website_url="https://example.com",
+            )
+        with self.assertRaises(ValueError):
+            self.targets.create(
+                competitor_id="competitor-1",
+                url="https://example.com",
+                page_type="BLOG",
+                check_interval_minutes=0,
+            )
+
+    def test_mongo_settings_require_uri_and_support_database_aliases(self):
+        with self.assertRaises(MongoConfigurationError):
+            MongoSettings.from_env({})
+
+        settings = MongoSettings.from_env(
+            {"MONGODB_URI": "mongodb://localhost", "MONGODB_DB_NAME": "monitoring"}
+        )
+        self.assertEqual(settings.database_name, "monitoring")
+
+
+if __name__ == "__main__":
+    unittest.main()
