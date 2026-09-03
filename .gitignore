@@ -1,0 +1,8 @@
+.env.mongodb
+.env.mongodb.*
+!.env.mongodb.example
+
+# Local/generated files
+.DS_Store
+__pycache__/
+*.py[cod]
