@@ -1,7 +1,9 @@
-"""Standalone Layer 2 fetch, normalization, and comparison mechanics.
+"""Layer 2 fetch, comparison, and monitoring-run orchestration.
 
-This module deliberately stops at in-memory monitoring results. Snapshot,
-change-event, run, and concurrency persistence belong to later roadmap steps.
+The low-level fetch/normalize/hash/diff functions remain usable independently,
+while :class:`MonitoringRunService` composes them with the repository-backed
+snapshot and change services. Concurrency and scheduling remain separate
+roadmap concerns.
 
 HTTP usability heuristic
 ------------------------
@@ -21,11 +23,16 @@ import hashlib
 import html
 import re
 from dataclasses import dataclass, field
+from datetime import datetime
 from html.parser import HTMLParser
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
+
+from backend.flask.database.base_repository import utc_now
+
+from .repository import MonitoringRunRepository, MonitoringTargetRepository
 
 
 HTTP_FETCH_METHOD = "HTTP"
@@ -244,6 +251,306 @@ def generate_diff(previous_content: str, current_content: str) -> str:
             tofile="current",
         )
     )
+
+
+class MonitoringRunError(MonitoringError):
+    """Raised when a monitoring run cannot be started or finalized safely."""
+
+
+class SnapshotCreator(Protocol):
+    """Repository-backed snapshot service boundary used by run orchestration."""
+
+    def create_snapshot(
+        self,
+        target_id: Any,
+        content: str,
+        *,
+        fetch_method: str,
+        http_status: int,
+        captured_at: datetime,
+    ) -> dict[str, Any]:
+        """Persist one successful normalized fetch."""
+
+
+class SnapshotHistoryReader(Protocol):
+    """Snapshot repository boundary used to find the previous valid snapshot."""
+
+    def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
+        """Return snapshots newest first."""
+
+
+class ChangeCreator(Protocol):
+    """Repository-backed change service boundary used after a hash difference."""
+
+    def create_change(
+        self,
+        target_id: Any,
+        previous_snapshot: Mapping[str, Any],
+        current_snapshot: Mapping[str, Any],
+        *,
+        detected_at: datetime,
+    ) -> dict[str, Any]:
+        """Persist one change derived from two different snapshots."""
+
+
+class MonitoringRunService:
+    """Run one target check and persist its complete lifecycle."""
+
+    def __init__(
+        self,
+        target_repository: MonitoringTargetRepository,
+        run_repository: MonitoringRunRepository,
+        snapshot_repository: SnapshotHistoryReader,
+        snapshot_service: SnapshotCreator,
+        change_service: ChangeCreator,
+        *,
+        fetcher: Callable[[str], FetchResult] = fetch_page,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> None:
+        self.target_repository = target_repository
+        self.run_repository = run_repository
+        self.snapshot_repository = snapshot_repository
+        self.snapshot_service = snapshot_service
+        self.change_service = change_service
+        self.fetcher = fetcher
+        self.clock = clock
+
+    @classmethod
+    def from_database(
+        cls,
+        database: Any,
+        *,
+        storage_root: str | None = None,
+        fetcher: Callable[[str], FetchResult] = fetch_page,
+        clock: Callable[[], datetime] = utc_now,
+    ) -> "MonitoringRunService":
+        """Build the complete repository-backed monitoring service."""
+
+        # These imports stay local because snapshot.service imports the
+        # low-level fetch/normalization functions from this module.
+        from backend.flask.change_detection.repository import ChangeRepository
+        from backend.flask.change_detection.service import ChangeService
+        from backend.flask.snapshot.repository import SnapshotRepository
+        from backend.flask.snapshot.service import SnapshotService
+        from backend.flask.snapshot.storage import SnapshotStorage
+
+        target_repository = MonitoringTargetRepository.from_database(database)
+        run_repository = MonitoringRunRepository.from_database(database)
+        snapshot_repository = SnapshotRepository.from_database(database)
+        storage = SnapshotStorage(storage_root)
+        snapshot_service = SnapshotService(snapshot_repository, storage)
+        change_service = ChangeService(
+            ChangeRepository.from_database(database),
+            target_repository,
+            snapshot_content_loader=lambda snapshot: storage.read_snapshot_bytes(
+                snapshot["storage_path"]
+            ).decode("utf-8"),
+        )
+        return cls(
+            target_repository,
+            run_repository,
+            snapshot_repository,
+            snapshot_service,
+            change_service,
+            fetcher=fetcher,
+            clock=clock,
+        )
+
+    def monitor_target(self, target_id: Any) -> dict[str, Any]:
+        """Execute one tracked attempt for an active monitoring target.
+
+        ``last_checked_at`` is written immediately after the RUNNING record is
+        created, so it records the last attempt even when fetching fails.
+        Fetch failures return a FAILED run result and never reach snapshot or
+        change creation. A successful fetch always creates a snapshot; change
+        creation is limited to a different previous hash.
+        """
+
+        target = self.target_repository.get(target_id)
+        if target is None:
+            raise MonitoringRunError(f"monitoring target {target_id!r} was not found")
+        if not _is_active_monitoring_target(target):
+            raise MonitoringRunError(
+                f"monitoring target {target_id!r} is not an active target"
+            )
+
+        started_at = self.clock()
+        run = self.run_repository.create(
+            monitoring_target_id=target_id,
+            started_at=started_at,
+            status=MonitoringRunRepository.RUNNING,
+        )
+        previous_snapshot: dict[str, Any] | None = None
+        current_snapshot: dict[str, Any] | None = None
+        change: dict[str, Any] | None = None
+
+        try:
+            checked_target = self.target_repository.update(
+                target_id,
+                {"last_checked_at": started_at},
+            )
+            if checked_target is None:
+                raise MonitoringRunError(
+                    f"monitoring target {target_id!r} disappeared before it was checked"
+                )
+
+            url = target.get("url")
+            if not isinstance(url, str) or not url.strip():
+                raise MonitoringRunError(
+                    f"monitoring target {target_id!r} has no monitorable URL"
+                )
+
+            try:
+                fetched = self.fetcher(url)
+            except Exception as exc:
+                raise MonitoringRunError(
+                    f"fetch failed for {url!r}: {_exception_detail(exc)}"
+                ) from exc
+            _validate_fetch_result(fetched, url)
+
+            normalized_content = normalize_content(fetched.content)
+            current_hash = hash_content(normalized_content)
+            snapshots = self.snapshot_repository.list_for_target(target_id)
+            previous_snapshot = snapshots[0] if snapshots else None
+            hash_changed = previous_snapshot is not None and not compare_hashes(
+                _snapshot_hash(previous_snapshot, target_id),
+                current_hash,
+            )
+
+            current_snapshot = self.snapshot_service.create_snapshot(
+                target_id,
+                normalized_content,
+                fetch_method=fetched.fetch_method,
+                http_status=fetched.http_status,
+                captured_at=self.clock(),
+            )
+
+            if hash_changed:
+                detected_at = self.clock()
+                change = self.change_service.create_change(
+                    target_id,
+                    previous_snapshot,
+                    current_snapshot,
+                    detected_at=detected_at,
+                )
+                changed_target = self.target_repository.update(
+                    target_id,
+                    {"last_changed_at": detected_at},
+                )
+                if changed_target is None:
+                    raise MonitoringRunError(
+                        f"monitoring target {target_id!r} disappeared while recording its change"
+                    )
+
+            finished_at = self.clock()
+            completed_run = self.run_repository.finish(
+                run["id"],
+                status=MonitoringRunRepository.SUCCESS,
+                finished_at=finished_at,
+            )
+            if completed_run is None:
+                raise MonitoringRunError(
+                    f"monitoring run {run['id']!r} could not be marked SUCCESS"
+                )
+            return {
+                "run": completed_run,
+                "previous_snapshot": previous_snapshot,
+                "snapshot": current_snapshot,
+                "change": change,
+            }
+        except Exception as exc:
+            finished_at = self.clock()
+            error_message = _monitoring_error_message(target_id, target, exc)
+            failed_run = self.run_repository.finish(
+                run["id"],
+                status=MonitoringRunRepository.FAILED,
+                finished_at=finished_at,
+                error_message=error_message,
+            )
+            if failed_run is None:
+                raise MonitoringRunError(
+                    f"monitoring run {run['id']!r} failed and could not be finalized"
+                ) from exc
+            return {
+                "run": failed_run,
+                "previous_snapshot": previous_snapshot,
+                "snapshot": current_snapshot,
+                "change": change,
+            }
+
+
+def monitor_target(
+    target_id: Any,
+    *,
+    target_repository: MonitoringTargetRepository,
+    run_repository: MonitoringRunRepository,
+    snapshot_repository: SnapshotHistoryReader,
+    snapshot_service: SnapshotCreator,
+    change_service: ChangeCreator,
+    fetcher: Callable[[str], FetchResult] = fetch_page,
+    clock: Callable[[], datetime] = utc_now,
+) -> dict[str, Any]:
+    """Functional entry point for one repository-backed monitoring attempt."""
+
+    return MonitoringRunService(
+        target_repository,
+        run_repository,
+        snapshot_repository,
+        snapshot_service,
+        change_service,
+        fetcher=fetcher,
+        clock=clock,
+    ).monitor_target(target_id)
+
+
+def _is_active_monitoring_target(target: Mapping[str, Any]) -> bool:
+    return target.get("active") is True and target.get("discovery_status") == "ACTIVE"
+
+
+def _validate_fetch_result(result: Any, url: str) -> None:
+    if not isinstance(result, FetchResult):
+        raise MonitoringRunError(
+            f"fetcher returned an invalid result for {url!r}; expected FetchResult"
+        )
+    if not isinstance(result.content, str) or not result.content.strip():
+        raise MonitoringRunError(f"fetch returned empty content for {url!r}")
+    if result.fetch_method not in {HTTP_FETCH_METHOD, BROWSER_FETCH_METHOD}:
+        raise MonitoringRunError(
+            f"fetch returned invalid fetch_method {result.fetch_method!r} for {url!r}"
+        )
+    if (
+        isinstance(result.http_status, bool)
+        or not isinstance(result.http_status, int)
+        or not 100 <= result.http_status <= 599
+    ):
+        raise MonitoringRunError(
+            f"fetch returned invalid HTTP status for {url!r}: {result.http_status!r}"
+        )
+
+
+def _snapshot_hash(snapshot: Mapping[str, Any], target_id: Any) -> str:
+    value = snapshot.get("content_hash")
+    if not isinstance(value, str) or not value.strip():
+        raise MonitoringRunError(
+            f"previous snapshot for target {target_id!r} has no content_hash"
+        )
+    return value
+
+
+def _exception_detail(exc: Exception) -> str:
+    message = str(exc).strip()
+    if message:
+        return f"{exc.__class__.__name__}: {message}"
+    return exc.__class__.__name__
+
+
+def _monitoring_error_message(
+    target_id: Any,
+    target: Mapping[str, Any],
+    exc: Exception,
+) -> str:
+    url = target.get("url") or "<missing URL>"
+    return f"monitoring target {target_id!r} ({url!r}) failed: {_exception_detail(exc)}"
 
 
 _SKIPPED_CONTENT_TAGS = frozenset({"script", "style", "template", "noscript"})
