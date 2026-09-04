@@ -16,6 +16,7 @@ class MonitoringTargetRepository(BaseMongoRepository):
     """Persistence operations for the ``monitoring_targets`` collection."""
 
     collection_name = "monitoring_targets"
+    DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES = 1440
     _UPDATE_FIELDS = {
         "raw_url",
         "url",
@@ -72,6 +73,7 @@ class MonitoringTargetRepository(BaseMongoRepository):
         _require_text(page_type, "page_type")
         _require_positive_interval(check_interval_minutes)
         _require_bool(active, "active")
+        _validate_active_discovery_status(active, discovery_status)
         timestamp = now or utc_now()
         document = {
             "competitor_id": to_object_id(competitor_id),
@@ -118,6 +120,104 @@ class MonitoringTargetRepository(BaseMongoRepository):
         if discovery_status is not None:
             query["discovery_status"] = discovery_status
         return self._find_sorted(query, [("created_at", -1)])
+
+    def list_active_targets(
+        self,
+        competitor_id: Optional[Any] = None,
+    ) -> list[dict[str, Any]]:
+        """Return only rows safe for the monitoring engine or scheduler.
+
+        Candidates and monitoring targets share this collection. Both fields
+        are required here so malformed or stale candidate rows cannot enter a
+        monitoring run merely because their ``active`` field is truthy.
+        Callers that need work to process must use this method instead of
+        constructing their own active-target query.
+        """
+
+        query: dict[str, Any] = {
+            "active": True,
+            "discovery_status": "ACTIVE",
+        }
+        if competitor_id is not None:
+            query["competitor_id"] = to_object_id(competitor_id)
+        return self._find_sorted(query, [("created_at", -1)])
+
+    def find_by_url(
+        self,
+        competitor_id: Any,
+        url: str,
+    ) -> Optional[dict[str, Any]]:
+        """Find a target by its competitor and normalized URL."""
+
+        _require_text(url, "url")
+        query = {
+            "competitor_id": to_object_id(competitor_id),
+            "url": url,
+        }
+        return serialize_document(self.collection.find_one(query))
+
+    def upsert_discovered_candidate(
+        self,
+        *,
+        competitor_id: Any,
+        raw_url: str,
+        url: str,
+        page_type: str,
+        discovery_source: str,
+        discovery_status: str,
+        classification_method: str,
+        now: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Persist a discovered candidate without regressing user decisions.
+
+        Discovery may run repeatedly. Existing active or explicitly activated
+        targets retain their activation state and classification metadata while
+        their discovery provenance can be refreshed.
+        """
+
+        _require_text(raw_url, "raw_url")
+        _require_text(url, "url")
+        _require_text(page_type, "page_type")
+        _require_text(discovery_source, "discovery_source")
+        _require_text(discovery_status, "discovery_status")
+        _require_text(classification_method, "classification_method")
+
+        existing = self.find_by_url(competitor_id, url)
+        if existing is not None:
+            updates: dict[str, Any] = {
+                "raw_url": raw_url,
+                "discovery_source": discovery_source,
+            }
+            is_user_activated = existing.get("active") or existing.get(
+                "discovery_status"
+            ) == "ACTIVE"
+            if not is_user_activated:
+                updates.update(
+                    {
+                        "page_type": page_type,
+                        "discovery_status": discovery_status,
+                        "classification_method": classification_method,
+                    }
+                )
+            updated = self.update(
+                existing["id"],
+                updates,
+                competitor_id=competitor_id,
+            )
+            return updated or existing
+
+        return self.create(
+            competitor_id=competitor_id,
+            raw_url=raw_url,
+            url=url,
+            page_type=page_type,
+            discovery_source=discovery_source,
+            discovery_status=discovery_status,
+            classification_method=classification_method,
+            active=False,
+            check_interval_minutes=self.DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES,
+            now=now,
+        )
 
     def list(
         self,
@@ -172,6 +272,13 @@ class MonitoringTargetRepository(BaseMongoRepository):
         query: dict[str, Any] = {"_id": to_object_id(target_id)}
         if competitor_id is not None:
             query["competitor_id"] = to_object_id(competitor_id)
+        current = self.get(target_id, competitor_id=competitor_id)
+        if current is None:
+            return None
+        _validate_active_discovery_status(
+            values.get("active", current.get("active", False)),
+            values.get("discovery_status", current.get("discovery_status")),
+        )
         values["updated_at"] = utc_now()
         result = self.collection.update_one(query, {"$set": values})
         if not self._matched(result):
@@ -205,3 +312,8 @@ def _require_positive_interval(value: Any) -> None:
 def _require_bool(value: Any, field: str) -> None:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
+
+
+def _validate_active_discovery_status(active: Any, discovery_status: Any) -> None:
+    if active is True and discovery_status == "DISCARDED":
+        raise ValueError("a DISCARDED candidate cannot be active")
