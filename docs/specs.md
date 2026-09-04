@@ -130,7 +130,8 @@ These discovered pages become Layer 2 candidates.
 
 ## Layer 1 discovery sources
 
-The system should use multiple sources:
+The system uses site-owned sources so discovery remains deterministic and
+focused on primary Layer 2 sections:
 
 ### 1. `robots.txt`
 
@@ -168,21 +169,6 @@ Blog
 News
 About
 ```
-
-### 4. Search-engine discovery
-
-Use search engines such as DuckDuckGo as a supplementary discovery mechanism.
-
-Example:
-
-```text
-site:example.com pricing
-site:example.com blog
-site:example.com products
-site:example.com campaign
-```
-
-Search-engine discovery is a fallback/complement, not the primary crawler.
 
 ## Layer 1 output
 
@@ -563,7 +549,7 @@ competitor_id
 raw_url                  # URL as originally discovered, before normalization
 url                       # normalized URL — this is what gets monitored
 page_type
-discovery_source          # ROBOTS | SITEMAP | LINKS | SEARCH | MANUAL
+discovery_source          # ROBOTS | SITEMAP | LINKS | MANUAL
 discovery_status          # SUGGESTED | DISCARDED | ACTIVE
 classification_method     # RULE | LLM | MANUAL
 active
@@ -1097,7 +1083,6 @@ Layer 1: Website Discovery
         ├── robots.txt
         ├── sitemap
         ├── internal links
-        └── search discovery
         │
         ▼
 Candidate Layer 2 Pages
