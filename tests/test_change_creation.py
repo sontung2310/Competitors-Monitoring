@@ -165,7 +165,7 @@ class ChangeCreationTests(unittest.TestCase):
         self.assertEqual(change["status"], DEFAULT_CHANGE_STATUS)
         self.assertRegex(
             change["summary"],
-            r"^NEW_BLOG: \d+ line\(s\) added, \d+ line\(s\) removed",
+            r"^NEW_BLOG: 1 line\(s\) added, 1 line\(s\) removed",
         )
         self.assertIn("characters added", change["summary"])
 

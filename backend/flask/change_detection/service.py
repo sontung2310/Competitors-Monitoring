@@ -115,7 +115,10 @@ class ChangeService:
 
         previous_content = self._load_content(previous_snapshot, "previous_snapshot")
         current_content = self._load_content(current_snapshot, "current_snapshot")
-        diff = generate_diff(previous_content, current_content)
+        diff = generate_diff(
+            _diff_text(previous_content),
+            _diff_text(current_content),
+        )
         if not diff:
             raise ChangeError(
                 "snapshot hashes differ but generate_diff returned no content"
@@ -203,6 +206,12 @@ def summarize_diff(change_type: str, diff: str) -> str:
         f"{change_type}: {added_lines} line(s) added, {removed_lines} line(s) removed "
         f"({added_characters} characters added, {removed_characters} removed)."
     )
+
+
+def _diff_text(content: str) -> str:
+    """Give line-oriented diffs a terminator without changing page content."""
+
+    return content if content.endswith("\n") else f"{content}\n"
 
 
 def _require_snapshot_mapping(snapshot: Any, label: str) -> None:
