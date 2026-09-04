@@ -30,6 +30,7 @@ from backend.flask.discovery.sources import (
     parse_robots_sitemaps,
     parse_sitemap,
 )
+from backend.flask.website_monitoring.service import HttpResponse, fetch_page
 
 
 class _FakeCompetitorRepository:
@@ -605,6 +606,7 @@ class DiscoveryTests(unittest.TestCase):
             link_source=_Source(
                 (DiscoveredURL("https://example.com/blog/post-1", "LINKS", "Blog"),)
             ),
+            liveness_checker=lambda url: True,
         )
 
         results = service.discover_website("competitor-1", user_id="company-a")
@@ -618,6 +620,51 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(classifier.batches), 1)
         self.assertEqual(len(target_repository.saved), 2)
         self.assertNotIn("SEARCH", service.last_summary.source_breakdown)
+
+    def test_liveness_gate_discards_collapsed_index_after_404(self):
+        article_url = (
+            "https://elevationmarketing.au/blog-posts/"
+            "local-seo-mastery-how-to-dominate-your-area-in-google-rankings"
+        )
+        liveness_calls = []
+
+        def dead_liveness(url):
+            liveness_calls.append(url)
+            return fetch_page(
+                url,
+                http_fetcher=lambda _: HttpResponse(
+                    "<html><body>Not found</body></html>",
+                    404,
+                    {"Content-Type": "text/html"},
+                ),
+            )
+
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "elevation",
+                    "user_id": "company-a",
+                    "website_url": "https://elevationmarketing.au/",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source((DiscoveredURL(article_url, "SITEMAP"),)),
+            link_source=_Source(),
+            liveness_checker=dead_liveness,
+        )
+
+        persisted = service.discover_website("elevation", user_id="company-a")
+
+        self.assertEqual(
+            liveness_calls,
+            ["https://elevationmarketing.au/blog-posts"],
+        )
+        self.assertEqual(persisted[0]["url"], "https://elevationmarketing.au/blog-posts")
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
+        self.assertEqual(persisted[0]["classification_method"], "RULE")
 
     def test_discovery_service_rejects_unknown_competitors(self):
         service = DiscoveryService(

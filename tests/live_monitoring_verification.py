@@ -1,4 +1,4 @@
-"""Opt-in live Layer 2 verification against Atlas and three real websites.
+"""Opt-in live Layer 2 verification against Atlas and two real websites.
 
 Run from the repository root with a dedicated Atlas test database configured:
 
@@ -11,7 +11,8 @@ Run from the repository root with a dedicated Atlas test database configured:
 This script intentionally uses the real competitor and monitoring-target
 repositories. It discovers and persists candidates, activates one target per
 site through DiscoveryService, then performs two quick fetch/normalize/hash
-passes. It never writes snapshots, changes, or monitoring-run records.
+passes. It never writes snapshots, changes, or monitoring-run records. Legacy
+Elevation records remain in Atlas but are outside this ongoing verification set.
 """
 
 from __future__ import annotations
@@ -43,14 +44,11 @@ USER_ID = "live-verification"
 SITES = (
     ("lyfemarketing.com", "LYFE Marketing", "https://www.lyfemarketing.com/", "/blog"),
     ("brownbagmarketing.com", "Brown Bag Marketing", "https://brownbagmarketing.com/", "/blog"),
-    # /blog-posts is a discovered index candidate, but the live site currently
-    # returns 404 for it. Use a valid suggested target for the fetch/hash check.
-    ("elevationmarketing.au", "Elevation Marketing", "https://elevationmarketing.au/", "/about-us"),
 )
 
 
 def run_live_verification() -> list[dict[str, object]]:
-    """Run the real persistence and fetch/hash checks for every test site."""
+    """Run the real persistence and fetch/hash checks for the ongoing sites."""
 
     if os.environ.get("RUN_LIVE_MONITORING") != "1":
         raise SystemExit("Set RUN_LIVE_MONITORING=1 to run live verification")

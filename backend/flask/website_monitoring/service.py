@@ -169,8 +169,10 @@ def fetch_page(
         raise
     except Exception as exc:
         raise BrowserFetchError(f"browser fetch failed for {url!r}") from exc
-    if not isinstance(browser_result.content, str):
-        raise BrowserFetchError("browser fetcher returned non-text content")
+    if not _is_usable_http_response(browser_result):
+        raise BrowserFetchError(
+            f"browser fetch returned an unusable response for {url!r}"
+        )
     return FetchResult(
         content=browser_result.content,
         fetch_method=BROWSER_FETCH_METHOD,

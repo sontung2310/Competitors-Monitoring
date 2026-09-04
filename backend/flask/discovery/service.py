@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import logging
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
+from backend.flask.website_monitoring.service import (
+    FetchResult,
+    MonitoringError,
+    fetch_page,
+)
 
 from .classification import (
     CandidateClassifier,
@@ -62,6 +67,9 @@ class WebsiteSource(Protocol):
         """Collect candidate URLs from a website source."""
 
 
+LivenessChecker = Callable[[str], FetchResult | bool]
+
+
 @dataclass(frozen=True)
 class _NormalizedCandidate:
     raw_url: str
@@ -106,10 +114,15 @@ class DiscoveryService:
         robots_source: Optional[RobotsSource] = None,
         sitemap_source: Optional[SitemapCollector] = None,
         link_source: Optional[WebsiteSource] = None,
+        liveness_checker: Optional[LivenessChecker] = None,
     ) -> None:
         self.competitor_repository = competitor_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.fallback_classifier = fallback_classifier
+        # This is intentionally injected at the service boundary so tests can
+        # avoid network access while production uses the Step 1.4 fetch
+        # heuristic, including browser fallback.
+        self.liveness_checker = liveness_checker or fetch_page
         self.last_summary: DiscoverySummary | None = None
         if any(source is None for source in (robots_source, sitemap_source, link_source)):
             fetcher = HttpFetcher()
@@ -303,6 +316,7 @@ class DiscoveryService:
             website_url=website_url,
         )
 
+        normalized = _apply_liveness_gate(normalized, self.liveness_checker)
         classification_inputs = tuple(
             CandidateForClassification(
                 raw_url=candidate.raw_url,
@@ -507,6 +521,48 @@ def _normalize_and_dedupe(
             priority=preferred_candidate.priority,
         )
     return list(by_url.values())
+
+
+def _apply_liveness_gate(
+    candidates: Sequence[_NormalizedCandidate],
+    liveness_checker: LivenessChecker,
+) -> list[_NormalizedCandidate]:
+    """Discard unresolved index candidates whose normalized URL is unusable.
+
+    This gate is the final Layer 1 step after URL normalization and before
+    Stage 2 classification. It checks every normalized index candidate; source
+    provenance may still force a candidate to DISCARDED, but it never bypasses
+    the liveness check. The default checker is ``fetch_page`` from the Layer 2
+    service, so HTTP-first and injected-browser behavior stay in one place.
+    """
+
+    gated: list[_NormalizedCandidate] = []
+    for candidate in candidates:
+        if discovery_scope(candidate.url) != "INDEX":
+            gated.append(candidate)
+            continue
+
+        try:
+            result = liveness_checker(candidate.url)
+        except (MonitoringError, ValueError) as exc:
+            logger.info(
+                "Layer 1 liveness check failed url=%s error=%s",
+                candidate.url,
+                exc,
+            )
+            gated.append(replace(candidate, force_discarded=True))
+            continue
+
+        is_live = result if isinstance(result, bool) else isinstance(result, FetchResult)
+        if not is_live:
+            logger.info(
+                "Layer 1 liveness check rejected url=%s",
+                candidate.url,
+            )
+            gated.append(replace(candidate, force_discarded=True))
+            continue
+        gated.append(candidate)
+    return gated
 
 
 def _canonicalize_for_site(url: str, site_url: str) -> str:
