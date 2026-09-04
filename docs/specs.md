@@ -226,11 +226,15 @@ every normalized index-type candidate. Source provenance may already require a
 candidate to be `DISCARDED`, but it still passes through the same check. The
 gate reuses the monitoring fetch heuristic: an HTTP 200–399 HTML response with
 at least 40 visible characters is usable, and an unusable HTTP response may be
-retried through the injected browser fetcher. If the normalized index URL
-remains unusable, the candidate is recorded as `DISCARDED` and no leaf URL is
-guessed as a substitute. This keeps liveness validation in the final Stage 1
-discovery step, before classification and before any candidate can be offered
-for Layer 2 activation.
+retried through the injected browser fetcher. Discovery makes up to three
+liveness attempts with a short backoff. Only repeated 404/410 responses are
+treated as confirmation that the normalized index is dead. Transport failures,
+browser configuration failures, 403/429 anti-bot or rate-limit responses,
+5xx responses, and other inconclusive failures are logged and leave the
+candidate eligible for suggestion. A confirmed dead normalized index is
+recorded as `DISCARDED`; no leaf URL is guessed as a substitute. This keeps
+liveness validation in the final Stage 1 discovery step, before classification
+and before any candidate can be offered for Layer 2 activation.
 
 ### Stage 2 — Classification (rule-first, LLM only as fallback)
 

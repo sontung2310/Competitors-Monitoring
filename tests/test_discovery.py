@@ -30,7 +30,12 @@ from backend.flask.discovery.sources import (
     parse_robots_sitemaps,
     parse_sitemap,
 )
-from backend.flask.website_monitoring.service import HttpResponse, fetch_page
+from backend.flask.website_monitoring.service import (
+    FetchResult,
+    HttpResponse,
+    MonitoringError,
+    fetch_page,
+)
 
 
 class _FakeCompetitorRepository:
@@ -654,17 +659,101 @@ class DiscoveryTests(unittest.TestCase):
             sitemap_source=_Source((DiscoveredURL(article_url, "SITEMAP"),)),
             link_source=_Source(),
             liveness_checker=dead_liveness,
+            liveness_sleep=lambda _: None,
         )
 
         persisted = service.discover_website("elevation", user_id="company-a")
 
         self.assertEqual(
             liveness_calls,
-            ["https://elevationmarketing.au/blog-posts"],
+            [
+                "https://elevationmarketing.au/blog-posts",
+                "https://elevationmarketing.au/blog-posts",
+                "https://elevationmarketing.au/blog-posts",
+            ],
         )
         self.assertEqual(persisted[0]["url"], "https://elevationmarketing.au/blog-posts")
         self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
         self.assertEqual(persisted[0]["classification_method"], "RULE")
+
+    def test_liveness_gate_keeps_candidate_after_transient_failure(self):
+        attempts = []
+
+        def transient_liveness(url):
+            attempts.append(url)
+            if len(attempts) == 1:
+                raise MonitoringError("temporary network failure")
+            return FetchResult(
+                content="<html><body>Live page with stable content.</body></html>",
+                fetch_method="HTTP",
+                http_status=200,
+            )
+
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com/",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/blog", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=transient_liveness,
+            liveness_sleep=lambda _: None,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(attempts, ["https://example.com/blog"] * 2)
+        self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
+        self.assertEqual(persisted[0]["classification_method"], "RULE")
+
+    def test_liveness_gate_keeps_candidate_when_response_is_anti_bot_blocked(self):
+        attempts = []
+
+        def blocked_liveness(url):
+            attempts.append(url)
+            return fetch_page(
+                url,
+                http_fetcher=lambda _: HttpResponse(
+                    "Forbidden by bot protection",
+                    403,
+                    {"Content-Type": "text/plain"},
+                ),
+            )
+
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com/",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/pricing", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=blocked_liveness,
+            liveness_sleep=lambda _: None,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(attempts, ["https://example.com/pricing"] * 3)
+        self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
+        self.assertEqual(persisted[0]["page_type"], "PRICING")
 
     def test_discovery_service_rejects_unknown_competitors(self):
         service = DiscoveryService(

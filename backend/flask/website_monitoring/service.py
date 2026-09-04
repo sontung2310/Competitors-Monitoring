@@ -41,6 +41,10 @@ class MonitoringError(RuntimeError):
 class BrowserFetchError(MonitoringError):
     """Raised when browser fallback is required but cannot be completed."""
 
+    def __init__(self, message: str, *, http_status: int | None = None) -> None:
+        super().__init__(message)
+        self.http_status = http_status
+
 
 @dataclass(frozen=True)
 class HttpResponse:
@@ -165,13 +169,22 @@ def fetch_page(
         browser_result = _coerce_response(
             _call_fetcher(resolved_browser_fetcher, url)
         )
-    except BrowserFetchError:
-        raise
+    except BrowserFetchError as exc:
+        if exc.http_status is not None:
+            raise
+        raise BrowserFetchError(
+            f"browser fetch failed for {url!r}",
+            http_status=http_result.http_status,
+        ) from exc
     except Exception as exc:
-        raise BrowserFetchError(f"browser fetch failed for {url!r}") from exc
+        raise BrowserFetchError(
+            f"browser fetch failed for {url!r}",
+            http_status=http_result.http_status,
+        ) from exc
     if not _is_usable_http_response(browser_result):
         raise BrowserFetchError(
-            f"browser fetch returned an unusable response for {url!r}"
+            f"browser fetch returned an unusable response for {url!r}",
+            http_status=browser_result.http_status,
         )
     return FetchResult(
         content=browser_result.content,
