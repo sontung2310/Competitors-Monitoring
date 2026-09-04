@@ -1,6 +1,7 @@
 .env.mongodb
 .env.mongodb.*
 !.env.mongodb.example
+.env
 
 # Local/generated files
 .DS_Store

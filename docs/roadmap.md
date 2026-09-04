@@ -11,18 +11,17 @@ end-to-end on website monitoring alone.
 ## Step 1: Website Monitoring (Layer 1 Discovery + Layer 2 Monitoring)
 
 - [x] 1.1 Data layer: `competitors` and `monitoring_targets` collections (MongoDB) + repository module
-- [ ] 1.2 Layer 1 — Discovery
-  - [ ] robots.txt fetch/parse
-  - [ ] sitemap.xml / sitemap_index.xml fetch/parse
-  - [ ] internal link crawler from homepage
-  - [ ] search-engine fallback discovery (DuckDuckGo)
-  - [ ] merge + dedupe raw discovered URLs
-  - [ ] rule-based URL normalization (strip dynamic IDs/UUIDs/hashes; page-type aware — collapse index pages like /blog, keep distinct item pages like /products/<slug> separate)
-  - [ ] rule-based classification (keyword/pattern match against page_type list — free, no LLM)
-  - [ ] LLM classification fallback for unresolved candidates only — batched per competitor, structured JSON output, cheap model (gpt-5-nano)
-  - [ ] persist candidates with discovery_status (SUGGESTED/DISCARDED) and classification_method (RULE/LLM)
-- [ ] 1.3 Layer 1 UX support (backend): expose SUGGESTED candidates for review; keep DISCARDED accessible, not deleted
-- [ ] 1.3b Candidate CRUD endpoints: activate suggested candidate, manually add/edit/remove — all writing through the normal repository layer (no direct-DB UI path)
+- [x] 1.2 Layer 1 — Discovery (robots.txt, sitemaps, and shallow homepage links; search engines intentionally excluded from v1)
+  - [x] robots.txt fetch/parse
+  - [x] sitemap.xml / sitemap_index.xml fetch/parse
+  - [x] internal link crawler from homepage
+  - [x] merge + dedupe raw discovered URLs
+  - [x] rule-based URL normalization (strip dynamic IDs/UUIDs/hashes; page-type aware — collapse index pages like /blog, keep distinct item pages like /products/<slug> separate)
+  - [x] rule-based classification (keyword/pattern match against page_type list — free, no LLM)
+  - [x] LLM classification fallback for unresolved candidates only — batched per competitor, structured JSON output, cheap model (gpt-5-nano)
+  - [x] persist candidates with discovery_status (SUGGESTED/DISCARDED) and classification_method (RULE/LLM)
+- [x] 1.3 Layer 1 UX support (backend service): expose SUGGESTED candidates for review; keep DISCARDED accessible, not deleted
+- [x] 1.3b Candidate CRUD service operations: activate suggested candidate, manually add/edit/remove through the normal repository layer (HTTP endpoints are wired in Step 2.3)
 - [ ] 1.4 Layer 2 — Monitoring engine
   - [ ] fetch strategy: HTTP first, browser-fetch fallback for JS-heavy pages
   - [ ] content normalization

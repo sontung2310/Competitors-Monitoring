@@ -6,7 +6,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from backend.flask.competitors.repository import CompetitorRepository
+from backend.flask.database.base_repository import to_object_id
 from backend.flask.database.connection import MongoConfigurationError, MongoSettings
+from backend.flask.discovery.classification import DeterministicStubClassifier
+from backend.flask.discovery.service import DiscoveryError, DiscoveryService
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
 
 try:
@@ -179,6 +182,170 @@ class RepositoryTests(unittest.TestCase):
         )
         self.assertEqual(updated["check_interval_minutes"], 60)
         self.assertTrue(updated["active"])
+
+    def test_discovered_candidate_upsert_does_not_regress_an_active_target(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+        candidate = self.targets.upsert_discovered_candidate(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/pages/abc123",
+            url="https://example.com/pages",
+            page_type="ABOUT",
+            discovery_source="LINKS",
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+            now=self.timestamp,
+        )
+        self.targets.update(candidate["id"], active=True)
+
+        refreshed = self.targets.upsert_discovered_candidate(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/pages/def456",
+            url="https://example.com/pages",
+            page_type="CAREERS",
+            discovery_source="SITEMAP",
+            discovery_status="DISCARDED",
+            classification_method="LLM",
+        )
+        self.assertTrue(refreshed["active"])
+        self.assertEqual(refreshed["discovery_status"], "SUGGESTED")
+        self.assertEqual(refreshed["classification_method"], "RULE")
+        self.assertEqual(refreshed["raw_url"], "https://example.com/pages/def456")
+
+    def test_candidate_review_service_uses_candidate_target_repository(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+        suggested = self.targets.upsert_discovered_candidate(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/blog/post-1",
+            url="https://example.com/blog",
+            page_type="BLOG",
+            discovery_source="SITEMAP",
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+            now=self.timestamp,
+        )
+        discarded = self.targets.upsert_discovered_candidate(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/opaque",
+            url="https://example.com/opaque",
+            page_type="OTHER",
+            discovery_source="SITEMAP",
+            discovery_status="DISCARDED",
+            classification_method="LLM",
+            now=self.timestamp,
+        )
+        service = DiscoveryService(
+            self.competitors,
+            self.targets,
+            fallback_classifier=DeterministicStubClassifier(),
+        )
+
+        self.assertEqual(
+            [candidate["id"] for candidate in service.list_candidates(competitor["id"])],
+            [suggested["id"]],
+        )
+        self.assertEqual(
+            {candidate["id"] for candidate in service.list_candidates(competitor["id"], "ALL")},
+            {suggested["id"], discarded["id"]},
+        )
+
+        activated = service.activate_candidate(suggested["id"])
+        self.assertTrue(activated["active"])
+        self.assertEqual(activated["discovery_status"], "ACTIVE")
+        self.assertEqual(len(self.targets.list_for_competitor(competitor["id"])), 2)
+        self.assertEqual(service.activate_candidate(suggested["id"])["id"], suggested["id"])
+        self.assertEqual(len(self.targets.list_for_competitor(competitor["id"])), 2)
+
+        added = service.add_candidate(competitor["id"], "https://example.com/manual")
+        self.assertEqual(added["classification_method"], "MANUAL")
+        edited = service.edit_candidate(discarded["id"], "https://example.com/review")
+        self.assertEqual(edited["url"], "https://example.com/review")
+        self.assertTrue(service.remove_candidate(discarded["id"]))
+        with self.assertRaisesRegex(DiscoveryError, "already activated"):
+            service.edit_candidate(suggested["id"], "https://example.com/changed")
+        with self.assertRaisesRegex(DiscoveryError, "activated"):
+            service.remove_candidate(suggested["id"])
+        self.assertIsNotNone(self.targets.get(added["id"]))
+
+    def test_list_active_targets_excludes_candidates_and_malformed_rows(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+        suggested = self.targets.create(
+            competitor_id=competitor["id"],
+            url="https://example.com/suggested",
+            page_type="OTHER",
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+            check_interval_minutes=1440,
+            active=False,
+            now=self.timestamp,
+        )
+        discarded = self.targets.create(
+            competitor_id=competitor["id"],
+            url="https://example.com/discarded",
+            page_type="OTHER",
+            discovery_status="DISCARDED",
+            classification_method="LLM",
+            check_interval_minutes=1440,
+            active=False,
+            now=self.timestamp,
+        )
+        active = self.targets.create(
+            competitor_id=competitor["id"],
+            url="https://example.com/active",
+            page_type="BLOG",
+            discovery_status="ACTIVE",
+            classification_method="RULE",
+            check_interval_minutes=1440,
+            active=True,
+            now=self.timestamp,
+        )
+        with self.assertRaisesRegex(ValueError, "DISCARDED"):
+            self.targets.create(
+                competitor_id=competitor["id"],
+                url="https://example.com/invalid",
+                page_type="OTHER",
+                discovery_status="DISCARDED",
+                classification_method="LLM",
+                check_interval_minutes=1440,
+                active=True,
+            )
+
+        malformed_id = ObjectId("000000000000000000000099") if ObjectId else "malformed"
+        self.targets.collection.documents.extend(
+            (
+                {
+                    "_id": malformed_id,
+                    "competitor_id": to_object_id(competitor["id"]),
+                    "url": "https://example.com/malformed-discarded",
+                    "active": True,
+                    "discovery_status": "DISCARDED",
+                },
+                {
+                    "_id": ObjectId("000000000000000000000098") if ObjectId else "missing-active",
+                    "competitor_id": to_object_id(competitor["id"]),
+                    "url": "https://example.com/missing-active",
+                    "discovery_status": "ACTIVE",
+                },
+            )
+        )
+        active_targets = self.targets.list_active_targets(competitor["id"])
+        self.assertEqual([target["id"] for target in active_targets], [active["id"]])
+        self.assertNotIn(suggested["id"], {target["id"] for target in active_targets})
+        self.assertNotIn(discarded["id"], {target["id"] for target in active_targets})
 
     def test_invalid_persisted_values_are_rejected(self):
         with self.assertRaises(ValueError):
