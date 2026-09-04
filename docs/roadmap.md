@@ -27,9 +27,9 @@ end-to-end on website monitoring alone.
   - [x] content normalization
   - [x] hashing + hash comparison (skip full diff when unchanged)
   - [x] full diff generation when hash differs
-- [ ] 1.5 Snapshot storage
-  - [ ] snapshot metadata (content_hash, content_size, storage_path, fetch_method, http_status)
-  - [ ] local file storage under storage/snapshots/<target_id>/
+- [x] 1.5 Snapshot storage
+  - [x] snapshot metadata (content_hash, content_size, storage_path, fetch_method, http_status)
+  - [x] local file storage under storage/snapshots/<target_id>/
 - [ ] 1.6 Change/event creation from diff (change_type derivation)
 - [ ] 1.7 Monitoring run tracking (RUNNING / SUCCESS / FAILED), failed run must not overwrite last valid snapshot
 - [ ] 1.8 Concurrency guard: prevent duplicate concurrent runs on the same target
