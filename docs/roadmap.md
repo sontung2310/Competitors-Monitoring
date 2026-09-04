@@ -22,11 +22,11 @@ end-to-end on website monitoring alone.
   - [x] persist candidates with discovery_status (SUGGESTED/DISCARDED) and classification_method (RULE/LLM)
 - [x] 1.3 Layer 1 UX support (backend service): expose SUGGESTED candidates for review; keep DISCARDED accessible, not deleted
 - [x] 1.3b Candidate CRUD service operations: activate suggested candidate, manually add/edit/remove through the normal repository layer (HTTP endpoints are wired in Step 2.3)
-- [ ] 1.4 Layer 2 — Monitoring engine
-  - [ ] fetch strategy: HTTP first, browser-fetch fallback for JS-heavy pages
-  - [ ] content normalization
-  - [ ] hashing + hash comparison (skip full diff when unchanged)
-  - [ ] full diff generation when hash differs
+- [x] 1.4 Layer 2 — Monitoring engine
+  - [x] fetch strategy: HTTP first, browser-fetch fallback for JS-heavy pages
+  - [x] content normalization
+  - [x] hashing + hash comparison (skip full diff when unchanged)
+  - [x] full diff generation when hash differs
 - [ ] 1.5 Snapshot storage
   - [ ] snapshot metadata (content_hash, content_size, storage_path, fetch_method, http_status)
   - [ ] local file storage under storage/snapshots/<target_id>/
