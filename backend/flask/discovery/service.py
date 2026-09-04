@@ -3,12 +3,18 @@
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass, replace
-from typing import Any, Iterable, Mapping, Optional, Protocol, Sequence
+from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
 
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
+from backend.flask.website_monitoring.service import (
+    FetchResult,
+    MonitoringError,
+    fetch_page,
+)
 
 from .classification import (
     CandidateClassifier,
@@ -41,6 +47,8 @@ class DiscoveryError(RuntimeError):
 logger = logging.getLogger(__name__)
 
 CANDIDATE_REVIEW_STATUSES = frozenset({"SUGGESTED", "DISCARDED"})
+DEFAULT_LIVENESS_ATTEMPTS = 3
+DEFAULT_LIVENESS_BACKOFF_SECONDS = 0.25
 
 
 class RobotsSource(Protocol):
@@ -60,6 +68,9 @@ class SitemapCollector(Protocol):
 class WebsiteSource(Protocol):
     def discover(self, website_url: str) -> Sequence[DiscoveredURL]:
         """Collect candidate URLs from a website source."""
+
+
+LivenessChecker = Callable[[str], FetchResult | bool]
 
 
 @dataclass(frozen=True)
@@ -106,10 +117,33 @@ class DiscoveryService:
         robots_source: Optional[RobotsSource] = None,
         sitemap_source: Optional[SitemapCollector] = None,
         link_source: Optional[WebsiteSource] = None,
+        liveness_checker: Optional[LivenessChecker] = None,
+        liveness_attempts: int = DEFAULT_LIVENESS_ATTEMPTS,
+        liveness_backoff_seconds: float = DEFAULT_LIVENESS_BACKOFF_SECONDS,
+        liveness_sleep: Optional[Callable[[float], None]] = None,
     ) -> None:
+        if (
+            isinstance(liveness_attempts, bool)
+            or not isinstance(liveness_attempts, int)
+            or liveness_attempts < 2
+        ):
+            raise ValueError("liveness_attempts must be at least 2")
+        if (
+            isinstance(liveness_backoff_seconds, bool)
+            or not isinstance(liveness_backoff_seconds, (int, float))
+            or liveness_backoff_seconds < 0
+        ):
+            raise ValueError("liveness_backoff_seconds cannot be negative")
         self.competitor_repository = competitor_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.fallback_classifier = fallback_classifier
+        # This is intentionally injected at the service boundary so tests can
+        # avoid network access while production uses the Step 1.4 fetch
+        # heuristic, including browser fallback.
+        self.liveness_checker = liveness_checker or fetch_page
+        self.liveness_attempts = liveness_attempts
+        self.liveness_backoff_seconds = liveness_backoff_seconds
+        self.liveness_sleep = liveness_sleep or time.sleep
         self.last_summary: DiscoverySummary | None = None
         if any(source is None for source in (robots_source, sitemap_source, link_source)):
             fetcher = HttpFetcher()
@@ -303,6 +337,13 @@ class DiscoveryService:
             website_url=website_url,
         )
 
+        normalized = _apply_liveness_gate(
+            normalized,
+            self.liveness_checker,
+            attempts=self.liveness_attempts,
+            backoff_seconds=self.liveness_backoff_seconds,
+            sleep=self.liveness_sleep,
+        )
         classification_inputs = tuple(
             CandidateForClassification(
                 raw_url=candidate.raw_url,
@@ -507,6 +548,119 @@ def _normalize_and_dedupe(
             priority=preferred_candidate.priority,
         )
     return list(by_url.values())
+
+
+def _apply_liveness_gate(
+    candidates: Sequence[_NormalizedCandidate],
+    liveness_checker: LivenessChecker,
+    *,
+    attempts: int = DEFAULT_LIVENESS_ATTEMPTS,
+    backoff_seconds: float = DEFAULT_LIVENESS_BACKOFF_SECONDS,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[_NormalizedCandidate]:
+    """Discard index candidates only after repeated confirmation of a dead URL.
+
+    This gate is the final Layer 1 step after URL normalization and before
+    Stage 2 classification. It checks every normalized index candidate; source
+    provenance may still force a candidate to DISCARDED, but it never bypasses
+    the liveness check. The default checker is ``fetch_page`` from the Layer 2
+    service, so HTTP-first and injected-browser behavior stay in one place.
+
+    Only repeated HTTP 404/410 results are considered confirmation that the
+    normalized page is dead. Transport errors, missing browser fallback,
+    anti-bot responses such as 403/429, server errors, and other unusable
+    results are inconclusive and leave the candidate eligible for suggestion.
+    """
+
+    gated: list[_NormalizedCandidate] = []
+    for candidate in candidates:
+        if discovery_scope(candidate.url) != "INDEX":
+            gated.append(candidate)
+            continue
+
+        decision = _confirm_liveness(
+            candidate.url,
+            liveness_checker,
+            attempts=attempts,
+            backoff_seconds=backoff_seconds,
+            sleep=sleep,
+        )
+        if decision == "DEAD":
+            gated.append(replace(candidate, force_discarded=True))
+        else:
+            gated.append(candidate)
+    return gated
+
+
+def _confirm_liveness(
+    url: str,
+    liveness_checker: LivenessChecker,
+    *,
+    attempts: int,
+    backoff_seconds: float,
+    sleep: Callable[[float], None],
+) -> str:
+    """Return LIVE, DEAD, or INCONCLUSIVE after bounded liveness attempts."""
+
+    permanent_failures = 0
+    for attempt in range(1, attempts + 1):
+        try:
+            result = liveness_checker(url)
+        except (MonitoringError, ValueError) as exc:
+            status = getattr(exc, "http_status", None)
+            is_permanent = _is_confirmable_dead_status(status)
+            permanent_failures += is_permanent
+            logger.info(
+                "Layer 1 liveness attempt=%d/%d url=%s status=%s "
+                "failure=%s",
+                attempt,
+                attempts,
+                url,
+                status,
+                exc,
+            )
+        else:
+            is_live = (
+                result
+                if isinstance(result, bool)
+                else isinstance(result, FetchResult)
+            )
+            if is_live:
+                if attempt > 1:
+                    logger.info(
+                        "Layer 1 liveness recovered url=%s attempt=%d/%d",
+                        url,
+                        attempt,
+                        attempts,
+                    )
+                return "LIVE"
+            logger.info(
+                "Layer 1 liveness attempt=%d/%d url=%s returned an "
+                "inconclusive unusable result",
+                attempt,
+                attempts,
+            )
+
+        if attempt < attempts:
+            sleep(backoff_seconds)
+
+    if permanent_failures == attempts:
+        logger.info(
+            "Layer 1 liveness confirmed dead url=%s attempts=%d",
+            url,
+            attempts,
+        )
+        return "DEAD"
+    logger.info(
+        "Layer 1 liveness inconclusive url=%s attempts=%d; candidate retained",
+        url,
+        attempts,
+    )
+    return "INCONCLUSIVE"
+
+
+def _is_confirmable_dead_status(status: Any) -> bool:
+    return isinstance(status, int) and status in {404, 410}
 
 
 def _canonicalize_for_site(url: str, site_url: str) -> str:

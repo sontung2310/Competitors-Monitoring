@@ -1,4 +1,4 @@
-"""Opt-in live Layer 1 verification for the three acceptance-test websites.
+"""Opt-in live Layer 1 verification for the two ongoing test websites.
 
 Run from the repository root with:
 
@@ -33,7 +33,6 @@ LIVE_CANDIDATE_CEILING = int(
 SITES = (
     ("lyfemarketing.com", "https://www.lyfemarketing.com/"),
     ("brownbagmarketing.com", "https://brownbagmarketing.com/"),
-    ("elevationmarketing.au", "https://elevationmarketing.au/"),
 )
 LYFE_REQUIRED_PATHS = {
     "/blog",
