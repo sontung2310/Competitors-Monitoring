@@ -351,7 +351,7 @@ class DiscoveryTests(unittest.TestCase):
         results = SitemapSource(fetcher).discover("https://example.com")
         self.assertEqual([result.raw_url for result in results], ["https://example.com/about"])
 
-    def test_sitemap_does_not_suggest_inferred_parent_without_explicit_location(self):
+    def test_sitemap_emits_inferred_parent_for_liveness_gate(self):
         article_url = (
             "https://www.elevationmarketing.au/blog-posts/"
             "local-seo-mastery-how-to-dominate-your-area-in-google-rankings"
@@ -382,27 +382,7 @@ class DiscoveryTests(unittest.TestCase):
 
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0].raw_url, "https://www.elevationmarketing.au/blog-posts")
-        self.assertTrue(results[0].force_discarded)
-
-        target_repository = _FakeTargetRepository()
-        service = DiscoveryService(
-            _FakeCompetitorRepository(
-                {
-                    "id": "elevation",
-                    "user_id": "company-a",
-                    "website_url": "https://elevationmarketing.au/",
-                }
-            ),
-            target_repository,
-            fallback_classifier=DeterministicStubClassifier(),
-            robots_source=_Robots(("https://www.elevationmarketing.au/sitemap.xml",)),
-            sitemap_source=_Source(results),
-            link_source=_Source(),
-        )
-        persisted = service.discover_website("elevation", user_id="company-a")
-        self.assertEqual(persisted[0]["url"], "https://elevationmarketing.au/blog-posts")
-        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
-        self.assertEqual(persisted[0]["classification_method"], "RULE")
+        self.assertFalse(results[0].force_discarded)
 
     def test_large_sitemap_samples_raw_unmatched_entries_before_normalization(self):
         locations = (

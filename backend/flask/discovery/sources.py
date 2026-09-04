@@ -137,9 +137,9 @@ class SitemapSource:
     Sitemap XML can enumerate thousands of leaf pages. The source always
     normalizes URLs before returning them, keeps explicit item paths, and
     retains only a deterministic sample of unmatched raw locations from large
-    sub-sitemaps as DISCARDED review records. The sample is chosen before URL
-    normalization; every emitted normalized candidate is classified by the
-    discovery service.
+    sub-sitemaps. The sample is chosen before URL normalization; every emitted
+    normalized candidate is classified by the discovery service and any
+    inferred index parent is checked by its liveness gate before suggestion.
     """
 
     def __init__(
@@ -259,20 +259,12 @@ class SitemapSource:
                 normalized_url = normalize_url(raw_url)
             except ValueError:
                 continue
-            # A known index prefix is not proof that the index page itself
-            # exists. Elevation's sitemap lists article leaves under
-            # /blog-posts/<slug> but has no /blog-posts location; promoting
-            # that inferred parent would create a broken SUGGESTED target.
-            inferred_index_without_explicit_parent = (
-                normalized_url != raw_url and normalized_url not in raw_urls
-            )
             candidates.append(
                 DiscoveredURL(
                     raw_url=normalized_url,
                     source="SITEMAP",
                     force_discarded=(
                         discovery_scope(raw_url) == "UNMATCHED"
-                        or inferred_index_without_explicit_parent
                     ),
                     priority=1,
                 )
