@@ -345,6 +345,59 @@ class DiscoveryTests(unittest.TestCase):
         results = SitemapSource(fetcher).discover("https://example.com")
         self.assertEqual([result.raw_url for result in results], ["https://example.com/about"])
 
+    def test_sitemap_does_not_suggest_inferred_parent_without_explicit_location(self):
+        article_url = (
+            "https://www.elevationmarketing.au/blog-posts/"
+            "local-seo-mastery-how-to-dominate-your-area-in-google-rankings"
+        )
+        xml = (
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            f"<url><loc>{article_url}</loc></url>"
+            "</urlset>"
+        )
+        fetcher = _StaticFetcher(
+            {
+                "https://elevationmarketing.au/sitemap.xml": FetchResponse(
+                    "https://elevationmarketing.au/sitemap.xml", 404, "", {}
+                ),
+                "https://elevationmarketing.au/sitemap_index.xml": FetchResponse(
+                    "https://elevationmarketing.au/sitemap_index.xml", 404, "", {}
+                ),
+                "https://www.elevationmarketing.au/sitemap.xml": FetchResponse(
+                    "https://www.elevationmarketing.au/sitemap.xml", 200, xml, {}
+                ),
+            }
+        )
+
+        results = SitemapSource(fetcher).discover(
+            "https://elevationmarketing.au/",
+            ("https://www.elevationmarketing.au/sitemap.xml",),
+        )
+
+        self.assertEqual(len(results), 1)
+        self.assertEqual(results[0].raw_url, "https://www.elevationmarketing.au/blog-posts")
+        self.assertTrue(results[0].force_discarded)
+
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "elevation",
+                    "user_id": "company-a",
+                    "website_url": "https://elevationmarketing.au/",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(("https://www.elevationmarketing.au/sitemap.xml",)),
+            sitemap_source=_Source(results),
+            link_source=_Source(),
+        )
+        persisted = service.discover_website("elevation", user_id="company-a")
+        self.assertEqual(persisted[0]["url"], "https://elevationmarketing.au/blog-posts")
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
+        self.assertEqual(persisted[0]["classification_method"], "RULE")
+
     def test_large_sitemap_samples_raw_unmatched_entries_before_normalization(self):
         locations = (
             "https://example.com/blog/post-1",

@@ -259,11 +259,21 @@ class SitemapSource:
                 normalized_url = normalize_url(raw_url)
             except ValueError:
                 continue
+            # A known index prefix is not proof that the index page itself
+            # exists. Elevation's sitemap lists article leaves under
+            # /blog-posts/<slug> but has no /blog-posts location; promoting
+            # that inferred parent would create a broken SUGGESTED target.
+            inferred_index_without_explicit_parent = (
+                normalized_url != raw_url and normalized_url not in raw_urls
+            )
             candidates.append(
                 DiscoveredURL(
                     raw_url=normalized_url,
                     source="SITEMAP",
-                    force_discarded=discovery_scope(raw_url) == "UNMATCHED",
+                    force_discarded=(
+                        discovery_scope(raw_url) == "UNMATCHED"
+                        or inferred_index_without_explicit_parent
+                    ),
                     priority=1,
                 )
             )
