@@ -30,7 +30,7 @@ end-to-end on website monitoring alone.
 - [x] 1.5 Snapshot storage
   - [x] snapshot metadata (content_hash, content_size, storage_path, fetch_method, http_status)
   - [x] local file storage under storage/snapshots/<target_id>/
-- [ ] 1.6 Change/event creation from diff (change_type derivation)
+- [x] 1.6 Change/event creation from diff (change_type derivation)
 - [ ] 1.7 Monitoring run tracking (RUNNING / SUCCESS / FAILED), failed run must not overwrite last valid snapshot
 - [ ] 1.8 Concurrency guard: prevent duplicate concurrent runs on the same target
 - [ ] 1.9 Scheduler: per-target interval, calls `monitor_target(target_id)` (scheduler stays decoupled from monitoring logic)
