@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from datetime import datetime
 from typing import Any, Mapping, Optional
 
 from backend.flask.database.base_repository import (
@@ -299,6 +300,108 @@ class MonitoringTargetRepository(BaseMongoRepository):
         return self._deleted(self.collection.delete_one(query))
 
 
+class MonitoringRunRepository(BaseMongoRepository):
+    """Persistence operations for the ``monitoring_runs`` collection."""
+
+    collection_name = "monitoring_runs"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+    _STATUSES = frozenset({RUNNING, SUCCESS, FAILED})
+
+    def ensure_indexes(self) -> None:
+        """Create the target/status history index used by run readers and 1.8."""
+
+        self.collection.create_index(
+            [("monitoring_target_id", 1), ("started_at", -1)],
+            name="ix_monitoring_runs_target_started_at",
+        )
+        self.collection.create_index(
+            [("monitoring_target_id", 1), ("status", 1)],
+            name="ix_monitoring_runs_target_status",
+        )
+
+    def create(
+        self,
+        *,
+        monitoring_target_id: Any,
+        started_at: datetime,
+        status: str = RUNNING,
+        error_message: Optional[str] = None,
+        now: Optional[Any] = None,
+    ) -> dict[str, Any]:
+        """Insert a run, normally in the ``RUNNING`` state."""
+
+        _require_timestamp(started_at, "started_at")
+        _require_run_status(status)
+        if status == self.FAILED:
+            _require_text(error_message, "error_message")
+        elif error_message is not None:
+            _require_text(error_message, "error_message")
+
+        timestamp = now or utc_now()
+        document = {
+            "monitoring_target_id": to_object_id(monitoring_target_id),
+            "started_at": started_at,
+            "finished_at": None,
+            "status": status,
+            "error_message": error_message,
+            "created_at": timestamp,
+            "updated_at": timestamp,
+        }
+        result = self.collection.insert_one(document)
+        inserted_id = getattr(result, "inserted_id", None)
+        if inserted_id is not None:
+            document["_id"] = inserted_id
+        return serialize_document(document) or {}
+
+    def finish(
+        self,
+        run_id: Any,
+        *,
+        status: str,
+        finished_at: datetime,
+        error_message: Optional[str] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Transition a run to a terminal state and return the updated record."""
+
+        _require_timestamp(finished_at, "finished_at")
+        _require_run_status(status)
+        if status == self.RUNNING:
+            raise ValueError("a RUNNING run cannot have finished_at")
+        if status == self.FAILED:
+            _require_text(error_message, "error_message")
+        elif error_message is not None:
+            raise ValueError("successful runs cannot have an error_message")
+
+        query = {"_id": to_object_id(run_id)}
+        values = {
+            "status": status,
+            "finished_at": finished_at,
+            "error_message": error_message,
+            "updated_at": utc_now(),
+        }
+        result = self.collection.update_one(query, {"$set": values})
+        if not self._matched(result):
+            return None
+        return self.get(run_id)
+
+    def get(self, run_id: Any) -> Optional[dict[str, Any]]:
+        """Return one monitoring-run record by id."""
+
+        return serialize_document(
+            self.collection.find_one({"_id": to_object_id(run_id)})
+        )
+
+    def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
+        """Return a target's runs, newest first."""
+
+        return self._find_sorted(
+            {"monitoring_target_id": to_object_id(monitoring_target_id)},
+            [("started_at", -1)],
+        )
+
+
 def _require_text(value: Any, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
@@ -312,6 +415,20 @@ def _require_positive_interval(value: Any) -> None:
 def _require_bool(value: Any, field: str) -> None:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
+
+
+def _require_timestamp(value: Any, field: str) -> None:
+    if not isinstance(value, datetime):
+        raise ValueError(f"{field} must be a datetime")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError(f"{field} must be timezone-aware")
+
+
+def _require_run_status(value: Any) -> None:
+    if not isinstance(value, str) or value not in MonitoringRunRepository._STATUSES:
+        raise ValueError(
+            "status must be one of RUNNING, SUCCESS, or FAILED"
+        )
 
 
 def _validate_active_discovery_status(active: Any, discovery_status: Any) -> None:
