@@ -32,7 +32,7 @@ end-to-end on website monitoring alone.
   - [x] local file storage under storage/snapshots/<target_id>/
 - [x] 1.6 Change/event creation from diff (change_type derivation)
 - [x] 1.7 Monitoring run tracking (RUNNING / SUCCESS / FAILED), failed run must not overwrite last valid snapshot
-- [ ] 1.8 Concurrency guard: prevent duplicate concurrent runs on the same target
+- [x] 1.8 Concurrency guard: prevent duplicate concurrent runs on the same target
 - [ ] 1.9 Scheduler: per-target interval, calls `monitor_target(target_id)` (scheduler stays decoupled from monitoring logic)
 - [ ] 1.10 Manual Layer 2 target creation (user-added page not from discovery)
 - [ ] 1.11 Delete vs. deactivate rule: hard-delete a target only if it has no snapshot/change history; otherwise set active = false to preserve foreign-key integrity on existing records
