@@ -15,10 +15,12 @@ from backend.flask.website_monitoring.service import (
     MonitoringError,
     fetch_page,
 )
+from backend.flask.website_monitoring.intervals import default_check_interval_minutes
 
 from .classification import (
     CandidateClassifier,
     CandidateForClassification,
+    classify_by_rules,
     classify_candidates,
 )
 from .normalization import (
@@ -207,12 +209,18 @@ class DiscoveryService:
         if candidate.get("active") and candidate.get("discovery_status") == "ACTIVE":
             return candidate
 
+        activation_updates = {
+            "active": True,
+            "discovery_status": "ACTIVE",
+        }
+        if not _has_positive_interval(candidate.get("check_interval_minutes")):
+            activation_updates["check_interval_minutes"] = (
+                default_check_interval_minutes(candidate.get("page_type"))
+            )
+
         updated = self.monitoring_target_repository.update(
             candidate_id,
-            {
-                "active": True,
-                "discovery_status": "ACTIVE",
-            },
+            activation_updates,
             competitor_id=candidate.get("competitor_id"),
         )
         if updated is None:
@@ -240,7 +248,98 @@ class DiscoveryService:
             discovery_status="SUGGESTED",
             classification_method="MANUAL",
             active=False,
-            check_interval_minutes=MonitoringTargetRepository.DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES,
+            check_interval_minutes=default_check_interval_minutes("OTHER"),
+        )
+
+    def add_manual_target(
+        self,
+        competitor_id: Any,
+        url: str,
+        page_type: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an already-active user-selected Layer 2 target.
+
+        This intentionally bypasses the SUGGESTED review state.  If no page
+        type is supplied, the existing deterministic URL classifier is used;
+        an unmatched URL receives ``OTHER``.  The liveness gate is reused with
+        its bounded retries, but manual creation requires a confirmed LIVE
+        result because an inconclusive check must not create a target that is
+        immediately unusable.
+
+        An exact normalized URL duplicate is never inserted twice.  An
+        existing ACTIVE row is returned unchanged.  A SUGGESTED or DISCARDED
+        row is promoted in place after liveness succeeds, because the explicit
+        manual request is a user decision to monitor that page.
+        """
+
+        competitor = self._get_competitor(competitor_id)
+        try:
+            canonical_url = canonicalize_raw_url(url)
+        except (TypeError, ValueError) as exc:
+            raise DiscoveryError(f"manual target URL is invalid: {exc}") from exc
+        normalized_url = _candidate_url_for_competitor(
+            canonical_url,
+            competitor["website_url"],
+        )
+        existing = self.monitoring_target_repository.find_by_url(
+            competitor_id,
+            normalized_url,
+        )
+        if existing is not None and _is_active_target(existing):
+            return existing
+
+        try:
+            liveness = _confirm_liveness(
+                normalized_url,
+                self.liveness_checker,
+                attempts=self.liveness_attempts,
+                backoff_seconds=self.liveness_backoff_seconds,
+                sleep=self.liveness_sleep,
+            )
+        except Exception as exc:
+            raise DiscoveryError(
+                f"manual target URL {normalized_url!r} liveness check failed; "
+                "target was not created"
+            ) from exc
+        if liveness == "DEAD":
+            raise DiscoveryError(
+                f"manual target URL {normalized_url!r} failed liveness checks "
+                f"after {self.liveness_attempts} attempts; target was not created"
+            )
+        if liveness != "LIVE":
+            raise DiscoveryError(
+                f"manual target URL {normalized_url!r} could not be confirmed live "
+                f"after {self.liveness_attempts} attempts; retry later"
+            )
+
+        resolved_page_type = _resolve_manual_page_type(normalized_url, page_type)
+        updates = {
+            "raw_url": canonical_url,
+            "url": normalized_url,
+            "page_type": resolved_page_type,
+            "discovery_source": "MANUAL",
+            "discovery_status": "ACTIVE",
+            "classification_method": "MANUAL",
+            "active": True,
+            "check_interval_minutes": default_check_interval_minutes(
+                resolved_page_type
+            ),
+        }
+        if existing is not None:
+            updated = self.monitoring_target_repository.update(
+                existing["id"],
+                updates,
+                competitor_id=competitor_id,
+            )
+            if updated is None:
+                raise DiscoveryError(
+                    f"existing target {existing['id']!r} could not be promoted"
+                )
+            return updated
+
+        return self.monitoring_target_repository.create(
+            competitor_id=competitor_id,
+            **updates,
         )
 
     def edit_candidate(self, candidate_id: Any, new_url: str) -> dict[str, Any]:
@@ -465,10 +564,19 @@ def _is_activated(candidate: Mapping[str, Any]) -> bool:
     return bool(candidate.get("active")) or candidate.get("discovery_status") == "ACTIVE"
 
 
+def _is_active_target(candidate: Mapping[str, Any]) -> bool:
+    """Return whether a row is a valid, already-active target."""
+
+    return (
+        candidate.get("active") is True
+        and candidate.get("discovery_status") == "ACTIVE"
+    )
+
+
 def _candidate_url_for_competitor(url: str, competitor_url: str) -> str:
     try:
         canonical_url = canonicalize_raw_url(url)
-    except ValueError as exc:
+    except (TypeError, ValueError) as exc:
         raise DiscoveryError(f"candidate URL is invalid: {exc}") from exc
     if not is_same_site(competitor_url, canonical_url):
         raise DiscoveryError("candidate URL must belong to the competitor's website")
@@ -479,6 +587,28 @@ def _candidate_url_for_competitor(url: str, competitor_url: str) -> str:
     if is_system_path(normalized_url):
         raise DiscoveryError("candidate URL cannot be a system or taxonomy path")
     return normalized_url
+
+
+def _has_positive_interval(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and value > 0
+    )
+
+
+def _resolve_manual_page_type(url: str, page_type: str | None) -> str:
+    """Resolve an explicit or rule-derived page type for a manual target."""
+
+    if page_type is not None:
+        if not isinstance(page_type, str) or not page_type.strip():
+            raise DiscoveryError("manual target page_type must be a non-empty string")
+        return page_type.strip().upper()
+
+    rule_result = classify_by_rules(
+        CandidateForClassification(raw_url=url, url=url)
+    )
+    return rule_result.page_type if rule_result is not None else "OTHER"
 
 
 def _normalize_and_dedupe(
