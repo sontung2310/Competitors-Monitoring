@@ -12,6 +12,8 @@ from backend.flask.database.base_repository import (
     utc_now,
 )
 
+from .intervals import DEFAULT_CHECK_INTERVAL_MINUTES, default_check_interval_minutes
+
 
 # Real checks observed so far complete in a few seconds and the HTTP adapter
 # times out at 15 seconds. Five minutes leaves room for a slow browser-backed
@@ -27,7 +29,7 @@ class MonitoringTargetRepository(BaseMongoRepository):
     """Persistence operations for the ``monitoring_targets`` collection."""
 
     collection_name = "monitoring_targets"
-    DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES = 1440
+    DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES = DEFAULT_CHECK_INTERVAL_MINUTES
     _UPDATE_FIELDS = {
         "raw_url",
         "url",
@@ -226,7 +228,7 @@ class MonitoringTargetRepository(BaseMongoRepository):
             discovery_status=discovery_status,
             classification_method=classification_method,
             active=False,
-            check_interval_minutes=self.DEFAULT_CANDIDATE_CHECK_INTERVAL_MINUTES,
+            check_interval_minutes=default_check_interval_minutes(page_type),
             now=now,
         )
 

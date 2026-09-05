@@ -31,6 +31,7 @@ from backend.flask.discovery.sources import (
     parse_sitemap,
 )
 from backend.flask.website_monitoring.service import (
+    BrowserFetchError,
     FetchResult,
     HttpResponse,
     MonitoringError,
@@ -814,6 +815,7 @@ class CandidateReviewTests(unittest.TestCase):
         activated = self.service.activate_candidate("candidate-1")
         self.assertTrue(activated["active"])
         self.assertEqual(activated["discovery_status"], "ACTIVE")
+        self.assertEqual(activated["check_interval_minutes"], 180)
         self.assertEqual(len(self.target_repository.records), 3)
 
         activated_again = self.service.activate_candidate("candidate-1")
@@ -868,6 +870,112 @@ class CandidateReviewTests(unittest.TestCase):
             added["id"],
             {candidate["id"] for candidate in self.service.list_candidates("competitor-1")},
         )
+
+    def _manual_service(self, liveness_checker=None):
+        return DiscoveryService(
+            _FakeCompetitorRepository(self.competitor),
+            self.target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(),
+            link_source=_Source(),
+            liveness_checker=liveness_checker or (lambda url: True),
+            liveness_attempts=2,
+            liveness_backoff_seconds=0,
+            liveness_sleep=lambda _: None,
+        )
+
+    def test_add_manual_target_resolves_type_defaults_and_activates_immediately(self):
+        service = self._manual_service()
+
+        pricing = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/pricing/",
+        )
+        other = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/custom-offer",
+        )
+
+        self.assertEqual(pricing["page_type"], "PRICING")
+        self.assertEqual(pricing["check_interval_minutes"], 360)
+        self.assertEqual(pricing["discovery_status"], "ACTIVE")
+        self.assertTrue(pricing["active"])
+        self.assertEqual(pricing["classification_method"], "MANUAL")
+        self.assertEqual(other["page_type"], "OTHER")
+        self.assertEqual(other["check_interval_minutes"], 1440)
+        self.assertEqual(
+            {target["id"] for target in service.list_active_targets("competitor-1")},
+            {pricing["id"], other["id"]},
+        )
+
+    def test_add_manual_target_rejects_dead_url_without_persisting(self):
+        def dead_liveness(url):
+            raise BrowserFetchError("not found", http_status=404)
+
+        service = self._manual_service(dead_liveness)
+        original_count = len(self.target_repository.records)
+
+        with self.assertRaisesRegex(DiscoveryError, "failed liveness checks"):
+            service.add_manual_target(
+                "competitor-1",
+                "https://example.com/not-a-real-page",
+            )
+
+        self.assertEqual(len(self.target_repository.records), original_count)
+        self.assertIsNone(
+            self.target_repository.find_by_url(
+                "competitor-1",
+                "https://example.com/not-a-real-page",
+            )
+        )
+
+    def test_add_manual_target_promotes_suggested_and_discarded_duplicates_in_place(self):
+        service = self._manual_service()
+        original_count = len(self.target_repository.records)
+
+        suggested = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/blog/",
+        )
+        discarded = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/opaque",
+            page_type="ABOUT",
+        )
+
+        self.assertEqual(suggested["id"], "candidate-1")
+        self.assertEqual(suggested["discovery_status"], "ACTIVE")
+        self.assertTrue(suggested["active"])
+        self.assertEqual(suggested["check_interval_minutes"], 180)
+        self.assertEqual(discarded["id"], "candidate-3")
+        self.assertEqual(discarded["discovery_status"], "ACTIVE")
+        self.assertTrue(discarded["active"])
+        self.assertEqual(discarded["page_type"], "ABOUT")
+        self.assertEqual(len(self.target_repository.records), original_count)
+
+    def test_add_manual_target_returns_active_duplicate_without_rechecking_or_inserting(self):
+        liveness_calls = []
+
+        def live_liveness(url):
+            liveness_calls.append(url)
+            return True
+
+        service = self._manual_service(live_liveness)
+        first = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/manual-active",
+        )
+        count_after_first = len(self.target_repository.records)
+
+        second = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/manual-active/",
+        )
+
+        self.assertEqual(second["id"], first["id"])
+        self.assertEqual(len(self.target_repository.records), count_after_first)
+        self.assertEqual(liveness_calls, ["https://example.com/manual-active"])
 
     def test_edit_candidate_updates_unactivated_candidate_url(self):
         edited = self.service.edit_candidate(
