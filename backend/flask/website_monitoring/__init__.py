@@ -6,6 +6,11 @@ from .repository import (
     MonitoringTargetRepository,
     RunAlreadyClaimedError,
 )
+from .intervals import (
+    DEFAULT_CHECK_INTERVAL_MINUTES,
+    PAGE_TYPE_CHECK_INTERVAL_MINUTES,
+    default_check_interval_minutes,
+)
 from .service import (
     AlreadyRunningError,
     BROWSER_FETCH_METHOD,
@@ -28,6 +33,7 @@ from .service import (
 
 __all__ = [
     "BROWSER_FETCH_METHOD",
+    "DEFAULT_CHECK_INTERVAL_MINUTES",
     "DEFAULT_RUN_STALE_AFTER",
     "AlreadyRunningError",
     "BrowserFetchError",
@@ -41,6 +47,7 @@ __all__ = [
     "MonitoringRunRepository",
     "MonitoringRunService",
     "MonitoringTargetRepository",
+    "PAGE_TYPE_CHECK_INTERVAL_MINUTES",
     "RunAlreadyClaimedError",
     "compare_hashes",
     "fetch_page",
@@ -48,4 +55,5 @@ __all__ = [
     "hash_content",
     "monitor_target",
     "normalize_content",
+    "default_check_interval_minutes",
 ]
