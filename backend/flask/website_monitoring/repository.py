@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
 from backend.flask.database.base_repository import (
@@ -11,6 +11,16 @@ from backend.flask.database.base_repository import (
     to_object_id,
     utc_now,
 )
+
+
+# Real checks observed so far complete in a few seconds and the HTTP adapter
+# times out at 15 seconds. Five minutes leaves room for a slow browser-backed
+# check while ensuring a crashed process cannot block a target indefinitely.
+DEFAULT_RUN_STALE_AFTER = timedelta(minutes=5)
+
+
+class RunAlreadyClaimedError(RuntimeError):
+    """Raised when another non-stale RUNNING record owns a target."""
 
 
 class MonitoringTargetRepository(BaseMongoRepository):
@@ -320,6 +330,72 @@ class MonitoringRunRepository(BaseMongoRepository):
             [("monitoring_target_id", 1), ("status", 1)],
             name="ix_monitoring_runs_target_status",
         )
+        self.collection.create_index(
+            [("monitoring_target_id", 1)],
+            unique=True,
+            partialFilterExpression={"status": self.RUNNING},
+            name="uq_monitoring_runs_running_target",
+        )
+
+    def claim(
+        self,
+        *,
+        monitoring_target_id: Any,
+        started_at: datetime,
+        stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
+        now: Optional[datetime] = None,
+    ) -> dict[str, Any]:
+        """Atomically claim one target with a RUNNING record.
+
+        The partial unique index makes the insert itself the concurrency
+        decision. A duplicate-key result means another RUNNING record won the
+        race; only a record older than ``stale_after`` is conditionally marked
+        FAILED before retrying the claim.
+        """
+
+        _require_timestamp(started_at, "started_at")
+        _require_stale_after(stale_after)
+        claim_time = now or utc_now()
+        _require_timestamp(claim_time, "now")
+
+        # A small retry budget handles the race where another caller resolves
+        # a stale record between our duplicate-key error and the lookup.
+        for _ in range(5):
+            try:
+                return self.create(
+                    monitoring_target_id=monitoring_target_id,
+                    started_at=started_at,
+                    status=self.RUNNING,
+                    now=claim_time,
+                )
+            except Exception as exc:
+                if not _is_duplicate_key_error(exc):
+                    raise
+
+            running = self.find_running(monitoring_target_id)
+            if running is None:
+                continue
+            running_id = running.get("id")
+            if not _is_stale_run(running.get("started_at"), claim_time, stale_after):
+                raise RunAlreadyClaimedError(
+                    f"monitoring target {monitoring_target_id!r} already has "
+                    f"active RUNNING run {running_id!r}"
+                )
+
+            stale_message = _stale_run_message(running_id, stale_after)
+            marked = self.mark_stale_failed(
+                running_id,
+                observed_started_at=running.get("started_at"),
+                finished_at=claim_time,
+                error_message=stale_message,
+            )
+            if marked is not None:
+                continue
+
+        raise RunAlreadyClaimedError(
+            f"monitoring target {monitoring_target_id!r} could not be claimed "
+            "because another RUNNING run won the concurrent claim"
+        )
 
     def create(
         self,
@@ -334,9 +410,9 @@ class MonitoringRunRepository(BaseMongoRepository):
 
         _require_timestamp(started_at, "started_at")
         _require_run_status(status)
-        if status == self.FAILED:
-            _require_text(error_message, "error_message")
-        elif error_message is not None:
+        if status != self.RUNNING:
+            raise ValueError("a newly-created monitoring run must start RUNNING")
+        if error_message is not None:
             _require_text(error_message, "error_message")
 
         timestamp = now or utc_now()
@@ -374,7 +450,10 @@ class MonitoringRunRepository(BaseMongoRepository):
         elif error_message is not None:
             raise ValueError("successful runs cannot have an error_message")
 
-        query = {"_id": to_object_id(run_id)}
+        query = {
+            "_id": to_object_id(run_id),
+            "status": self.RUNNING,
+        }
         values = {
             "status": status,
             "finished_at": finished_at,
@@ -392,6 +471,51 @@ class MonitoringRunRepository(BaseMongoRepository):
         return serialize_document(
             self.collection.find_one({"_id": to_object_id(run_id)})
         )
+
+    def find_running(self, monitoring_target_id: Any) -> Optional[dict[str, Any]]:
+        """Return the current RUNNING record for one target, if present."""
+
+        return serialize_document(
+            self.collection.find_one(
+                {
+                    "monitoring_target_id": to_object_id(monitoring_target_id),
+                    "status": self.RUNNING,
+                }
+            )
+        )
+
+    def mark_stale_failed(
+        self,
+        run_id: Any,
+        *,
+        observed_started_at: Any,
+        finished_at: datetime,
+        error_message: str,
+    ) -> Optional[dict[str, Any]]:
+        """Fail a stale run only if it is still the observed RUNNING record."""
+
+        _require_timestamp(finished_at, "finished_at")
+        _require_text(error_message, "error_message")
+        query: dict[str, Any] = {
+            "_id": to_object_id(run_id),
+            "status": self.RUNNING,
+        }
+        if observed_started_at is not None:
+            query["started_at"] = observed_started_at
+        result = self.collection.update_one(
+            query,
+            {
+                "$set": {
+                    "status": self.FAILED,
+                    "finished_at": finished_at,
+                    "error_message": error_message,
+                    "updated_at": utc_now(),
+                }
+            },
+        )
+        if not self._matched(result):
+            return None
+        return self.get(run_id)
 
     def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
         """Return a target's runs, newest first."""
@@ -429,6 +553,42 @@ def _require_run_status(value: Any) -> None:
         raise ValueError(
             "status must be one of RUNNING, SUCCESS, or FAILED"
         )
+
+
+def _require_stale_after(value: Any) -> None:
+    if not isinstance(value, timedelta) or value <= timedelta(0):
+        raise ValueError("stale_after must be a positive timedelta")
+
+
+def _is_duplicate_key_error(exc: Exception) -> bool:
+    return getattr(exc, "code", None) == 11000 or (
+        exc.__class__.__name__ == "DuplicateKeyError"
+    )
+
+
+def _is_stale_run(
+    started_at: Any,
+    now: datetime,
+    stale_after: timedelta,
+) -> bool:
+    if not isinstance(started_at, datetime):
+        # A malformed RUNNING record cannot safely prove that a live process
+        # still owns the target, so it is treated as orphaned.
+        return True
+    return _as_utc(now) - _as_utc(started_at) > stale_after
+
+
+def _as_utc(value: datetime) -> datetime:
+    if value.tzinfo is None or value.utcoffset() is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def _stale_run_message(run_id: Any, stale_after: timedelta) -> str:
+    return (
+        f"RUNNING monitoring run {run_id!r} was marked FAILED as orphaned after "
+        f"exceeding the {stale_after} staleness threshold"
+    )
 
 
 def _validate_active_discovery_status(active: Any, discovery_status: Any) -> None:

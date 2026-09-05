@@ -23,7 +23,7 @@ import hashlib
 import html
 import re
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timedelta
 from html.parser import HTMLParser
 from typing import Any, Callable, Mapping, Protocol
 from urllib.error import HTTPError, URLError
@@ -32,7 +32,12 @@ from urllib.request import Request, urlopen
 
 from backend.flask.database.base_repository import utc_now
 
-from .repository import MonitoringRunRepository, MonitoringTargetRepository
+from .repository import (
+    DEFAULT_RUN_STALE_AFTER,
+    MonitoringRunRepository,
+    MonitoringTargetRepository,
+    RunAlreadyClaimedError,
+)
 
 
 HTTP_FETCH_METHOD = "HTTP"
@@ -257,6 +262,10 @@ class MonitoringRunError(MonitoringError):
     """Raised when a monitoring run cannot be started or finalized safely."""
 
 
+class AlreadyRunningError(MonitoringRunError):
+    """Raised when a non-stale run already owns the requested target."""
+
+
 class SnapshotCreator(Protocol):
     """Repository-backed snapshot service boundary used by run orchestration."""
 
@@ -306,6 +315,7 @@ class MonitoringRunService:
         *,
         fetcher: Callable[[str], FetchResult] = fetch_page,
         clock: Callable[[], datetime] = utc_now,
+        stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
     ) -> None:
         self.target_repository = target_repository
         self.run_repository = run_repository
@@ -314,6 +324,12 @@ class MonitoringRunService:
         self.change_service = change_service
         self.fetcher = fetcher
         self.clock = clock
+        self.stale_after = stale_after
+        if isinstance(run_repository, MonitoringRunRepository):
+            # The partial unique index is part of the runtime safety contract,
+            # so repository-backed construction makes sure it exists before
+            # the first claim attempt.
+            run_repository.ensure_indexes()
 
     @classmethod
     def from_database(
@@ -323,6 +339,7 @@ class MonitoringRunService:
         storage_root: str | None = None,
         fetcher: Callable[[str], FetchResult] = fetch_page,
         clock: Callable[[], datetime] = utc_now,
+        stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
     ) -> "MonitoringRunService":
         """Build the complete repository-backed monitoring service."""
 
@@ -354,6 +371,7 @@ class MonitoringRunService:
             change_service,
             fetcher=fetcher,
             clock=clock,
+            stale_after=stale_after,
         )
 
     def monitor_target(self, target_id: Any) -> dict[str, Any]:
@@ -375,11 +393,15 @@ class MonitoringRunService:
             )
 
         started_at = self.clock()
-        run = self.run_repository.create(
-            monitoring_target_id=target_id,
-            started_at=started_at,
-            status=MonitoringRunRepository.RUNNING,
-        )
+        try:
+            run = self.run_repository.claim(
+                monitoring_target_id=target_id,
+                started_at=started_at,
+                stale_after=self.stale_after,
+                now=started_at,
+            )
+        except RunAlreadyClaimedError as exc:
+            raise AlreadyRunningError(str(exc)) from exc
         previous_snapshot: dict[str, Any] | None = None
         current_snapshot: dict[str, Any] | None = None
         change: dict[str, Any] | None = None
@@ -489,6 +511,7 @@ def monitor_target(
     change_service: ChangeCreator,
     fetcher: Callable[[str], FetchResult] = fetch_page,
     clock: Callable[[], datetime] = utc_now,
+    stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
 ) -> dict[str, Any]:
     """Functional entry point for one repository-backed monitoring attempt."""
 
@@ -500,6 +523,7 @@ def monitor_target(
         change_service,
         fetcher=fetcher,
         clock=clock,
+        stale_after=stale_after,
     ).monitor_target(target_id)
 
 

@@ -5,10 +5,13 @@ from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 
 from backend.flask.website_monitoring.repository import (
+    DEFAULT_RUN_STALE_AFTER,
     MonitoringRunRepository,
     MonitoringTargetRepository,
+    RunAlreadyClaimedError,
 )
 from backend.flask.website_monitoring.service import (
+    AlreadyRunningError,
     FetchResult,
     MonitoringError,
     MonitoringRunService,
@@ -81,6 +84,24 @@ class _FakeCollection:
         return _WriteResult(matched_count=0)
 
 
+class _DuplicateKeyError(RuntimeError):
+    code = 11000
+
+
+class _UniqueRunningCollection(_FakeCollection):
+    """Fake Mongo collection that models the partial unique RUNNING index."""
+
+    def insert_one(self, document):
+        if document.get("status") == "RUNNING" and any(
+            existing.get("status") == "RUNNING"
+            and existing.get("monitoring_target_id")
+            == document.get("monitoring_target_id")
+            for existing in self.documents
+        ):
+            raise _DuplicateKeyError("duplicate RUNNING target claim")
+        return super().insert_one(document)
+
+
 def _matches(document, query):
     return all(document.get(field) == value for field, value in query.items())
 
@@ -120,6 +141,21 @@ class _RunRepository:
         self.records.append(record)
         self.transitions.append((record["id"], status))
         return deepcopy(record)
+
+    def claim(
+        self,
+        *,
+        monitoring_target_id,
+        started_at,
+        status="RUNNING",
+        stale_after,
+        now,
+    ):
+        return self.create(
+            monitoring_target_id=monitoring_target_id,
+            started_at=started_at,
+            status=status,
+        )
 
     def finish(self, run_id, *, status, finished_at, error_message=None):
         for record in self.records:
@@ -211,6 +247,13 @@ class _ChangeService:
         }
 
 
+class _RejectingRunRepository(_RunRepository):
+    def claim(self, **kwargs):
+        raise RunAlreadyClaimedError(
+            "monitoring target 'target-1' already has active RUNNING run 'run-existing'"
+        )
+
+
 class _Clock:
     def __init__(self):
         self.current = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
@@ -223,7 +266,7 @@ class _Clock:
 
 class MonitoringRunRepositoryTests(unittest.TestCase):
     def test_run_repository_defines_queryable_indexes_and_lifecycle_shape(self):
-        collection = _FakeCollection()
+        collection = _UniqueRunningCollection()
         repository = MonitoringRunRepository(collection)
         repository.ensure_indexes()
 
@@ -232,7 +275,18 @@ class MonitoringRunRepositoryTests(unittest.TestCase):
             {
                 "ix_monitoring_runs_target_started_at",
                 "ix_monitoring_runs_target_status",
+                "uq_monitoring_runs_running_target",
             },
+        )
+        unique_index = next(
+            options
+            for _, options in collection.indexes
+            if options["name"] == "uq_monitoring_runs_running_target"
+        )
+        self.assertTrue(unique_index["unique"])
+        self.assertEqual(
+            unique_index["partialFilterExpression"],
+            {"status": "RUNNING"},
         )
         target_id = "000000000000000000000001"
         started_at = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
@@ -254,11 +308,69 @@ class MonitoringRunRepositoryTests(unittest.TestCase):
         self.assertEqual(finished["status"], "FAILED")
         self.assertIn("connection refused", finished["error_message"])
 
+    def test_atomic_claim_rejects_fresh_duplicate_but_allows_other_targets(self):
+        collection = _UniqueRunningCollection()
+        repository = MonitoringRunRepository(collection)
+        repository.ensure_indexes()
+        now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+
+        first = repository.claim(
+            monitoring_target_id="000000000000000000000001",
+            started_at=now,
+            now=now,
+        )
+        with self.assertRaisesRegex(RunAlreadyClaimedError, "active RUNNING run"):
+            repository.claim(
+                monitoring_target_id="000000000000000000000001",
+                started_at=now + timedelta(seconds=1),
+                now=now + timedelta(seconds=1),
+            )
+        second = repository.claim(
+            monitoring_target_id="000000000000000000000002",
+            started_at=now + timedelta(seconds=1),
+            now=now + timedelta(seconds=1),
+        )
+
+        self.assertEqual(first["status"], "RUNNING")
+        self.assertEqual(second["status"], "RUNNING")
+        self.assertEqual(len(collection.documents), 2)
+
+    def test_stale_claim_is_failed_then_replaced(self):
+        collection = _UniqueRunningCollection()
+        repository = MonitoringRunRepository(collection)
+        repository.ensure_indexes()
+        now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+        stale_started_at = now - DEFAULT_RUN_STALE_AFTER - timedelta(seconds=1)
+
+        stale = repository.claim(
+            monitoring_target_id="000000000000000000000001",
+            started_at=stale_started_at,
+            now=stale_started_at,
+        )
+        replacement = repository.claim(
+            monitoring_target_id="000000000000000000000001",
+            started_at=now,
+            now=now,
+        )
+
+        failed = repository.get(stale["id"])
+        self.assertEqual(failed["status"], "FAILED")
+        self.assertIn("orphaned", failed["error_message"])
+        self.assertIn("staleness threshold", failed["error_message"])
+        self.assertEqual(replacement["status"], "RUNNING")
+        self.assertEqual(len(collection.documents), 2)
+
 
 class MonitoringRunServiceTests(unittest.TestCase):
     target_id = "target-1"
 
-    def _make_service(self, *, previous_content=None, fetcher=None):
+    def _make_service(
+        self,
+        *,
+        previous_content=None,
+        fetcher=None,
+        run_repository=None,
+    ):
         target = {
             "id": self.target_id,
             "url": "https://example.com/blog",
@@ -281,7 +393,7 @@ class MonitoringRunServiceTests(unittest.TestCase):
             )
         snapshot_service = _SnapshotService(snapshots)
         change_service = _ChangeService()
-        run_repository = _RunRepository()
+        run_repository = run_repository or _RunRepository()
         target_repository = _TargetRepository(target)
         service = MonitoringRunService(
             target_repository,
@@ -307,6 +419,19 @@ class MonitoringRunServiceTests(unittest.TestCase):
             change_service,
             run_repository,
         )
+
+    def test_already_running_is_distinct_and_has_no_monitoring_side_effects(self):
+        service, target, snapshots, snapshot_service, change_service, runs = self._make_service(
+            run_repository=_RejectingRunRepository(),
+        )
+
+        with self.assertRaisesRegex(AlreadyRunningError, "active RUNNING run"):
+            service.monitor_target(self.target_id)
+
+        self.assertEqual(target.updates, [])
+        self.assertEqual(snapshot_service.calls, [])
+        self.assertEqual(change_service.calls, [])
+        self.assertEqual(runs.records, [])
 
     def test_success_transitions_running_to_success_and_skips_change_when_hash_matches(self):
         service, target, snapshots, snapshot_service, change_service, runs = self._make_service(
