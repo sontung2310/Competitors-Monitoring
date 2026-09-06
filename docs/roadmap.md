@@ -36,6 +36,9 @@ end-to-end on website monitoring alone.
 - [x] 1.9 Scheduler: per-target interval, calls `monitor_target(target_id)` (scheduler stays decoupled from monitoring logic)
 - [x] 1.10 Manual Layer 2 target creation (user-added page not from discovery)
 - [x] 1.11 Delete vs. deactivate rule: hard-delete a target only if it has no snapshot/change history; otherwise set active = false to preserve foreign-key integrity on existing records
+- [x] 1.12 Extract existing monitoring logic behind the `ContentProcessor` interface (pure refactor, with real-target proof that behavior and hashes are unchanged)
+- [ ] 1.13 Implement `ProductListingProcessor` for `PRODUCT_LISTING` pages (structured extraction, keyed diff, and `NEW_PRODUCT`/`PRODUCT_REMOVED`/`PRICE_CHANGE` events)
+- [ ] 1.14 Simulated-change verification tooling for blog and product-listing scenarios, using offline LLM-generated fixtures with strict isolation from real fetch history
 
 ## Step 2: Backend (Flask) — Website Monitoring Only
 
