@@ -656,10 +656,41 @@ _URL_ATTRIBUTES = frozenset({"href", "src", "action", "poster"})
 _INSTANCE_ID_ATTRIBUTE_NAMES = frozenset(
     {"id", "name", "data-ad-id", "data-iframe-id", "data-instance-id", "data-widget-id"}
 )
+_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 _INSTANCE_ID_VALUE_PATTERN = re.compile(
     r"(?i)^(?:ad|ads|iframe|gpt|googletag|slot|widget|instance)[-_]?(?:[a-z0-9]{4,}|\d{2,})$"
 )
 _VOLATILE_TOKEN_KEY_PATTERN = re.compile(r"(?i)(?:csrf|nonce)")
+_VOLATILE_CLASS_TOKEN_PATTERNS = (
+    re.compile(r"(?i)^(?:gf|gform)_browser[_-][a-z0-9_-]+$"),
+)
+_VOLATILE_PLUGIN_MARKER_PATTERN = re.compile(
+    r"(?i)(?:honeypot|akismet|(?:^|[_-])ak(?:[_-]|$))"
+)
+_VOLATILE_GRAVITY_FIELD_PATTERNS = (
+    re.compile(
+        r"(?i)^gform_(?:field_values|source_page_number|submit|target_page_number|unique_id)(?:_\d+)?$"
+    ),
+    re.compile(r"(?i)^is_submit_\d+$"),
+    re.compile(r"(?i)^state_\d+$"),
+)
 _WHITESPACE_PATTERN = re.compile(r"\s+")
 
 
@@ -673,14 +704,23 @@ class _CanonicalHTMLParser(HTMLParser):
         self._visible_text_parts: list[str] = []
         self._skip_depth = 0
         self._skip_tags: list[str] = []
+        self._volatile_skip_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         normalized_tag = tag.lower()
+        if self._volatile_skip_tags:
+            if normalized_tag not in _VOID_HTML_TAGS:
+                self._volatile_skip_tags.append(normalized_tag)
+            return
         if normalized_tag in _SKIPPED_CONTENT_TAGS:
             self._skip_depth += 1
             self._skip_tags.append(normalized_tag)
             return
         if self._skip_depth:
+            return
+        if _is_volatile_plugin_element(normalized_tag, attrs):
+            if normalized_tag not in _VOID_HTML_TAGS:
+                self._volatile_skip_tags.append(normalized_tag)
             return
         if self.capture_markup:
             self._parts.append(
@@ -693,7 +733,12 @@ class _CanonicalHTMLParser(HTMLParser):
         attrs: list[tuple[str, str | None]],
     ) -> None:
         normalized_tag = tag.lower()
-        if self._skip_depth or normalized_tag in _SKIPPED_CONTENT_TAGS:
+        if (
+            self._volatile_skip_tags
+            or self._skip_depth
+            or normalized_tag in _SKIPPED_CONTENT_TAGS
+            or _is_volatile_plugin_element(normalized_tag, attrs)
+        ):
             return
         if self.capture_markup:
             self._parts.append(
@@ -702,6 +747,10 @@ class _CanonicalHTMLParser(HTMLParser):
 
     def handle_endtag(self, tag: str) -> None:
         normalized_tag = tag.lower()
+        if self._volatile_skip_tags:
+            if normalized_tag == self._volatile_skip_tags[-1]:
+                self._volatile_skip_tags.pop()
+            return
         if self._skip_depth:
             if self._skip_tags and normalized_tag == self._skip_tags[-1]:
                 self._skip_tags.pop()
@@ -711,7 +760,7 @@ class _CanonicalHTMLParser(HTMLParser):
             self._parts.append(f"</{normalized_tag}>")
 
     def handle_data(self, data: str) -> None:
-        if self._skip_depth:
+        if self._skip_depth or self._volatile_skip_tags:
             return
         collapsed = _WHITESPACE_PATTERN.sub(" ", data).strip()
         if not collapsed:
@@ -746,6 +795,7 @@ def _serialize_start_tag(
 ) -> str:
     attribute_values = {name.lower(): value for name, value in attrs if name}
     hidden_input = tag == "input" and attribute_values.get("type", "").lower() == "hidden"
+    volatile_gravity_field = _is_volatile_gravity_field(tag, attribute_values)
     hidden_name = attribute_values.get("name", "") or ""
     serialized_attrs: list[str] = []
     for name, value in sorted(
@@ -756,13 +806,22 @@ def _serialize_start_tag(
             continue
         if hidden_input and name == "value" and _VOLATILE_TOKEN_KEY_PATTERN.search(hidden_name):
             value = "<volatile>"
+        elif volatile_gravity_field and name == "value":
+            value = "<volatile>"
         elif name in _URL_ATTRIBUTES and value is not None:
             value = _normalize_url_attribute(value)
         elif name in _INSTANCE_ID_ATTRIBUTE_NAMES and value is not None:
             if _is_volatile_instance_value(value):
                 value = "<volatile>"
         elif name == "class" and value is not None:
-            value = _WHITESPACE_PATTERN.sub(" ", value).strip()
+            class_tokens = [
+                token
+                for token in _WHITESPACE_PATTERN.sub(" ", value).strip().split(" ")
+                if token and not _is_volatile_class_token(token)
+            ]
+            if not class_tokens:
+                continue
+            value = " ".join(class_tokens)
 
         if value is None:
             serialized_attrs.append(name)
@@ -774,6 +833,41 @@ def _serialize_start_tag(
     if serialized_attrs:
         return f"<{tag} {' '.join(serialized_attrs)}{suffix}"
     return f"<{tag}{suffix}"
+
+
+def _is_volatile_plugin_element(
+    tag: str,
+    attrs: list[tuple[str, str | None]],
+) -> bool:
+    """Identify whole elements injected by comment-form anti-spam plugins."""
+
+    attributes = {
+        name.lower(): value or ""
+        for name, value in attrs
+        if name
+    }
+    for name in ("id", "name", "class", "data-prefix"):
+        if _VOLATILE_PLUGIN_MARKER_PATTERN.search(attributes.get(name, "")):
+            return True
+    return False
+
+
+def _is_volatile_class_token(token: str) -> bool:
+    return any(pattern.fullmatch(token) for pattern in _VOLATILE_CLASS_TOKEN_PATTERNS)
+
+
+def _is_volatile_gravity_field(
+    tag: str,
+    attributes: Mapping[str, str | None],
+) -> bool:
+    field_type = attributes.get("type") or ""
+    if tag != "input" or field_type.lower() != "hidden":
+        return False
+    classes = attributes.get("class") or ""
+    if "gform_hidden" not in classes.split():
+        return False
+    field_name = attributes.get("name") or attributes.get("id") or ""
+    return any(pattern.fullmatch(field_name) for pattern in _VOLATILE_GRAVITY_FIELD_PATTERNS)
 
 
 def _normalize_url_attribute(value: str) -> str:
