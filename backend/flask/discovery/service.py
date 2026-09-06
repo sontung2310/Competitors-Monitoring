@@ -75,6 +75,13 @@ class WebsiteSource(Protocol):
 LivenessChecker = Callable[[str], FetchResult | bool]
 
 
+class TargetHistoryRepository(Protocol):
+    """Repository boundary for target-linked snapshot or change history."""
+
+    def list_for_target(self, monitoring_target_id: Any) -> list[Mapping[str, Any]]:
+        """Return persisted history rows linked to one monitoring target."""
+
+
 @dataclass(frozen=True)
 class _NormalizedCandidate:
     raw_url: str
@@ -119,6 +126,8 @@ class DiscoveryService:
         robots_source: Optional[RobotsSource] = None,
         sitemap_source: Optional[SitemapCollector] = None,
         link_source: Optional[WebsiteSource] = None,
+        snapshot_repository: Optional[TargetHistoryRepository] = None,
+        change_repository: Optional[TargetHistoryRepository] = None,
         liveness_checker: Optional[LivenessChecker] = None,
         liveness_attempts: int = DEFAULT_LIVENESS_ATTEMPTS,
         liveness_backoff_seconds: float = DEFAULT_LIVENESS_BACKOFF_SECONDS,
@@ -154,6 +163,8 @@ class DiscoveryService:
         self.robots_source = robots_source or RobotsTxtSource(fetcher or HttpFetcher())
         self.sitemap_source = sitemap_source or SitemapSource(fetcher or HttpFetcher())
         self.link_source = link_source or InternalLinkSource(fetcher or HttpFetcher())
+        self.snapshot_repository = snapshot_repository
+        self.change_repository = change_repository
 
     def list_candidates(
         self,
@@ -374,14 +385,45 @@ class DiscoveryService:
         return updated
 
     def remove_candidate(self, candidate_id: Any) -> bool:
-        """Hard-delete an unactivated candidate; protect activated targets."""
+        """Delete an unactivated/historyless target or deactivate its history.
+
+        Candidates and active targets share one collection. An ACTIVE row with
+        snapshot or change history is retained and marked ``active=False`` so
+        those history records continue to reference an existing target. Its
+        ``discovery_status`` remains ``ACTIVE``; the strict active-target
+        repository filter excludes it from monitoring and scheduling. ACTIVE
+        rows with no history are safe to hard-delete.
+        """
 
         candidate = self._get_candidate(candidate_id)
         if _is_activated(candidate):
-            raise DiscoveryError(
-                f"candidate {candidate_id!r} is activated; deactivate the monitoring "
-                "target before removing it"
-            )
+            if self.snapshot_repository is None or self.change_repository is None:
+                raise DiscoveryError(
+                    "snapshot and change history repositories are required before "
+                    f"removing activated target {candidate_id!r}"
+                )
+            try:
+                has_history = bool(
+                    self.snapshot_repository.list_for_target(candidate_id)
+                    or self.change_repository.list_for_target(candidate_id)
+                )
+            except Exception as exc:
+                raise DiscoveryError(
+                    f"could not inspect history for activated target {candidate_id!r}; "
+                    "nothing was removed"
+                ) from exc
+            if has_history:
+                updated = self.monitoring_target_repository.update(
+                    candidate_id,
+                    {"active": False},
+                    competitor_id=candidate.get("competitor_id"),
+                )
+                if updated is None:
+                    raise DiscoveryError(
+                        f"activated target {candidate_id!r} could not be deactivated"
+                    )
+                return True
+
         removed = self.monitoring_target_repository.delete(
             candidate_id,
             competitor_id=candidate.get("competitor_id"),

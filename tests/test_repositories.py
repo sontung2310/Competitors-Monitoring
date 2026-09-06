@@ -6,11 +6,13 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from backend.flask.competitors.repository import CompetitorRepository
+from backend.flask.change_detection.repository import ChangeRepository
 from backend.flask.database.base_repository import to_object_id
 from backend.flask.database.connection import MongoConfigurationError, MongoSettings
 from backend.flask.discovery.classification import DeterministicStubClassifier
 from backend.flask.discovery.service import DiscoveryError, DiscoveryService
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
+from backend.flask.snapshot.repository import SnapshotRepository
 
 try:
     from bson import ObjectId
@@ -97,6 +99,7 @@ def _matches(document, query):
 class RepositoryTests(unittest.TestCase):
     def setUp(self):
         database = _FakeDatabase()
+        self.database = database
         self.competitors = CompetitorRepository.from_database(database)
         self.targets = MonitoringTargetRepository.from_database(database)
         self.timestamp = datetime(2026, 9, 3, tzinfo=timezone.utc)
@@ -247,6 +250,8 @@ class RepositoryTests(unittest.TestCase):
             self.competitors,
             self.targets,
             fallback_classifier=DeterministicStubClassifier(),
+            snapshot_repository=SnapshotRepository.from_database(self.database),
+            change_repository=ChangeRepository.from_database(self.database),
         )
 
         self.assertEqual(
@@ -272,8 +277,8 @@ class RepositoryTests(unittest.TestCase):
         self.assertTrue(service.remove_candidate(discarded["id"]))
         with self.assertRaisesRegex(DiscoveryError, "already activated"):
             service.edit_candidate(suggested["id"], "https://example.com/changed")
-        with self.assertRaisesRegex(DiscoveryError, "activated"):
-            service.remove_candidate(suggested["id"])
+        self.assertTrue(service.remove_candidate(suggested["id"]))
+        self.assertIsNone(self.targets.get(suggested["id"]))
         self.assertIsNotNone(self.targets.get(added["id"]))
 
     def test_list_active_targets_excludes_candidates_and_malformed_rows(self):
