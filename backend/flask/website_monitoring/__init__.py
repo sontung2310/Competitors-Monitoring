@@ -11,6 +11,13 @@ from .intervals import (
     PAGE_TYPE_CHECK_INTERVAL_MINUTES,
     default_check_interval_minutes,
 )
+from .content_processing import (
+    ContentProcessingError,
+    ContentProcessor,
+    ProcessResult,
+    TextBlobProcessor,
+    resolve_content_processor,
+)
 from .service import (
     AlreadyRunningError,
     BROWSER_FETCH_METHOD,
@@ -33,6 +40,8 @@ from .service import (
 
 __all__ = [
     "BROWSER_FETCH_METHOD",
+    "ContentProcessingError",
+    "ContentProcessor",
     "DEFAULT_CHECK_INTERVAL_MINUTES",
     "DEFAULT_RUN_STALE_AFTER",
     "AlreadyRunningError",
@@ -49,11 +58,14 @@ __all__ = [
     "MonitoringTargetRepository",
     "PAGE_TYPE_CHECK_INTERVAL_MINUTES",
     "RunAlreadyClaimedError",
+    "ProcessResult",
+    "TextBlobProcessor",
     "compare_hashes",
     "fetch_page",
     "generate_diff",
     "hash_content",
     "monitor_target",
     "normalize_content",
+    "resolve_content_processor",
     "default_check_interval_minutes",
 ]

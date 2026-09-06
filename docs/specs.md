@@ -617,6 +617,7 @@ content_size
 storage_path
 fetch_method
 http_status
+is_simulated             # false for live monitoring; true only for isolated simulated fixtures
 ```
 
 The actual snapshot content should be stored separately from the metadata.
@@ -718,6 +719,7 @@ Examples:
 PRICE_CHANGE
 NEW_BLOG
 NEW_PRODUCT
+PRODUCT_REMOVED
 NEW_PROMOTION
 NEW_CAMPAIGN
 NEW_AWARD
@@ -725,6 +727,111 @@ PAGE_UPDATE
 ```
 
 The PoC can initially derive `change_type` from the monitored page type and simple rules.
+Each detected event is stored as its own change record. A monitoring run can produce
+zero, one, or many change records: the existing whole-page text flow normally produces
+at most one event, while structured processors can produce one event per added, removed,
+or changed item.
+
+---
+
+# 14a. Pluggable Content Processing and Simulated-Change Verification
+
+The monitoring pipeline dispatches content processing by the existing `page_type` field.
+It does not add a second field for processor selection. The same page type already drives
+the default `change_type` mapping from §14 and the check-interval defaults from §16.
+
+## ContentProcessor interface
+
+Every processor implements:
+
+```text
+ContentProcessor.process(raw_content, previous_snapshot) -> ProcessResult
+
+ProcessResult = {
+    changed: bool,
+    snapshot_content: str,
+    change_events: [
+        { change_type, summary },
+        ...
+    ]
+}
+```
+
+`previous_snapshot` contains the prior processor-compatible snapshot content. The returned
+`snapshot_content` is the canonical content to store, hash, and compare for the next run.
+`change_events` is empty when no change is detected and may contain multiple events when a
+structured page produces multiple independent changes.
+
+### TextBlobProcessor
+
+`TextBlobProcessor` is the existing §1.4/§1.6 behavior moved behind this interface. It
+normalizes the fetched page, hashes the normalized whole-page text, compares hashes, and
+generates a diff only when the hashes differ. A changed page produces the existing simple
+page-type-derived event (for example, `BLOG` → `NEW_BLOG`); an unchanged page produces no
+event.
+
+This is a pure refactor. For every page type currently supported, it must produce behavior
+identical to the current fetch → normalize → hash → compare → diff flow.
+
+### ProductListingProcessor
+
+`ProductListingProcessor` is selected for the new `PRODUCT_LISTING` page type. It extracts
+a canonical structured list from the page, with at least:
+
+```text
+product = {
+    name,
+    key,       # stable identifying URL or product ID
+    price
+}
+```
+
+It compares the current list with the previous extracted list by `key`:
+
+- a new key produces `NEW_PRODUCT`;
+- a missing previous key produces `PRODUCT_REMOVED`;
+- the same key with a different price produces `PRICE_CHANGE`.
+
+The canonical extracted list is serialized into `snapshot_content` so the stored snapshot,
+hash, and next comparison all use the same deterministic representation. One run can produce
+zero, one, or many `change_events`.
+
+## Simulated-change verification methodology
+
+This is a testing pattern, not a production monitoring feature. Verification should:
+
+1. Start with a real captured snapshot from an already-monitored target.
+2. Use an LLM offline to generate a plausible mutated fixture: for example, a realistic new
+   blog post in the site's style, or a product listing with specified additions, removals,
+   and price changes.
+3. Feed the mutated content into the real `ContentProcessor` as if it were a fresh fetch,
+   bypassing only the network call. The actual normalization, extraction, hashing, keyed diff,
+   and event creation logic must still run.
+4. Assert that the resulting event set exactly matches the mutation that was requested.
+
+The LLM is only a fixture generator. It is never part of the live monitoring path, and it
+does not decide whether production content changed. Hashing, diffing, extraction, and keyed
+comparison remain deterministic. This follows the existing LLM boundary in §22: no LLM runs
+on every monitoring cycle. Any future relevance filtering remains user-defined and specific
+to the target rather than a system-wide judgment.
+
+Simulated content must also be isolated from real monitoring history. The default verification
+mode is a dry run that does not persist simulated snapshots, changes, or monitoring runs. If
+a fixture must be persisted for debugging, its snapshot metadata must set `is_simulated=true`,
+and real-history queries must exclude simulated records by default. Simulated content must
+never be queryable or processed as if it were genuinely fetched content.
+
+## Success criteria
+
+1. `TextBlobProcessor` is proven to be a pure refactor by running it against a real already-
+   monitored target, such as Lyfe's `/blog`, and confirming the resulting hash exactly matches
+   the known real hash.
+2. An LLM-generated simulated new blog post, injected for a real blog target, produces exactly
+   one `NEW_BLOG` event.
+3. An LLM-generated simulated product-listing mutation produces exactly the matching set of
+   `NEW_PRODUCT`, `PRODUCT_REMOVED`, and `PRICE_CHANGE` events—no more and no fewer than the
+   requested additions, removals, and repricings.
+4. No simulated data is queryable as real fetch history.
 
 ---
 

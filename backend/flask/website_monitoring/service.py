@@ -32,6 +32,10 @@ from urllib.request import Request, urlopen
 
 from backend.flask.database.base_repository import utc_now
 
+from .content_processing import (
+    ContentProcessor,
+    resolve_content_processor,
+)
 from .repository import (
     DEFAULT_RUN_STALE_AFTER,
     MonitoringRunRepository,
@@ -288,6 +292,9 @@ class SnapshotHistoryReader(Protocol):
         """Return snapshots newest first."""
 
 
+SnapshotContentLoader = Callable[[Mapping[str, Any]], str]
+
+
 class ChangeCreator(Protocol):
     """Repository-backed change service boundary used after a hash difference."""
 
@@ -316,6 +323,8 @@ class MonitoringRunService:
         fetcher: Callable[[str], FetchResult] = fetch_page,
         clock: Callable[[], datetime] = utc_now,
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
+        snapshot_content_loader: SnapshotContentLoader | None = None,
+        content_processors: Mapping[str, ContentProcessor] | None = None,
     ) -> None:
         self.target_repository = target_repository
         self.run_repository = run_repository
@@ -325,6 +334,8 @@ class MonitoringRunService:
         self.fetcher = fetcher
         self.clock = clock
         self.stale_after = stale_after
+        self.snapshot_content_loader = snapshot_content_loader
+        self.content_processors = dict(content_processors or {})
         if isinstance(run_repository, MonitoringRunRepository):
             # The partial unique index is part of the runtime safety contract,
             # so repository-backed construction makes sure it exists before
@@ -340,6 +351,7 @@ class MonitoringRunService:
         fetcher: Callable[[str], FetchResult] = fetch_page,
         clock: Callable[[], datetime] = utc_now,
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
+        content_processors: Mapping[str, ContentProcessor] | None = None,
     ) -> "MonitoringRunService":
         """Build the complete repository-backed monitoring service."""
 
@@ -356,12 +368,13 @@ class MonitoringRunService:
         snapshot_repository = SnapshotRepository.from_database(database)
         storage = SnapshotStorage(storage_root)
         snapshot_service = SnapshotService(snapshot_repository, storage)
+        snapshot_content_loader = lambda snapshot: storage.read_snapshot_bytes(
+            snapshot["storage_path"]
+        ).decode("utf-8")
         change_service = ChangeService(
             ChangeRepository.from_database(database),
             target_repository,
-            snapshot_content_loader=lambda snapshot: storage.read_snapshot_bytes(
-                snapshot["storage_path"]
-            ).decode("utf-8"),
+            snapshot_content_loader=snapshot_content_loader,
         )
         return cls(
             target_repository,
@@ -372,6 +385,8 @@ class MonitoringRunService:
             fetcher=fetcher,
             clock=clock,
             stale_after=stale_after,
+            snapshot_content_loader=snapshot_content_loader,
+            content_processors=content_processors,
         )
 
     def monitor_target(self, target_id: Any) -> dict[str, Any]:
@@ -430,39 +445,45 @@ class MonitoringRunService:
                 ) from exc
             _validate_fetch_result(fetched, url)
 
-            normalized_content = normalize_content(fetched.content)
-            current_hash = hash_content(normalized_content)
             snapshots = self.snapshot_repository.list_for_target(target_id)
             previous_snapshot = snapshots[0] if snapshots else None
-            hash_changed = previous_snapshot is not None and not compare_hashes(
-                _snapshot_hash(previous_snapshot, target_id),
-                current_hash,
+            previous_snapshot = self._load_previous_snapshot_content(previous_snapshot)
+            processor = resolve_content_processor(
+                target.get("page_type"),
+                self.content_processors,
             )
+            process_result = processor.process(fetched.content, previous_snapshot)
 
             current_snapshot = self.snapshot_service.create_snapshot(
                 target_id,
-                normalized_content,
+                process_result.snapshot_content,
                 fetch_method=fetched.fetch_method,
                 http_status=fetched.http_status,
                 captured_at=self.clock(),
             )
 
-            if hash_changed:
+            changes: list[dict[str, Any]] = []
+            if process_result.changed:
                 detected_at = self.clock()
-                change = self.change_service.create_change(
-                    target_id,
-                    previous_snapshot,
-                    current_snapshot,
-                    detected_at=detected_at,
-                )
-                changed_target = self.target_repository.update(
-                    target_id,
-                    {"last_changed_at": detected_at},
-                )
-                if changed_target is None:
-                    raise MonitoringRunError(
-                        f"monitoring target {target_id!r} disappeared while recording its change"
+                for _event in process_result.change_events:
+                    changes.append(
+                        self.change_service.create_change(
+                            target_id,
+                            previous_snapshot,
+                            current_snapshot,
+                            detected_at=detected_at,
+                        )
                     )
+                if changes:
+                    changed_target = self.target_repository.update(
+                        target_id,
+                        {"last_changed_at": detected_at},
+                    )
+                    if changed_target is None:
+                        raise MonitoringRunError(
+                            f"monitoring target {target_id!r} disappeared while recording its change"
+                        )
+                change = changes[0] if len(changes) == 1 else None
 
             finished_at = self.clock()
             completed_run = self.run_repository.finish(
@@ -479,6 +500,7 @@ class MonitoringRunService:
                 "previous_snapshot": previous_snapshot,
                 "snapshot": current_snapshot,
                 "change": change,
+                "changes": changes,
             }
         except Exception as exc:
             finished_at = self.clock()
@@ -498,7 +520,20 @@ class MonitoringRunService:
                 "previous_snapshot": previous_snapshot,
                 "snapshot": current_snapshot,
                 "change": change,
+                "changes": [],
             }
+
+    def _load_previous_snapshot_content(
+        self,
+        snapshot: dict[str, Any] | None,
+    ) -> dict[str, Any] | None:
+        if snapshot is None or "content" in snapshot or "normalized_content" in snapshot:
+            return snapshot
+        if self.snapshot_content_loader is None:
+            return snapshot
+        loaded = dict(snapshot)
+        loaded["content"] = self.snapshot_content_loader(snapshot)
+        return loaded
 
 
 def monitor_target(
@@ -512,6 +547,8 @@ def monitor_target(
     fetcher: Callable[[str], FetchResult] = fetch_page,
     clock: Callable[[], datetime] = utc_now,
     stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
+    snapshot_content_loader: SnapshotContentLoader | None = None,
+    content_processors: Mapping[str, ContentProcessor] | None = None,
 ) -> dict[str, Any]:
     """Functional entry point for one repository-backed monitoring attempt."""
 
@@ -524,6 +561,8 @@ def monitor_target(
         fetcher=fetcher,
         clock=clock,
         stale_after=stale_after,
+        snapshot_content_loader=snapshot_content_loader,
+        content_processors=content_processors,
     ).monitor_target(target_id)
 
 
