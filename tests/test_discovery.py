@@ -129,6 +129,16 @@ class _ReviewTargetRepository:
         return False
 
 
+class _HistoryRepository:
+    def __init__(self, target_ids=()):
+        self.target_ids = set(target_ids)
+
+    def list_for_target(self, target_id):
+        if target_id in self.target_ids:
+            return [{"id": f"history-for-{target_id}"}]
+        return []
+
+
 class _Source:
     def __init__(self, candidates=()):
         self.candidates = tuple(candidates)
@@ -990,14 +1000,31 @@ class CandidateReviewTests(unittest.TestCase):
         with self.assertRaisesRegex(DiscoveryError, "already activated"):
             self.service.edit_candidate("candidate-1", "https://example.com/edited")
 
-    def test_remove_candidate_deletes_unactivated_and_blocks_activated(self):
-        self.assertTrue(self.service.remove_candidate("candidate-2"))
+    def test_remove_candidate_hard_deletes_unactivated_and_historyless_active(self):
+        history = _HistoryRepository()
+        service = self._manual_service()
+        service.snapshot_repository = history
+        service.change_repository = history
+
+        self.assertTrue(service.remove_candidate("candidate-2"))
         self.assertIsNone(self.target_repository.get("candidate-2"))
 
-        self.service.activate_candidate("candidate-1")
-        with self.assertRaisesRegex(DiscoveryError, "activated"):
-            self.service.remove_candidate("candidate-1")
-        self.assertIsNotNone(self.target_repository.get("candidate-1"))
+        service.activate_candidate("candidate-1")
+        self.assertTrue(service.remove_candidate("candidate-1"))
+        self.assertIsNone(self.target_repository.get("candidate-1"))
+
+    def test_remove_candidate_deactivates_active_target_with_history(self):
+        history = _HistoryRepository(("candidate-1",))
+        service = self._manual_service()
+        service.snapshot_repository = history
+        service.change_repository = _HistoryRepository()
+        service.activate_candidate("candidate-1")
+
+        self.assertTrue(service.remove_candidate("candidate-1"))
+        retained = self.target_repository.get("candidate-1")
+        self.assertIsNotNone(retained)
+        self.assertFalse(retained["active"])
+        self.assertEqual(retained["discovery_status"], "ACTIVE")
 
 
 if __name__ == "__main__":
