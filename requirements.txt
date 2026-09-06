@@ -1,3 +1,4 @@
 pymongo>=4.6,<5
 openai>=1.68
+playwright>=1.52,<2
 python-dotenv>=1.0,<2

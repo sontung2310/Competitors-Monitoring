@@ -49,6 +49,9 @@ HTTP_FETCH_METHOD = "HTTP"
 BROWSER_FETCH_METHOD = "BROWSER"
 MIN_RENDERABLE_TEXT_LENGTH = 40
 DEFAULT_HTTP_TIMEOUT_SECONDS = 15
+DEFAULT_BROWSER_TIMEOUT_SECONDS = 30
+DEFAULT_BROWSER_SETTLE_SECONDS = 0.75
+DEFAULT_BROWSER_NETWORK_IDLE_TIMEOUT_SECONDS = 5
 
 
 class MonitoringError(RuntimeError):
@@ -141,20 +144,124 @@ class HttpPageFetcher:
 
 
 class BrowserPageFetcher:
-    """Explicit browser adapter boundary.
+    """Render a page with a real headless Chromium browser.
 
-    The repository has no browser runtime dependency yet. Applications that
-    provide one inject an object implementing ``fetch`` (or a callable) into
-    :func:`fetch_page`. Keeping this default explicit prevents a silent switch
-    to a local-only or fake browser implementation in production.
+    Playwright is imported lazily so the rest of the monitoring module remains
+    importable in environments that only use the HTTP path. ``fetch_page``
+    applies the same visible-text/content-type/status usability heuristic to
+    this response that it applies to HTTP responses.
     """
 
+    def __init__(
+        self,
+        *,
+        timeout_seconds: float = DEFAULT_BROWSER_TIMEOUT_SECONDS,
+        settle_seconds: float = DEFAULT_BROWSER_SETTLE_SECONDS,
+        network_idle_timeout_seconds: float = DEFAULT_BROWSER_NETWORK_IDLE_TIMEOUT_SECONDS,
+        headless: bool = True,
+        user_agent: str = "CompetitorsMonitoring/1.0",
+    ) -> None:
+        if timeout_seconds <= 0:
+            raise ValueError("timeout_seconds must be positive")
+        if settle_seconds < 0:
+            raise ValueError("settle_seconds cannot be negative")
+        if network_idle_timeout_seconds <= 0:
+            raise ValueError("network_idle_timeout_seconds must be positive")
+        self.timeout_seconds = timeout_seconds
+        self.settle_seconds = settle_seconds
+        self.network_idle_timeout_seconds = network_idle_timeout_seconds
+        self.headless = headless
+        self.user_agent = user_agent
+
     def fetch(self, url: str) -> HttpResponse:
-        raise BrowserFetchError(
-            "browser fallback is required for {!r}, but no browser fetcher is configured".format(
-                url
-            )
+        _validate_url(url)
+        try:
+            from playwright.sync_api import TimeoutError as PlaywrightTimeoutError
+            from playwright.sync_api import sync_playwright
+        except ImportError as exc:
+            raise BrowserFetchError(
+                "browser fallback requires the Playwright Python package"
+            ) from exc
+
+        timeout_ms = int(self.timeout_seconds * 1000)
+        network_idle_timeout_ms = int(
+            min(self.network_idle_timeout_seconds, self.timeout_seconds) * 1000
         )
+        browser = None
+        context = None
+        try:
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=self.headless)
+                context = browser.new_context(user_agent=self.user_agent)
+                page = context.new_page()
+                page.set_default_navigation_timeout(timeout_ms)
+                response = page.goto(
+                    url,
+                    wait_until="domcontentloaded",
+                    timeout=timeout_ms,
+                )
+                if response is None:
+                    raise BrowserFetchError(
+                        f"browser navigation returned no HTTP response for {url!r}"
+                    )
+
+                # Some JS-heavy pages continue making analytics requests
+                # forever. Network idle is therefore a bounded best-effort
+                # settling signal, not a requirement for success.
+                try:
+                    page.wait_for_load_state(
+                        "networkidle",
+                        timeout=network_idle_timeout_ms,
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+
+                # Give client-side rendering a short, deterministic window
+                # after navigation settles. The final success decision is
+                # still made by _is_usable_http_response in fetch_page.
+                try:
+                    page.wait_for_function(
+                        """() => {
+                            if (document.readyState !== 'complete' || !document.body) {
+                                return false;
+                            }
+                            return (document.body.innerText || '')
+                                .replace(/\\s+/g, ' ')
+                                .trim()
+                                .length >= 40;
+                        }""",
+                        timeout=network_idle_timeout_ms,
+                    )
+                except PlaywrightTimeoutError:
+                    pass
+                if self.settle_seconds:
+                    page.wait_for_timeout(int(self.settle_seconds * 1000))
+
+                headers = dict(response.headers)
+                return HttpResponse(
+                    content=page.content(),
+                    http_status=int(response.status),
+                    headers=headers,
+                )
+        except BrowserFetchError:
+            raise
+        except Exception as exc:
+            raise BrowserFetchError(
+                f"browser fetch failed for {url!r}: {exc}"
+            ) from exc
+        finally:
+            # The context manager normally closes Playwright. Retain explicit
+            # cleanup for partially initialized launches and future adapters.
+            if context is not None:
+                try:
+                    context.close()
+                except Exception:
+                    pass
+            if browser is not None:
+                try:
+                    browser.close()
+                except Exception:
+                    pass
 
 
 def fetch_page(
@@ -1094,6 +1201,9 @@ __all__ = [
     "BROWSER_FETCH_METHOD",
     "BrowserFetchError",
     "BrowserPageFetcher",
+    "DEFAULT_BROWSER_NETWORK_IDLE_TIMEOUT_SECONDS",
+    "DEFAULT_BROWSER_SETTLE_SECONDS",
+    "DEFAULT_BROWSER_TIMEOUT_SECONDS",
     "DEFAULT_HTTP_TIMEOUT_SECONDS",
     "FetchResult",
     "HTTP_FETCH_METHOD",
