@@ -360,23 +360,77 @@ def compare_hashes(previous_hash: str, current_hash: str) -> bool:
 
 
 def generate_diff(previous_content: str, current_content: str) -> str:
-    """Generate a unified text diff for content that has already changed.
+    """Generate a display-oriented diff for content that has already changed.
 
     Callers should compare hashes first and skip this function when they match.
     Returning an empty string for identical inputs keeps the function safe for
     defensive use while the service's intended fast path remains hash-first.
+
+    The content passed here is normally canonical markup from
+    :func:`normalize_content`, which intentionally has no layout whitespace so
+    it can be hashed deterministically. That representation is not a useful
+    diff display format, so this function derives its own display segments at
+    block-element and sentence boundaries. The segmentation is local to the
+    diff and never feeds back into normalization or hashing.
     """
 
     if not isinstance(previous_content, str) or not isinstance(current_content, str):
         raise TypeError("diff inputs must be strings")
     return "".join(
         difflib.unified_diff(
-            previous_content.splitlines(keepends=True),
-            current_content.splitlines(keepends=True),
+            _display_diff_lines(previous_content),
+            _display_diff_lines(current_content),
             fromfile="previous",
             tofile="current",
         )
     )
+
+
+_DISPLAY_TOKEN_PATTERN = re.compile(r"<!--.*?-->|<[^>]+>|[^<]+", re.DOTALL)
+_DISPLAY_BLOCK_TAG_PATTERN = re.compile(
+    r"(?:</(?:address|article|aside|blockquote|dd|div|dl|dt|figcaption|figure|footer|h[1-6]|header|li|main|nav|ol|p|pre|section|table|tbody|td|tfoot|th|thead|tr|ul)\s*>|<br\s*/?>)",
+    re.IGNORECASE,
+)
+_DISPLAY_SENTENCE_BOUNDARY_PATTERN = re.compile(
+    r"(?<=[.!?])(?=(?:[\"'’”»\)\]]?)(?:\s+|$))|\n+"
+)
+
+
+def _display_diff_lines(content: str) -> list[str]:
+    """Split canonical content into stable, human-readable diff segments.
+
+    HTML tags remain attached to the surrounding segment so the diff retains
+    enough context for callers that display it, while visible text is split at
+    sentence boundaries. Block-level closing tags force a boundary even when a
+    paragraph contains no sentence punctuation.
+    """
+
+    segments: list[str] = []
+    current: list[str] = []
+
+    def flush() -> None:
+        value = "".join(current).strip()
+        current.clear()
+        if value:
+            segments.append(f"{value}\n")
+
+    for match in _DISPLAY_TOKEN_PATTERN.finditer(content):
+        token = match.group(0)
+        if token.startswith("<"):
+            current.append(token)
+            if _DISPLAY_BLOCK_TAG_PATTERN.fullmatch(token):
+                flush()
+            continue
+
+        parts = _DISPLAY_SENTENCE_BOUNDARY_PATTERN.split(token)
+        for index, part in enumerate(parts):
+            if part:
+                current.append(part)
+            if index < len(parts) - 1:
+                flush()
+
+    flush()
+    return segments
 
 
 class MonitoringRunError(MonitoringError):
