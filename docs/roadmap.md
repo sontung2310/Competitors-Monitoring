@@ -6,6 +6,12 @@ Reference: /docs/specs.md, /docs/architecture.md
 is deferred to Step 5, after backend, frontend, and integration are working
 end-to-end on website monitoring alone.
 
+**Branch-integrity check:** Run `python scripts/check_unmerged_branches.py`
+before review or when auditing `main`. It lists feature branches whose history
+is not reachable from `main`, accounts for squash-merged/patch-equivalent
+branches, and exits nonzero when a genuinely unmerged branch corresponds to a
+checked-off roadmap item. This is process tooling, not a roadmap feature.
+
 ---
 
 ## Step 1: Website Monitoring (Layer 1 Discovery + Layer 2 Monitoring)
