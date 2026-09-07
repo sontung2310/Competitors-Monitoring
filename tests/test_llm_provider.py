@@ -57,6 +57,21 @@ class LLMProviderTests(unittest.TestCase):
         self.assertEqual(client.responses.calls[0]["model"], "test-model")
         self.assertEqual(client.responses.calls[0]["store"], False)
 
+    def test_consumer_model_override_still_uses_shared_provider(self):
+        client = _FakeClient("generated fixture")
+        provider = OpenAIProvider.from_env(
+            {
+                "OPENAI_KEY": "test-key-not-used",
+                "OPENAI_MODEL": "shared-default",
+            },
+            model="consumer-model",
+            client=client,
+        )
+
+        provider.generate("make a fixture", instructions="return fixture text")
+
+        self.assertEqual(client.responses.calls[0]["model"], "consumer-model")
+
     def test_generate_json_parses_structured_output_and_sends_schema(self):
         payload = {"removed_key": "/product/one"}
         client = _FakeClient(json.dumps(payload))

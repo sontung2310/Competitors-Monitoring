@@ -3,11 +3,18 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from dataclasses import dataclass
-from json import JSONDecodeError
 from typing import Any, Mapping, Protocol, Sequence
 from urllib.parse import urlparse
+
+from backend.flask.llm_provider import (
+    LLMProvider,
+    LLMProviderConfigurationError,
+    OpenAIProvider,
+    OPENAI_MODEL_ENV_VAR,
+)
 
 from .normalization import INDEX_TYPE_VARIANTS
 
@@ -56,7 +63,7 @@ class CandidateClassifier(Protocol):
         """Return exactly one classification result for every input candidate."""
 
 
-DEFAULT_CLASSIFIER_MODEL = "gpt-5-nano"
+DEFAULT_CLASSIFIER_MODEL = "gpt-4o"
 CLASSIFIER_MODEL_ENV_VAR = "DISCOVERY_CLASSIFIER_MODEL"
 OPENAI_API_KEY_ENV_VAR = "OPENAI_KEY"
 _ALLOWED_PAGE_TYPES = (
@@ -125,13 +132,16 @@ navigation, authentication, a legal/privacy page, a utility endpoint, or an
 irrelevant asset. Choose the most useful coarse page type for each candidate.
 Return one classification for every candidate and do not invent URLs."""
 
+logger = logging.getLogger(__name__)
+
 
 class OpenAIClassifier:
-    """Classify unresolved candidates with OpenAI's structured Responses API."""
+    """Classify unresolved candidates through the shared LLM provider."""
 
     def __init__(
         self,
         *,
+        provider: LLMProvider | None = None,
         api_key: str | None = None,
         model: str = DEFAULT_CLASSIFIER_MODEL,
         client: Any | None = None,
@@ -143,15 +153,26 @@ class OpenAIClassifier:
             raise OpenAIClassifierConfigurationError(
                 "max_output_tokens must be a positive integer"
             )
-        if client is None:
-            if not api_key or not api_key.strip():
-                raise OpenAIClassifierConfigurationError(
-                    f"{OPENAI_API_KEY_ENV_VAR} is not configured"
-                )
-            client = _create_openai_client(api_key)
-        self.client = client
         self.model = model.strip()
         self.max_output_tokens = max_output_tokens
+        self.call_count = 0
+        self.last_results: tuple[ClassificationResult, ...] = ()
+        if provider is not None and any(value is not None for value in (api_key, client)):
+            raise OpenAIClassifierConfigurationError(
+                "provide either provider or api_key/client, not both"
+            )
+        if provider is not None:
+            self.provider = provider
+            return
+        try:
+            self.provider = OpenAIProvider(
+                api_key=api_key,
+                model=self.model,
+                client=client,
+                max_output_tokens=max_output_tokens,
+            )
+        except LLMProviderConfigurationError as exc:
+            raise OpenAIClassifierConfigurationError(str(exc)) from exc
 
     @classmethod
     def from_env(
@@ -173,12 +194,21 @@ class OpenAIClassifier:
             values: Mapping[str, str] = os.environ
         else:
             values = environ
-        return cls(
-            api_key=values.get(OPENAI_API_KEY_ENV_VAR),
-            model=values.get(CLASSIFIER_MODEL_ENV_VAR, DEFAULT_CLASSIFIER_MODEL),
-            client=client,
-            max_output_tokens=max_output_tokens,
+        model = (
+            values.get(CLASSIFIER_MODEL_ENV_VAR)
+            or values.get(OPENAI_MODEL_ENV_VAR)
+            or DEFAULT_CLASSIFIER_MODEL
         )
+        try:
+            provider = OpenAIProvider.from_env(
+                values,
+                model=model,
+                client=client,
+                max_output_tokens=max_output_tokens,
+            )
+        except LLMProviderConfigurationError as exc:
+            raise OpenAIClassifierConfigurationError(str(exc)) from exc
+        return cls(provider=provider, model=model, max_output_tokens=max_output_tokens)
 
     def classify(
         self,
@@ -198,56 +228,23 @@ class OpenAIClassifier:
             }
             for candidate in candidates
         ]
+        self.call_count += 1
         try:
-            response = self.client.responses.create(
-                model=self.model,
-                instructions=_OPENAI_INSTRUCTIONS,
-                input=json.dumps(
+            payload = self.provider.generate_json(
+                json.dumps(
                     {"candidates": request_candidates},
                     ensure_ascii=False,
                 ),
-                text={"format": _OPENAI_RESPONSE_FORMAT},
-                max_output_tokens=self.max_output_tokens,
-                store=False,
+                instructions=_OPENAI_INSTRUCTIONS,
+                response_format=_OPENAI_RESPONSE_FORMAT,
             )
         except Exception as exc:
             raise ClassificationError("OpenAI classification request failed") from exc
 
-        try:
-            payload = json.loads(_response_output_text(response))
-        except (JSONDecodeError, TypeError, ValueError) as exc:
-            raise ClassificationError(
-                "OpenAI classification response was not valid JSON"
-            ) from exc
-
         results = _parse_openai_results(payload)
         _validate_fallback_results(candidates, results)
-        return tuple(results)
-
-
-def _create_openai_client(api_key: str) -> Any:
-    try:
-        from openai import OpenAI
-    except ImportError as exc:
-        raise OpenAIClassifierConfigurationError(
-            "the openai package is required for OpenAIClassifier"
-        ) from exc
-    return OpenAI(api_key=api_key)
-
-
-def _load_dotenv() -> None:
-    try:
-        from dotenv import load_dotenv
-    except ImportError:
-        return
-    load_dotenv(override=False)
-
-
-def _response_output_text(response: Any) -> str:
-    output_text = getattr(response, "output_text", None)
-    if not isinstance(output_text, str) or not output_text.strip():
-        raise ClassificationError("OpenAI classification response had no output text")
-    return output_text
+        self.last_results = tuple(results)
+        return self.last_results
 
 
 def _parse_openai_results(payload: Any) -> tuple[ClassificationResult, ...]:
@@ -282,6 +279,16 @@ def _parse_openai_results(payload: Any) -> tuple[ClassificationResult, ...]:
             )
         )
     return tuple(results)
+
+
+def _load_dotenv() -> None:
+    """Load local environment configuration without requiring python-dotenv."""
+
+    try:
+        from dotenv import load_dotenv
+    except ImportError:
+        return
+    load_dotenv(override=False)
 
 
 class DeterministicStubClassifier:
@@ -377,7 +384,16 @@ def classify_candidates(
 
     fallback_results: Sequence[ClassificationResult] = ()
     if unresolved:
-        fallback_results = fallback_classifier.classify(tuple(unresolved))
+        try:
+            fallback_results = fallback_classifier.classify(tuple(unresolved))
+            _validate_fallback_results(unresolved, fallback_results)
+        except Exception as exc:
+            logger.warning(
+                "candidate fallback classification failed; retaining unresolved "
+                "candidates as discarded: %s",
+                exc,
+            )
+            fallback_results = DeterministicStubClassifier().classify(unresolved)
     _validate_fallback_results(unresolved, fallback_results)
     all_results = {**rule_results, **{result.url: result for result in fallback_results}}
     return tuple(all_results[candidate.url] for candidate in candidates)
