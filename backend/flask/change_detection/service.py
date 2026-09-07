@@ -33,6 +33,16 @@ from .repository import ChangeRepository
 class ChangeError(RuntimeError):
     """Raised when a change cannot be created safely."""
 
+    status_code = 400
+    code = "validation_error"
+
+
+class ChangeNotFoundError(ChangeError):
+    """Raised when a requested target used to scope changes is absent."""
+
+    status_code = 404
+    code = "not_found"
+
 
 class MonitoringTargetReader(Protocol):
     """Repository boundary used to resolve a target's page type."""
@@ -167,6 +177,50 @@ class ChangeService:
                 f"{label} content is unavailable; inject a snapshot_content_loader"
             )
         return content
+
+    def get_change(self, change_id: Any) -> dict[str, Any] | None:
+        """Return one persisted change for the read-only changes endpoint."""
+
+        return self.change_repository.get(change_id)
+
+    def list_changes(
+        self,
+        *,
+        competitor_id: Any | None = None,
+        target_id: Any | None = None,
+        since: datetime | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Read a bounded latest-change feed without bypassing repositories."""
+
+        target_ids: list[Any] | None = None
+        if target_id is not None:
+            target = self.monitoring_target_repository.get(target_id)
+            if target is None:
+                raise ChangeNotFoundError(f"monitoring target {target_id!r} was not found")
+            target_ids = [target_id]
+
+        if competitor_id is not None:
+            list_for_competitor = getattr(
+                self.monitoring_target_repository,
+                "list_for_competitor",
+                None,
+            )
+            if not callable(list_for_competitor):
+                raise ChangeError("target repository cannot scope changes by competitor")
+            competitor_targets = list_for_competitor(competitor_id)
+            competitor_target_ids = [target["id"] for target in competitor_targets]
+            if target_ids is None:
+                target_ids = competitor_target_ids
+            else:
+                allowed_ids = set(competitor_target_ids)
+                target_ids = [value for value in target_ids if value in allowed_ids]
+
+        return self.change_repository.list(
+            monitoring_target_ids=target_ids,
+            since=since,
+            limit=limit,
+        )
 
 
 def create_change(

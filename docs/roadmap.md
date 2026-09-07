@@ -56,14 +56,14 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 
 ## Step 2: Backend (Flask) — Website Monitoring Only
 
-- [ ] 2.1 Project skeleton per module: competitors/, discovery/, website_monitoring/, snapshot/, change_detection/, scheduler/, database/ (social_monitoring/ scaffolded but not implemented yet)
-- [ ] 2.2 Layering inside each module: routes (presentation) → service (business logic) → repository (data access) — see architecture.md
-- [ ] 2.3 REST endpoints: competitor CRUD (website URL only for now), monitoring target CRUD (add/remove/activate/deactivate), candidate review (list SUGGESTED/DISCARDED, activate, edit, discard)
-- [ ] 2.4 REST endpoints: changes/events read (latest updates feed)
-- [ ] 2.5 Wire discovery, website_monitoring, change_detection into the service layer
-- [ ] 2.6 MongoDB data access layer (repositories only — no direct pymongo calls outside this layer)
-- [ ] 2.7 Error handling: timeouts, 4xx/5xx, invalid HTML, empty responses — consistent error response shape
-- [ ] 2.8 API contract doc: write endpoint shapes to /docs/api-contract.md as they're finalized
+- [x] 2.1 Project skeleton per module: competitors/, discovery/, website_monitoring/, snapshot/, change_detection/, scheduler/, database/ (social_monitoring/ scaffolded but not implemented yet)
+- [x] 2.2 Layering inside each module: routes (presentation) → service (business logic) → repository (data access) — see architecture.md
+- [x] 2.3 REST endpoints: competitor CRUD (website URL only for now), monitoring target CRUD (add/remove/activate/deactivate), candidate review (list SUGGESTED/DISCARDED, activate, edit, discard)
+- [x] 2.4 REST endpoints: changes/events read (latest updates feed)
+- [x] 2.5 Wire discovery, website_monitoring, change_detection into the service layer
+- [x] 2.6 MongoDB data access layer (repositories only — no direct pymongo calls outside this layer)
+- [x] 2.7 Error handling: timeouts, 4xx/5xx, invalid HTML, empty responses — consistent error response shape
+- [x] 2.8 API contract doc: write endpoint shapes to /docs/api-contract.md as they're finalized
 
 ## Step 3: Frontend (Django) — Website Monitoring Only
 
