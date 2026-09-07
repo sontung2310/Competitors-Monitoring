@@ -20,6 +20,9 @@ from backend.flask.website_monitoring.intervals import default_check_interval_mi
 from .classification import (
     CandidateClassifier,
     CandidateForClassification,
+    DeterministicStubClassifier,
+    OpenAIClassifier,
+    OpenAIClassifierConfigurationError,
     classify_by_rules,
     classify_candidates,
 )
@@ -122,7 +125,7 @@ class DiscoveryService:
         competitor_repository: CompetitorRepository,
         monitoring_target_repository: MonitoringTargetRepository,
         *,
-        fallback_classifier: CandidateClassifier,
+        fallback_classifier: CandidateClassifier | None = None,
         robots_source: Optional[RobotsSource] = None,
         sitemap_source: Optional[SitemapCollector] = None,
         link_source: Optional[WebsiteSource] = None,
@@ -147,7 +150,7 @@ class DiscoveryService:
             raise ValueError("liveness_backoff_seconds cannot be negative")
         self.competitor_repository = competitor_repository
         self.monitoring_target_repository = monitoring_target_repository
-        self.fallback_classifier = fallback_classifier
+        self.fallback_classifier = fallback_classifier or _default_classifier()
         # This is intentionally injected at the service boundary so tests can
         # avoid network access while production uses the Step 1.4 fetch
         # heuristic, including browser fallback.
@@ -600,6 +603,25 @@ def _normalize_candidate_status(status: str) -> str:
             "candidate status must be SUGGESTED, DISCARDED, or ALL"
         )
     return normalized
+
+
+def _default_classifier() -> CandidateClassifier:
+    """Use configured OpenAI classification without making configuration fatal.
+
+    Discovery remains usable in environments without an API key. Runtime
+    provider failures are handled by ``classify_candidates``; configuration
+    failures at startup use the same deterministic discarded fallback.
+    """
+
+    try:
+        return OpenAIClassifier.from_env()
+    except OpenAIClassifierConfigurationError as exc:
+        logger.warning(
+            "OpenAI candidate classifier is unavailable; using deterministic "
+            "discarded fallback: %s",
+            exc,
+        )
+        return DeterministicStubClassifier()
 
 
 def _is_activated(candidate: Mapping[str, Any]) -> bool:

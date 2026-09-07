@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from backend.flask.discovery.classification import (
     CandidateForClassification,
@@ -762,6 +763,36 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(persisted[0]["page_type"], "OTHER")
         self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
         self.assertEqual(persisted[0]["classification_method"], "LLM")
+
+    def test_discovery_service_defaults_to_stub_when_provider_is_unconfigured(self):
+        target_repository = _FakeTargetRepository()
+        with patch(
+            "backend.flask.discovery.service.OpenAIClassifier.from_env",
+            side_effect=OpenAIClassifierConfigurationError("OPENAI_KEY is not configured"),
+        ):
+            service = DiscoveryService(
+                _FakeCompetitorRepository(
+                    {
+                        "id": "competitor-1",
+                        "user_id": "company-a",
+                        "website_url": "https://example.com",
+                    }
+                ),
+                target_repository,
+                robots_source=_Robots(),
+                sitemap_source=_Source(
+                    (DiscoveredURL("https://example.com/ambiguous", "SITEMAP"),)
+                ),
+                link_source=_Source(),
+                liveness_checker=lambda url: True,
+            )
+
+            persisted = service.discover_website(
+                "competitor-1",
+                user_id="company-a",
+            )
+
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
 
     def test_liveness_gate_discards_collapsed_index_after_404(self):
         article_url = (
