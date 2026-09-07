@@ -25,6 +25,9 @@ from .storage import SnapshotStorage
 class SnapshotError(RuntimeError):
     """Raised when a snapshot cannot be created consistently."""
 
+    status_code = 500
+    code = "snapshot_error"
+
 
 class SnapshotService:
     """Coordinate normalized content, local storage, and snapshot metadata."""

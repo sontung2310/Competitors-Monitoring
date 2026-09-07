@@ -48,6 +48,23 @@ from .sources import (
 class DiscoveryError(RuntimeError):
     """Raised when a competitor cannot be discovered."""
 
+    status_code = 400
+    code = "validation_error"
+
+
+class DiscoveryNotFoundError(DiscoveryError):
+    """Raised when a candidate or competitor is absent."""
+
+    status_code = 404
+    code = "not_found"
+
+
+class DiscoveryConflictError(DiscoveryError):
+    """Raised when a candidate action conflicts with its current state."""
+
+    status_code = 409
+    code = "conflict"
+
 
 logger = logging.getLogger(__name__)
 
@@ -213,11 +230,11 @@ class DiscoveryService:
 
         candidate = self._get_candidate(candidate_id)
         if candidate.get("discovery_status") == "DISCARDED":
-            raise DiscoveryError(
+            raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} is DISCARDED and cannot be activated"
             )
         if candidate.get("discovery_status") not in {"SUGGESTED", "ACTIVE"}:
-            raise DiscoveryError(
+            raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} has an invalid activation status"
             )
         if candidate.get("active") and candidate.get("discovery_status") == "ACTIVE":
@@ -361,7 +378,7 @@ class DiscoveryService:
 
         candidate = self._get_candidate(candidate_id)
         if _is_activated(candidate):
-            raise DiscoveryError(
+            raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} is already activated and cannot be edited"
             )
 
@@ -373,7 +390,7 @@ class DiscoveryService:
             candidate_url,
         )
         if existing is not None and existing.get("id") != candidate.get("id"):
-            raise DiscoveryError(
+            raise DiscoveryConflictError(
                 f"candidate URL {candidate_url!r} already exists for competitor "
                 f"{competitor_id!r}"
             )
@@ -385,6 +402,25 @@ class DiscoveryService:
         )
         if updated is None:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be edited")
+        return updated
+
+    def discard_candidate(self, candidate_id: Any) -> dict[str, Any]:
+        """Mark an unactivated candidate DISCARDED without deleting its row."""
+
+        candidate = self._get_candidate(candidate_id)
+        if _is_activated(candidate):
+            raise DiscoveryConflictError(
+                f"candidate {candidate_id!r} is already activated and cannot be discarded"
+            )
+        if candidate.get("discovery_status") == "DISCARDED":
+            return candidate
+        updated = self.monitoring_target_repository.update(
+            candidate_id,
+            {"active": False, "discovery_status": "DISCARDED"},
+            competitor_id=candidate.get("competitor_id"),
+        )
+        if updated is None:
+            raise DiscoveryError(f"candidate {candidate_id!r} could not be discarded")
         return updated
 
     def remove_candidate(self, candidate_id: Any) -> bool:
@@ -438,13 +474,13 @@ class DiscoveryService:
     def _get_candidate(self, candidate_id: Any) -> dict[str, Any]:
         candidate = self.monitoring_target_repository.get(candidate_id)
         if candidate is None:
-            raise DiscoveryError(f"candidate {candidate_id!r} was not found")
+            raise DiscoveryNotFoundError(f"candidate {candidate_id!r} was not found")
         return candidate
 
     def _get_competitor(self, competitor_id: Any) -> dict[str, Any]:
         competitor = self.competitor_repository.get(competitor_id)
         if competitor is None:
-            raise DiscoveryError(f"competitor {competitor_id!r} was not found")
+            raise DiscoveryNotFoundError(f"competitor {competitor_id!r} was not found")
         return competitor
 
     def discover_website(
@@ -457,7 +493,7 @@ class DiscoveryService:
 
         competitor = self.competitor_repository.get(competitor_id, user_id=user_id)
         if competitor is None:
-            raise DiscoveryError(f"competitor {competitor_id!r} was not found")
+            raise DiscoveryNotFoundError(f"competitor {competitor_id!r} was not found")
         website_url = competitor["website_url"]
 
         source_candidates: dict[str, Sequence[DiscoveredURL]] = {}
