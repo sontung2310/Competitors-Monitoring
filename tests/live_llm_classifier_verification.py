@@ -46,6 +46,31 @@ SITES = (
     ("brownbagmarketing.com", "https://brownbagmarketing.com/"),
 )
 
+# These are the candidates that the pre-fix live run promoted through the LLM
+# fallback. Keep this review set explicit so a corrected run re-checks the
+# exact same candidates even after their persisted status has changed.
+PREVIOUS_LLM_PROMOTIONS = {
+    "lyfemarketing.com": (
+        "https://www.lyfemarketing.com/website-design-services-for-small-businesses",
+        "https://www.lyfemarketing.com/director-of-digital-marketing",
+        "https://www.lyfemarketing.com/roi-benefits-social-media-marketing",
+        "https://www.lyfemarketing.com/how-to-grow-a-church",
+        "https://www.lyfemarketing.com/8-quick-tips-email-marketing",
+        "https://www.lyfemarketing.com/beyonce-uses-social-media-promote-album-release",
+        "https://www.lyfemarketing.com/social-media-the-student-housing-industrys-best-marketing-source",
+    ),
+    "brownbagmarketing.com": (
+        "https://brownbagmarketing.com/paid-media-advertising",
+        "https://brownbagmarketing.com/atlanta-social-media-marketing-company",
+        "https://brownbagmarketing.com/veterinarians-digital-marketing",
+        "https://brownbagmarketing.com/atlanta-brand-marketing-agency",
+        "https://brownbagmarketing.com/aeo-content-strategies-for-nonprofits",
+        "https://brownbagmarketing.com/airbnb-new-logo-faces-backlash-all-part-of-the-plan",
+        "https://brownbagmarketing.com/marketing-it-so-happy-together-part-1",
+        "https://brownbagmarketing.com/snaping-into-snapchat-spectacles",
+    ),
+}
+
 
 class _FailingProvider:
     """Provider double used only to inject a real fallback-path failure."""
@@ -142,6 +167,54 @@ def _run_real_discovery(
     }
 
 
+def _reclassify_previous_llm_promotions(
+    targets: MonitoringTargetRepository,
+    competitor: dict[str, object],
+    urls: tuple[str, ...],
+    classifier: OpenAIClassifier,
+) -> list[dict[str, object]]:
+    """Run the fixed fallback against the exact pre-fix review set."""
+
+    candidates = []
+    existing_rows = []
+    for url in urls:
+        row = targets.find_by_url(competitor["id"], url)
+        if row is None:
+            raise AssertionError(f"review candidate disappeared from Atlas: {url}")
+        existing_rows.append(row)
+        candidates.append(
+            CandidateForClassification(
+                raw_url=str(row.get("raw_url") or row["url"]),
+                url=str(row["url"]),
+                title=row.get("title"),
+                sources=("REVIEW_SET",),
+            )
+        )
+
+    results = classify_candidates(tuple(candidates), classifier)
+    persisted = []
+    for row, result in zip(existing_rows, results):
+        updated = targets.upsert_discovered_candidate(
+            competitor_id=competitor["id"],
+            raw_url=str(row.get("raw_url") or row["url"]),
+            url=result.url,
+            page_type=result.page_type,
+            discovery_source=str(row.get("discovery_source") or "REVIEW_SET"),
+            discovery_status=result.discovery_status,
+            classification_method=result.classification_method,
+        )
+        persisted.append(
+            {
+                "id": updated["id"],
+                "url": updated["url"],
+                "page_type": updated["page_type"],
+                "discovery_status": updated["discovery_status"],
+                "classification_method": updated["classification_method"],
+            }
+        )
+    return persisted
+
+
 def _run_forced_failure(
     competitors: CompetitorRepository,
     targets: MonitoringTargetRepository,
@@ -236,11 +309,32 @@ def run_live_verification() -> dict[str, object]:
                 raise AssertionError(
                     f"{label}: full discovery produced no unresolved candidate to classify"
                 )
-        reports["sites"][label] = {
-            "competitor_id": competitor["id"],
-            "website_url": website_url,
-            "classifier_model": classifier.model,
-            **{key: value for key, value in report.items() if key != "summary"},
+            if label == SITES[0][0]:
+                # Run the failure-degradation check before the corrected
+                # review-set pass so that the report's final counts reflect
+                # the fixed classifier rather than the deterministic failure
+                # fallback's discarded updates.
+                reports["forced_failure"] = _run_forced_failure(
+                    competitors,
+                    targets,
+                    competitor,
+                )
+            review_classifier = OpenAIClassifier.from_env()
+            review_rows = _reclassify_previous_llm_promotions(
+                targets,
+                competitor,
+                PREVIOUS_LLM_PROMOTIONS[label],
+                review_classifier,
+            )
+            final_rows = targets.list_for_competitor(competitor["id"])
+            reports["sites"][label] = {
+                "competitor_id": competitor["id"],
+                "website_url": website_url,
+                "classifier_model": classifier.model,
+                **{key: value for key, value in report.items() if key != "summary"},
+                "review_set_llm_calls": review_classifier.call_count,
+                "review_set_results": review_rows,
+                "final": _counts(final_rows),
                 "source_summary": report["summary"],
                 "sample_persisted_rows": [
                     {
@@ -254,13 +348,8 @@ def run_live_verification() -> dict[str, object]:
                 ][:10],
             }
 
-        if first_competitor is None:
+        if first_competitor is None or "forced_failure" not in reports:
             raise AssertionError("no live competitor was selected")
-        reports["forced_failure"] = _run_forced_failure(
-            competitors,
-            targets,
-            first_competitor,
-        )
         return reports
     finally:
         client.close()
@@ -284,10 +373,13 @@ if __name__ == "__main__":
             "classifier_model",
             "before",
             "after",
+            "final",
             "llm_calls",
             "newly_suggested_from_discarded",
             "llm_results",
             "sample_persisted_rows",
+            "review_set_llm_calls",
+            "review_set_results",
         ):
             print(f"{key}={site_report[key]}")
         summary = site_report["source_summary"]

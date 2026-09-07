@@ -635,6 +635,37 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result[0].classification_method, "LLM")
         self.assertEqual(classifier.last_results, result)
 
+    def test_openai_classifier_prompt_requires_index_item_distinction(self):
+        provider = _RecordingLLMProvider(
+            {
+                "classifications": [
+                    {
+                        "url": "https://example.com/ambiguous",
+                        "page_type": "OTHER",
+                        "discovery_status": "DISCARDED",
+                    }
+                ]
+            }
+        )
+        classifier = OpenAIClassifier(provider=provider)
+
+        classifier.classify(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            )
+        )
+
+        instructions = " ".join(provider.calls[0]["instructions"].split())
+        self.assertIn("index-vs-item distinction strictly", instructions)
+        self.assertIn("individual article", instructions)
+        self.assertIn("flat descriptive slug is not an index merely", instructions)
+        self.assertIn("durable service or industry offering", instructions)
+        self.assertIn('homepage root URL (path "/")', instructions)
+        self.assertIn("choose DISCARDED rather than guessing", instructions)
+
     def test_openai_classifier_sends_default_gpt4o_to_shared_provider(self):
         client = _FakeOpenAIClient(
             {
