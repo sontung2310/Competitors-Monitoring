@@ -207,6 +207,33 @@ class ChangeCreationTests(unittest.TestCase):
 
         self.assertEqual(change["change_type"], "PAGE_UPDATE")
 
+    def test_processor_event_type_and_summary_are_persisted_without_page_type_remapping(self):
+        self.target_repository.page_type = "PRODUCT_LISTING"
+        previous = self._snapshot(
+            "000000000000000000000010",
+            '[{"key":"/product/old","name":"Old","price":"10.00"}]',
+        )
+        current = self._snapshot(
+            "000000000000000000000011",
+            '[{"key":"/product/new","name":"New","price":"12.00"}]',
+        )
+
+        change = self.service.create_change(
+            self.target_id,
+            previous,
+            current,
+            detected_at=self.detected_at,
+            change_type="PRODUCT_REMOVED",
+            summary="PRODUCT_REMOVED: Old (10.00) at /product/old",
+        )
+
+        self.assertEqual(change["change_type"], "PRODUCT_REMOVED")
+        self.assertEqual(
+            change["summary"],
+            "PRODUCT_REMOVED: Old (10.00) at /product/old",
+        )
+        self.assertEqual(derive_change_type("PRODUCT_LISTING"), "PAGE_UPDATE")
+
     def test_change_service_can_load_metadata_only_snapshots_through_injected_reader(self):
         self.target_repository.page_type = "TESTIMONIALS"
         contents = {

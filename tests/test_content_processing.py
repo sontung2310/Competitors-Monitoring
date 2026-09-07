@@ -5,8 +5,11 @@ from datetime import datetime, timezone
 from unittest.mock import Mock
 
 from backend.flask.website_monitoring.content_processing import (
+    ProductListingProcessor,
     ProcessResult,
     TextBlobProcessor,
+    diff_by_key,
+    extract_products,
     resolve_content_processor,
 )
 from backend.flask.website_monitoring.service import (
@@ -55,10 +58,71 @@ class TextBlobProcessorTests(unittest.TestCase):
         self.assertEqual(result.change_events[0]["change_type"], "NEW_BLOG")
         self.assertTrue(result.change_events[0]["summary"].startswith("NEW_BLOG:"))
 
-    def test_unmapped_page_type_defaults_to_text_blob(self):
+    def test_product_listing_page_type_resolves_to_structured_processor(self):
         processor = resolve_content_processor("PRODUCT_LISTING")
 
-        self.assertIsInstance(processor, TextBlobProcessor)
+        self.assertIsInstance(processor, ProductListingProcessor)
+
+    def test_extract_products_uses_url_name_and_current_sale_price(self):
+        content = """
+        <ul>
+          <li class="productListItem">
+            <span class="itemContainer" data-productsku="sku-1">
+              <a class="itemImage" href="/product/blue-shoe/sku-1/?utm_source=ad">
+                <img alt="Blue Shoe" />
+              </a>
+              <span class="itemInformation">
+                <span class="itemTitle">Blue Shoe</span>
+                <span class="itemPrice">Was $120.00 Now $80.00 Save 33%</span>
+              </span>
+            </span>
+          </li>
+        </ul>
+        """
+
+        self.assertEqual(
+            extract_products(content),
+            [{"key": "/product/blue-shoe/sku-1", "name": "Blue Shoe", "price": "80.00"}],
+        )
+
+    def test_diff_by_key_emits_add_remove_and_price_events(self):
+        previous = [
+            {"key": "/product/keep", "name": "Keep", "price": "10.00"},
+            {"key": "/product/remove", "name": "Remove", "price": "20.00"},
+        ]
+        current = [
+            {"key": "/product/keep", "name": "Keep", "price": "12.00"},
+            {"key": "/product/new", "name": "New", "price": "30.00"},
+        ]
+
+        events = diff_by_key(previous, current)
+
+        self.assertEqual(
+            [event["change_type"] for event in events],
+            ["NEW_PRODUCT", "PRODUCT_REMOVED", "PRICE_CHANGE"],
+        )
+        self.assertIn("/product/new", events[0]["summary"])
+        self.assertIn("20.00", events[1]["summary"])
+        self.assertIn("10.00 -> 12.00", events[2]["summary"])
+
+    def test_product_listing_processor_serializes_canonical_list_and_owns_event_types(self):
+        previous_content = '[{"key":"/product/old","name":"Old","price":"10.00"}]'
+        processor = ProductListingProcessor()
+
+        result = processor.process(
+            '<li class="productListItem"><a class="itemImage" href="/product/new/1/">'
+            '<span class="itemTitle">New</span><span class="itemPrice">Now $12.00</span>'
+            '</a></li>',
+            {
+                "content": previous_content,
+                "content_hash": hash_content(previous_content),
+            },
+        )
+
+        self.assertTrue(result.changed)
+        self.assertEqual(result.change_events[0]["change_type"], "NEW_PRODUCT")
+        self.assertEqual(result.change_events[1]["change_type"], "PRODUCT_REMOVED")
+        self.assertNotIn("PAGE_UPDATE", [event["change_type"] for event in result.change_events])
 
 
 class MonitoringProcessorDispatchTests(unittest.TestCase):
@@ -118,6 +182,10 @@ class MonitoringProcessorDispatchTests(unittest.TestCase):
 
         processor.process.assert_called_once_with("raw fetched content", None)
         self.assertEqual(change_service.create_change.call_count, 2)
+        self.assertEqual(
+            change_service.create_change.call_args_list[0].kwargs,
+            {"detected_at": now, "change_type": "NEW_BLOG", "summary": "first"},
+        )
         self.assertEqual(result["changes"], [{"id": "change-1"}, {"id": "change-2"}])
         self.assertIsNone(result["change"])
 
