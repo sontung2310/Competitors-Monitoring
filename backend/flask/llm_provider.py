@@ -91,10 +91,16 @@ class OpenAIProvider:
         cls,
         environ: Mapping[str, str] | None = None,
         *,
+        model: str | None = None,
         client: Any | None = None,
         max_output_tokens: int = DEFAULT_MAX_OUTPUT_TOKENS,
     ) -> "OpenAIProvider":
-        """Build a provider from process environment or an explicit mapping."""
+        """Build a provider from process environment or an explicit mapping.
+
+        ``model`` is an optional consumer-specific override.  This keeps the
+        provider's environment handling shared while allowing consumers such
+        as discovery classification to use their own configured default.
+        """
 
         if environ is None:
             _load_dotenv()
@@ -106,7 +112,7 @@ class OpenAIProvider:
                 values.get(OPENAI_API_KEY_ENV_VAR)
                 or values.get(OPENAI_STANDARD_API_KEY_ENV_VAR)
             ),
-            model=values.get(OPENAI_MODEL_ENV_VAR, DEFAULT_OPENAI_MODEL),
+            model=model or values.get(OPENAI_MODEL_ENV_VAR, DEFAULT_OPENAI_MODEL),
             client=client,
             max_output_tokens=max_output_tokens,
         )

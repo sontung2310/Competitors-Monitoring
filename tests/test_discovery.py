@@ -4,6 +4,7 @@ import json
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from backend.flask.discovery.classification import (
     CandidateForClassification,
@@ -185,6 +186,31 @@ class _FakeOpenAIResponses:
 class _FakeOpenAIClient:
     def __init__(self, payload):
         self.responses = _FakeOpenAIResponses(payload)
+
+
+class _RecordingLLMProvider:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def generate_json(self, prompt, *, instructions, response_format):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "instructions": instructions,
+                "response_format": response_format,
+            }
+        )
+        return self.payload
+
+
+class _FailingClassifier:
+    def __init__(self):
+        self.calls = 0
+
+    def classify(self, candidates):
+        self.calls += 1
+        raise RuntimeError("forced classifier outage")
 
 
 @dataclass
@@ -580,6 +606,130 @@ class DiscoveryTests(unittest.TestCase):
         with self.assertRaises(OpenAIClassifierConfigurationError):
             OpenAIClassifier.from_env({})
 
+    def test_openai_classifier_wraps_shared_provider_and_defaults_to_gpt4o(self):
+        provider = _RecordingLLMProvider(
+            {
+                "classifications": [
+                    {
+                        "url": "https://example.com/ambiguous",
+                        "page_type": "SERVICES",
+                        "discovery_status": "SUGGESTED",
+                    }
+                ]
+            }
+        )
+        classifier = OpenAIClassifier(provider=provider)
+
+        result = classifier.classify(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            )
+        )
+
+        self.assertEqual(classifier.model, "gpt-4o")
+        self.assertIs(classifier.provider, provider)
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(result[0].classification_method, "LLM")
+        self.assertEqual(classifier.last_results, result)
+
+    def test_openai_classifier_prompt_requires_index_item_distinction(self):
+        provider = _RecordingLLMProvider(
+            {
+                "classifications": [
+                    {
+                        "url": "https://example.com/ambiguous",
+                        "page_type": "OTHER",
+                        "discovery_status": "DISCARDED",
+                    }
+                ]
+            }
+        )
+        classifier = OpenAIClassifier(provider=provider)
+
+        classifier.classify(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            )
+        )
+
+        instructions = " ".join(provider.calls[0]["instructions"].split())
+        self.assertIn("index-vs-item distinction strictly", instructions)
+        self.assertIn("individual article", instructions)
+        self.assertIn("flat descriptive slug is not an index merely", instructions)
+        self.assertIn("durable service or industry offering", instructions)
+        self.assertIn('homepage root URL (path "/")', instructions)
+        self.assertIn("choose DISCARDED rather than guessing", instructions)
+
+    def test_openai_classifier_sends_default_gpt4o_to_shared_provider(self):
+        client = _FakeOpenAIClient(
+            {
+                "classifications": [
+                    {
+                        "url": "https://example.com/ambiguous",
+                        "page_type": "OTHER",
+                        "discovery_status": "DISCARDED",
+                    }
+                ]
+            }
+        )
+        classifier = OpenAIClassifier.from_env(
+            {"OPENAI_KEY": "test-key-not-used"},
+            client=client,
+        )
+
+        classifier.classify(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            )
+        )
+
+        self.assertEqual(client.responses.calls[0]["model"], "gpt-4o")
+
+    def test_rule_match_never_calls_real_classifier(self):
+        provider = _RecordingLLMProvider({"classifications": []})
+        classifier = OpenAIClassifier(provider=provider)
+
+        results = classify_candidates(
+            (
+                CandidateForClassification(
+                    "https://example.com/blog",
+                    "https://example.com/blog",
+                ),
+            ),
+            classifier,
+        )
+
+        self.assertEqual(results[0].page_type, "BLOG")
+        self.assertEqual(results[0].classification_method, "RULE")
+        self.assertEqual(classifier.call_count, 0)
+        self.assertEqual(provider.calls, [])
+
+    def test_fallback_failure_degrades_to_discarded_stub_result(self):
+        classifier = _FailingClassifier()
+        results = classify_candidates(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            ),
+            classifier,
+        )
+
+        self.assertEqual(classifier.calls, 1)
+        self.assertEqual(results[0].page_type, "OTHER")
+        self.assertEqual(results[0].discovery_status, "DISCARDED")
+        self.assertEqual(results[0].classification_method, "LLM")
+
     def test_discovery_service_collects_dedupes_classifies_and_persists(self):
         competitor = {
             "id": "competitor-1",
@@ -616,6 +766,64 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(classifier.batches), 1)
         self.assertEqual(len(target_repository.saved), 2)
         self.assertNotIn("SEARCH", service.last_summary.source_breakdown)
+
+    def test_discovery_service_degrades_when_fallback_classifier_fails(self):
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            target_repository,
+            fallback_classifier=_FailingClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/ambiguous", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(persisted), 1)
+        self.assertEqual(persisted[0]["url"], "https://example.com/ambiguous")
+        self.assertEqual(persisted[0]["page_type"], "OTHER")
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
+        self.assertEqual(persisted[0]["classification_method"], "LLM")
+
+    def test_discovery_service_defaults_to_stub_when_provider_is_unconfigured(self):
+        target_repository = _FakeTargetRepository()
+        with patch(
+            "backend.flask.discovery.service.OpenAIClassifier.from_env",
+            side_effect=OpenAIClassifierConfigurationError("OPENAI_KEY is not configured"),
+        ):
+            service = DiscoveryService(
+                _FakeCompetitorRepository(
+                    {
+                        "id": "competitor-1",
+                        "user_id": "company-a",
+                        "website_url": "https://example.com",
+                    }
+                ),
+                target_repository,
+                robots_source=_Robots(),
+                sitemap_source=_Source(
+                    (DiscoveredURL("https://example.com/ambiguous", "SITEMAP"),)
+                ),
+                link_source=_Source(),
+                liveness_checker=lambda url: True,
+            )
+
+            persisted = service.discover_website(
+                "competitor-1",
+                user_id="company-a",
+            )
+
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
 
     def test_liveness_gate_discards_collapsed_index_after_404(self):
         article_url = (
