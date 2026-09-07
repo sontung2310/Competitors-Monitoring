@@ -47,6 +47,9 @@ CHANGE_TYPE_BY_PAGE_TYPE = {
     "BLOG": "NEW_BLOG",
     "PRICING": "PRICE_CHANGE",
 }
+PROCESSOR_CHANGE_TYPES = frozenset(
+    {"NEW_PRODUCT", "PRODUCT_REMOVED", "PRICE_CHANGE"}
+)
 DEFAULT_CHANGE_TYPE = "PAGE_UPDATE"
 DEFAULT_CHANGE_STATUS = "NEW"
 
@@ -88,6 +91,8 @@ class ChangeService:
         current_snapshot: Mapping[str, Any],
         *,
         detected_at: Optional[datetime] = None,
+        change_type: Optional[str] = None,
+        summary: Optional[str] = None,
     ) -> dict[str, Any]:
         """Persist a change from two snapshots whose hashes differ.
 
@@ -124,15 +129,25 @@ class ChangeService:
                 "snapshot hashes differ but generate_diff returned no content"
             )
 
-        change_type = derive_change_type(page_type)
-        summary = summarize_diff(change_type, diff)
+        if change_type is None:
+            resolved_change_type = derive_change_type(page_type)
+        else:
+            if not isinstance(change_type, str) or not change_type.strip():
+                raise ChangeError("change_type override must be a non-empty string")
+            resolved_change_type = change_type.strip().upper()
+        if summary is None:
+            resolved_summary = summarize_diff(resolved_change_type, diff)
+        else:
+            if not isinstance(summary, str) or not summary.strip():
+                raise ChangeError("summary override must be a non-empty string")
+            resolved_summary = summary.strip()
         return self.change_repository.create(
             monitoring_target_id=target_id,
             previous_snapshot_id=_snapshot_id(previous_snapshot, "previous_snapshot"),
             current_snapshot_id=_snapshot_id(current_snapshot, "current_snapshot"),
             detected_at=detected_at or utc_now(),
-            change_type=change_type,
-            summary=summary,
+            change_type=resolved_change_type,
+            summary=resolved_summary,
             status=DEFAULT_CHANGE_STATUS,
         )
 
@@ -163,6 +178,8 @@ def create_change(
     monitoring_target_repository: MonitoringTargetReader,
     snapshot_content_loader: Optional[SnapshotContentLoader] = None,
     detected_at: Optional[datetime] = None,
+    change_type: Optional[str] = None,
+    summary: Optional[str] = None,
 ) -> dict[str, Any]:
     """Functional entry point for repository-backed change creation."""
 
@@ -175,6 +192,8 @@ def create_change(
         previous_snapshot,
         current_snapshot,
         detected_at=detected_at,
+        change_type=change_type,
+        summary=summary,
     )
 
 

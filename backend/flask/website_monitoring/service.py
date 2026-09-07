@@ -422,8 +422,10 @@ class ChangeCreator(Protocol):
         current_snapshot: Mapping[str, Any],
         *,
         detected_at: datetime,
+        change_type: str | None = None,
+        summary: str | None = None,
     ) -> dict[str, Any]:
-        """Persist one change derived from two different snapshots."""
+        """Persist one change, using a processor-owned event when supplied."""
 
 
 class MonitoringRunService:
@@ -582,13 +584,29 @@ class MonitoringRunService:
             changes: list[dict[str, Any]] = []
             if process_result.changed:
                 detected_at = self.clock()
-                for _event in process_result.change_events:
+                for event in process_result.change_events:
+                    if not isinstance(event, Mapping):
+                        raise MonitoringRunError(
+                            "content processor returned a non-mapping change event"
+                        )
+                    event_change_type = event.get("change_type")
+                    event_summary = event.get("summary")
+                    if not isinstance(event_change_type, str) or not event_change_type.strip():
+                        raise MonitoringRunError(
+                            "content processor returned an event without change_type"
+                        )
+                    if not isinstance(event_summary, str) or not event_summary.strip():
+                        raise MonitoringRunError(
+                            "content processor returned an event without summary"
+                        )
                     changes.append(
                         self.change_service.create_change(
                             target_id,
                             previous_snapshot,
                             current_snapshot,
                             detected_at=detected_at,
+                            change_type=event_change_type,
+                            summary=event_summary,
                         )
                     )
                 if changes:
