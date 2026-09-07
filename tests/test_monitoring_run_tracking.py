@@ -232,6 +232,8 @@ class _ChangeService:
         current_snapshot,
         *,
         detected_at,
+        change_type=None,
+        summary=None,
     ):
         self.calls.append(
             {
@@ -239,6 +241,8 @@ class _ChangeService:
                 "previous_snapshot": deepcopy(previous_snapshot),
                 "current_snapshot": deepcopy(current_snapshot),
                 "detected_at": detected_at,
+                "change_type": change_type,
+                "summary": summary,
             }
         )
         return {

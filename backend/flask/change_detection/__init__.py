@@ -5,6 +5,7 @@ from .service import (
     CHANGE_TYPE_BY_PAGE_TYPE,
     DEFAULT_CHANGE_STATUS,
     DEFAULT_CHANGE_TYPE,
+    PROCESSOR_CHANGE_TYPES,
     ChangeError,
     ChangeService,
     create_change,
@@ -18,6 +19,7 @@ __all__ = [
     "ChangeService",
     "DEFAULT_CHANGE_STATUS",
     "DEFAULT_CHANGE_TYPE",
+    "PROCESSOR_CHANGE_TYPES",
     "create_change",
     "derive_change_type",
 ]

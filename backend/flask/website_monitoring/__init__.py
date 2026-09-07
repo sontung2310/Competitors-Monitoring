@@ -14,8 +14,11 @@ from .intervals import (
 from .content_processing import (
     ContentProcessingError,
     ContentProcessor,
+    ProductListingProcessor,
     ProcessResult,
     TextBlobProcessor,
+    diff_by_key,
+    extract_products,
     resolve_content_processor,
 )
 from .service import (
@@ -42,6 +45,7 @@ __all__ = [
     "BROWSER_FETCH_METHOD",
     "ContentProcessingError",
     "ContentProcessor",
+    "ProductListingProcessor",
     "DEFAULT_CHECK_INTERVAL_MINUTES",
     "DEFAULT_RUN_STALE_AFTER",
     "AlreadyRunningError",
@@ -60,6 +64,8 @@ __all__ = [
     "RunAlreadyClaimedError",
     "ProcessResult",
     "TextBlobProcessor",
+    "diff_by_key",
+    "extract_products",
     "compare_hashes",
     "fetch_page",
     "generate_diff",

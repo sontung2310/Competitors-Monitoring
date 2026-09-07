@@ -37,7 +37,7 @@ end-to-end on website monitoring alone.
 - [x] 1.10 Manual Layer 2 target creation (user-added page not from discovery)
 - [x] 1.11 Delete vs. deactivate rule: hard-delete a target only if it has no snapshot/change history; otherwise set active = false to preserve foreign-key integrity on existing records
 - [x] 1.12 Extract existing monitoring logic behind the `ContentProcessor` interface (pure refactor, with real-target proof that behavior and hashes are unchanged)
-- [ ] 1.13 Implement `ProductListingProcessor` for `PRODUCT_LISTING` pages (structured extraction, keyed diff, and `NEW_PRODUCT`/`PRODUCT_REMOVED`/`PRICE_CHANGE` events)
+- [x] 1.13 Implement `ProductListingProcessor` for `PRODUCT_LISTING` pages (structured extraction, keyed diff, and `NEW_PRODUCT`/`PRODUCT_REMOVED`/`PRICE_CHANGE` events)
   - [x] WordPress comment-form/plugin volatile-noise normalization (TON-18; known false-positive change retained and documented)
   - [x] Generic exclusion of explicitly hidden HTML content from normalization (TON-20; applies to consent, utility, duplicate, and hidden-variant markup)
   - [x] Concrete Playwright browser fetcher for the 1.4 HTTP fallback gap (TON-19; HTTP remains first, browser rendering is used only for unusable responses)
