@@ -69,6 +69,44 @@ class MonitoringEngineTests(unittest.TestCase):
             hash_content(normalize_content(second)),
         )
 
+    def test_normalization_removes_wordpress_comment_form_plugin_noise(self):
+        first = (
+            '<main><div class="gf_browser_chrome gform_wrapper">'
+            '<p>Meaningful form introduction.</p>'
+            '<input class="gform_hidden" name="state_5" type="hidden" value="token-one" />'
+            '<input name="campaign" type="hidden" value="spring-sale" />'
+            '<li class="gfield gfield--type-honeypot"><label>Email</label>'
+            '<input name="input_10" type="text" value="" /></li>'
+            '<p class="akismet-fields-container" data-prefix="ak_">'
+            '<textarea name="ak_hp_textarea"></textarea>'
+            '<input id="ak_js_1" name="ak_js" type="hidden" value="146" />'
+            '</p></div></main>'
+        )
+        second = (
+            '<main><div class="gf_browser_unknown gform_wrapper">'
+            '<p>Meaningful form introduction.</p>'
+            '<input class="gform_hidden" name="state_5" type="hidden" value="token-two" />'
+            '<input name="campaign" type="hidden" value="spring-sale" />'
+            '<li class="gfield gfield--type-honeypot"><label>Phone</label>'
+            '<input name="input_10" type="text" value="" /></li>'
+            '<p class="akismet-fields-container" data-prefix="ak_">'
+            '<textarea name="ak_hp_textarea"></textarea>'
+            '<input id="ak_js_1" name="ak_js" type="hidden" value="219" />'
+            '</p></div></main>'
+        )
+
+        first_normalized = normalize_content(first)
+        second_normalized = normalize_content(second)
+
+        self.assertEqual(first_normalized, second_normalized)
+        self.assertIn("gform_wrapper", first_normalized)
+        self.assertIn("spring-sale", first_normalized)
+        self.assertNotIn("gf_browser_", first_normalized)
+        self.assertNotIn("honeypot", first_normalized)
+        self.assertNotIn("akismet", first_normalized)
+        self.assertNotIn("ak_js", first_normalized)
+        self.assertIn("&lt;volatile&gt;", first_normalized)
+
     def test_hash_comparison_is_deterministic(self):
         normalized = normalize_content("<p>Same content</p>")
         digest = hash_content(normalized)
