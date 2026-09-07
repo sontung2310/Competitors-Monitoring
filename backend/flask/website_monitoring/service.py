@@ -57,6 +57,9 @@ DEFAULT_BROWSER_NETWORK_IDLE_TIMEOUT_SECONDS = 5
 class MonitoringError(RuntimeError):
     """Raised when a monitoring operation cannot produce a valid result."""
 
+    status_code = 400
+    code = "validation_error"
+
 
 class BrowserFetchError(MonitoringError):
     """Raised when browser fallback is required but cannot be completed."""
@@ -439,6 +442,9 @@ class MonitoringRunError(MonitoringError):
 
 class AlreadyRunningError(MonitoringRunError):
     """Raised when a non-stale run already owns the requested target."""
+
+    status_code = 409
+    code = "already_running"
 
 
 class SnapshotCreator(Protocol):
@@ -1269,6 +1275,76 @@ def _header_value(headers: Any, name: str) -> str | None:
     return None
 
 
+class MonitoringTargetService:
+    """Business operations for the HTTP monitoring-target resource.
+
+    Candidate promotion, manual-target liveness checks, and history-aware
+    removal remain in ``DiscoveryService``. This service composes those
+    operations for target endpoints so routes never call a repository.
+    """
+
+    def __init__(self, repository: MonitoringTargetRepository, discovery_service: Any) -> None:
+        self.repository = repository
+        self.discovery_service = discovery_service
+
+    def list_targets(self, *, competitor_id: Any | None = None) -> list[dict[str, Any]]:
+        return self.repository.list(competitor_id=competitor_id)
+
+    def get_target(self, target_id: Any) -> dict[str, Any] | None:
+        return self.repository.get(target_id)
+
+    def add_manual_target(
+        self,
+        competitor_id: Any,
+        url: str,
+        page_type: str | None = None,
+    ) -> dict[str, Any]:
+        return self.discovery_service.add_manual_target(
+            competitor_id,
+            url,
+            page_type=page_type,
+        )
+
+    def update_target(
+        self,
+        target_id: Any,
+        updates: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        current = self.repository.get(target_id)
+        if current is None:
+            from backend.flask.errors import NotFoundError
+
+            raise NotFoundError(f"monitoring target {target_id!r} was not found")
+        allowed = {"active", "check_interval_minutes"}
+        unknown = set(updates) - allowed
+        if unknown:
+            raise ValueError(f"unsupported monitoring-target fields: {sorted(unknown)}")
+        if not updates:
+            raise ValueError("at least one monitoring-target field is required")
+
+        values = dict(updates)
+        # The target endpoint may activate a review row directly. Keeping the
+        # status transition here preserves the repository invariant that
+        # active=True never coexists with SUGGESTED/DISCARDED.
+        if values.get("active") is True and current.get("discovery_status") != "ACTIVE":
+            values["discovery_status"] = "ACTIVE"
+        updated = self.repository.update(target_id, values)
+        if updated is None:
+            from backend.flask.errors import NotFoundError
+
+            raise NotFoundError(f"monitoring target {target_id!r} was not found")
+        return updated
+
+    def remove_target(self, target_id: Any) -> dict[str, Any] | None:
+        current = self.repository.get(target_id)
+        if current is None:
+            from backend.flask.errors import NotFoundError
+
+            raise NotFoundError(f"monitoring target {target_id!r} was not found")
+        self.discovery_service.remove_candidate(target_id)
+        return self.repository.get(target_id)
+
+
 __all__ = [
     "BROWSER_FETCH_METHOD",
     "BrowserFetchError",
@@ -1281,6 +1357,7 @@ __all__ = [
     "HTTP_FETCH_METHOD",
     "HttpPageFetcher",
     "HttpResponse",
+    "MonitoringTargetService",
     "MIN_RENDERABLE_TEXT_LENGTH",
     "MonitoringError",
     "compare_hashes",

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Optional
+from typing import Any, Iterable, Optional
 
 from backend.flask.database.base_repository import (
     BaseMongoRepository,
@@ -78,14 +78,44 @@ class ChangeRepository(BaseMongoRepository):
             [("detected_at", -1)],
         )
 
+    def list(
+        self,
+        *,
+        monitoring_target_ids: Optional[Iterable[Any]] = None,
+        since: Optional[datetime] = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        """Return a bounded newest-first change feed through the repository."""
+
+        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 100:
+            raise ValueError("limit must be an integer between 1 and 100")
+        if since is not None:
+            _require_timestamp(since, "since")
+
+        query: dict[str, Any] = {}
+        if monitoring_target_ids is not None:
+            target_ids = [to_object_id(value) for value in monitoring_target_ids]
+            if not target_ids:
+                return []
+            query["monitoring_target_id"] = {"$in": target_ids}
+        if since is not None:
+            query["detected_at"] = {"$gte": since}
+
+        cursor = self.collection.find(query)
+        if hasattr(cursor, "sort"):
+            cursor = cursor.sort([("detected_at", -1)])
+        if hasattr(cursor, "limit"):
+            cursor = cursor.limit(limit)
+        return [serialize_document(document) for document in cursor]
+
 
 def _require_text(value: Any, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
 
 
-def _require_timestamp(value: Any) -> None:
+def _require_timestamp(value: Any, field: str = "detected_at") -> None:
     if not isinstance(value, datetime):
-        raise ValueError("detected_at must be a datetime")
+        raise ValueError(f"{field} must be a datetime")
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("detected_at must be timezone-aware")
+        raise ValueError(f"{field} must be timezone-aware")

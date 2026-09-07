@@ -10,7 +10,12 @@ from .classification import (
     classify_candidates,
     classify_by_rules,
 )
-from .service import DiscoveryError, DiscoveryService
+from .service import (
+    DiscoveryConflictError,
+    DiscoveryError,
+    DiscoveryNotFoundError,
+    DiscoveryService,
+)
 
 __all__ = [
     "CandidateClassifier",
@@ -18,6 +23,8 @@ __all__ = [
     "ClassificationResult",
     "DeterministicStubClassifier",
     "DiscoveryError",
+    "DiscoveryConflictError",
+    "DiscoveryNotFoundError",
     "DiscoveryService",
     "OpenAIClassifier",
     "OpenAIClassifierConfigurationError",

@@ -1,1 +1,5 @@
-"""Flask backend packages."""
+"""Flask backend packages and application factory."""
+
+from .app import create_app
+
+__all__ = ["create_app"]
