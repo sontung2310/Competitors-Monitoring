@@ -26,7 +26,10 @@ from .simulated_verification import (
     ProductSimulationResult,
     SimulatedVerificationError,
     simulate_blog_change,
+    simulate_product_mutation,
     simulate_product_listing_change,
+    simulate_services_change,
+    simulate_text_change,
 )
 from .service import (
     AlreadyRunningError,
@@ -84,6 +87,9 @@ __all__ = [
     "normalize_content",
     "resolve_content_processor",
     "simulate_blog_change",
+    "simulate_product_mutation",
     "simulate_product_listing_change",
+    "simulate_services_change",
+    "simulate_text_change",
     "default_check_interval_minutes",
 ]
