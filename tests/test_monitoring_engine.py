@@ -17,6 +17,7 @@ from backend.flask.website_monitoring.service import (
     hash_content,
     normalize_content,
 )
+from backend.flask.change_detection.service import summarize_diff
 
 
 class MonitoringEngineTests(unittest.TestCase):
@@ -258,6 +259,30 @@ class MonitoringEngineTests(unittest.TestCase):
         self.assertTrue(diff)
         self.assertIn("Old service copy", diff)
         self.assertIn("New service copy", diff)
+
+    def test_diff_uses_display_segments_without_changing_hash_input(self):
+        previous = (
+            "<main><p>Stable introduction. Stable context.</p>"
+            "<p>Old pricing sentence.</p></main>"
+        )
+        current = (
+            "<main><p>Stable introduction. Stable context.</p>"
+            "<p>New pricing sentence.</p></main>"
+        )
+        previous_normalized = normalize_content(previous)
+        current_normalized = normalize_content(current)
+
+        self.assertNotEqual(
+            hash_content(previous_normalized),
+            hash_content(current_normalized),
+        )
+        diff = generate_diff(previous_normalized, current_normalized)
+        summary = summarize_diff("PAGE_UPDATE", diff)
+
+        self.assertIn("Old pricing sentence.", diff)
+        self.assertIn("New pricing sentence.", diff)
+        self.assertIn("1 line(s) added, 1 line(s) removed", summary)
+        self.assertNotIn("70724 characters", summary)
 
     def test_identical_content_skips_diff_call(self):
         content = "<main>Unchanged service copy</main>\n"
