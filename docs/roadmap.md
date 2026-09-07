@@ -51,7 +51,7 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
   - [x] Text-blob display diff granularity for informative summaries (TON-17; hashing remains unchanged)
 - [x] 1.14 Simulated-change verification tooling for blog and product-listing scenarios, using offline LLM-generated fixtures with strict isolation from real fetch history
   - Reusable environment-configured LLM provider client is available for future consumers.
-  - CandidateClassifier provider unification (1.2b) remains separately deferred; this step does not wire the provider into discovery classification.
+  - CandidateClassifier provider unification is completed separately in 1.2b (TON-25); this step did not wire the provider into discovery classification.
 - [x] 1.15 Unified simulated-change acceptance suite: capture real content, LLM-mutate in memory, run the real processors, and verify new blog, services, product-add, price-change, and product-removal cases (TON-24; live five-case suite passed with Atlas counts unchanged). SOLD_OUT remains separately deferred under TON-23 because the JD Sports listing exposes no reliable availability signal.
 
 ## Step 2: Backend (Flask) — Website Monitoring Only
