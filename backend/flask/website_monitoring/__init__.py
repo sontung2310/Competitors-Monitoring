@@ -21,6 +21,13 @@ from .content_processing import (
     extract_products,
     resolve_content_processor,
 )
+from .simulated_verification import (
+    BlogSimulationResult,
+    ProductSimulationResult,
+    SimulatedVerificationError,
+    simulate_blog_change,
+    simulate_product_listing_change,
+)
 from .service import (
     AlreadyRunningError,
     BROWSER_FETCH_METHOD,
@@ -45,6 +52,7 @@ __all__ = [
     "BROWSER_FETCH_METHOD",
     "ContentProcessingError",
     "ContentProcessor",
+    "BlogSimulationResult",
     "ProductListingProcessor",
     "DEFAULT_CHECK_INTERVAL_MINUTES",
     "DEFAULT_RUN_STALE_AFTER",
@@ -63,6 +71,8 @@ __all__ = [
     "PAGE_TYPE_CHECK_INTERVAL_MINUTES",
     "RunAlreadyClaimedError",
     "ProcessResult",
+    "ProductSimulationResult",
+    "SimulatedVerificationError",
     "TextBlobProcessor",
     "diff_by_key",
     "extract_products",
@@ -73,5 +83,7 @@ __all__ = [
     "monitor_target",
     "normalize_content",
     "resolve_content_processor",
+    "simulate_blog_change",
+    "simulate_product_listing_change",
     "default_check_interval_minutes",
 ]
