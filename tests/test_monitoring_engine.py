@@ -107,6 +107,69 @@ class MonitoringEngineTests(unittest.TestCase):
         self.assertNotIn("ak_js", first_normalized)
         self.assertIn("&lt;volatile&gt;", first_normalized)
 
+    def test_normalization_excludes_jd_sports_hidden_consent_markup(self):
+        first = """
+        <main>
+          <h1>Sale</h1>
+          <div class="miniConsent rejectAllCookies" style="display: none">
+            <div class="overlay"></div>
+            <div class="banner">
+              <div class="bannerText">
+                <div class="consetHead">Cookies</div>
+                Accept All Cookies and Reject All Cookies
+              </div>
+            </div>
+          </div>
+          <div class="consent" style="display: none">
+            <div class="popupOverlay">
+              <div id="popupMessageLarger">
+                <div class="settingsHead">Your Cookie Settings</div>
+                <div class="subHeading">Privacy Preference Centre</div>
+              </div>
+            </div>
+          </div>
+          <div hidden>Hidden utility markup one</div>
+          <section style="visibility: hidden">Hidden variant one</section>
+          <p class="product-name">Visible product content</p>
+          <div style="display: block">Visible supporting content</div>
+        </main>
+        """
+        second = first.replace(
+            "Accept All Cookies and Reject All Cookies",
+            "Rotating consent copy and session-specific utility content",
+        ).replace("Hidden utility markup one", "Hidden utility markup two")
+        second = second.replace("Hidden variant one", "Hidden variant two")
+
+        first_normalized = normalize_content(first)
+        second_normalized = normalize_content(second)
+
+        self.assertEqual(first_normalized, second_normalized)
+        self.assertEqual(
+            hash_content(first_normalized),
+            hash_content(second_normalized),
+        )
+        self.assertIn("Visible product content", first_normalized)
+        self.assertIn("Visible supporting content", first_normalized)
+        self.assertNotIn("Accept All Cookies", first_normalized)
+        self.assertNotIn("Your Cookie Settings", first_normalized)
+        self.assertNotIn("Hidden utility markup", first_normalized)
+        self.assertNotIn("Hidden variant", first_normalized)
+
+    def test_normalization_keeps_content_without_explicit_capture_time_hidden_signal(self):
+        content = (
+            '<main><div class="dropdown closed">Meaningful menu content</div>'
+            '<details><summary>More information</summary>'
+            '<p>Interaction-revealed content</p></details>'
+            '<div style="display: none; display: block">Overridden visible content</div>'
+            '</main>'
+        )
+
+        normalized = normalize_content(content)
+
+        self.assertIn("Meaningful menu content", normalized)
+        self.assertIn("Interaction-revealed content", normalized)
+        self.assertIn("Overridden visible content", normalized)
+
     def test_hash_comparison_is_deterministic(self):
         normalized = normalize_content("<p>Same content</p>")
         digest = hash_content(normalized)

@@ -10,10 +10,11 @@ HTTP usability heuristic
 An HTTP response is usable when its status is in the 200-399 range, its
 Content-Type is HTML/XHTML (or is not supplied), and it contains at least 40
 characters of visible text after scripts, styles, templates, noscript blocks,
-and comments are removed. This catches error pages, empty SPA shells, and
-non-HTML resources without requiring a browser for ordinary HTML pages. A
-response that fails any check is eligible for the injected browser fallback;
-transport errors remain errors because there is no HTTP response to assess.
+comments, and explicitly hidden elements are removed. This catches error
+pages, empty SPA shells, and non-HTML resources without requiring a browser
+for ordinary HTML pages. A response that fails any check is eligible for the
+injected browser fallback; transport errors remain errors because there is no
+HTTP response to assess.
 """
 
 from __future__ import annotations
@@ -213,11 +214,20 @@ def normalize_content(raw_content: str) -> str:
     """Return deterministic canonical HTML suitable for content hashing.
 
     The normalizer removes non-visible script/style/template/noscript content,
-    comments, known request/render tokens, and cache-busting URL parameters.
-    It also sorts attributes and collapses text whitespace. Business content,
+    comments, content with an explicit ``hidden`` attribute, and content with
+    inline ``display: none`` or ``visibility: hidden`` declarations. It also
+    removes known request/render tokens and cache-busting URL parameters,
+    sorts attributes, and collapses text whitespace. Business content,
     meaningful URL parameters, element structure, and non-volatile attributes
     remain in the canonical form, so a real page change still changes the
     result.
+
+    Visibility is intentionally limited to explicit signals present in the
+    captured HTML. The parser does not attempt to evaluate external stylesheets
+    or infer whether a JavaScript-controlled interactive element will become
+    visible after a user action. This prevents static consent, utility, menu,
+    and A/B-variant markup from entering the hash without pretending that a
+    text normalizer can model every interactive UI state.
     """
 
     if not isinstance(raw_content, str):
@@ -692,6 +702,24 @@ _VOLATILE_GRAVITY_FIELD_PATTERNS = (
     re.compile(r"(?i)^state_\d+$"),
 )
 _WHITESPACE_PATTERN = re.compile(r"\s+")
+_VOID_HTML_TAGS = frozenset(
+    {
+        "area",
+        "base",
+        "br",
+        "col",
+        "embed",
+        "hr",
+        "img",
+        "input",
+        "link",
+        "meta",
+        "param",
+        "source",
+        "track",
+        "wbr",
+    }
+)
 
 
 class _CanonicalHTMLParser(HTMLParser):
@@ -705,12 +733,17 @@ class _CanonicalHTMLParser(HTMLParser):
         self._skip_depth = 0
         self._skip_tags: list[str] = []
         self._volatile_skip_tags: list[str] = []
+        self._hidden_tags: list[str] = []
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         normalized_tag = tag.lower()
         if self._volatile_skip_tags:
             if normalized_tag not in _VOID_HTML_TAGS:
                 self._volatile_skip_tags.append(normalized_tag)
+            return
+        if self._hidden_tags:
+            if normalized_tag not in _VOID_HTML_TAGS:
+                self._hidden_tags.append(normalized_tag)
             return
         if normalized_tag in _SKIPPED_CONTENT_TAGS:
             self._skip_depth += 1
@@ -721,6 +754,10 @@ class _CanonicalHTMLParser(HTMLParser):
         if _is_volatile_plugin_element(normalized_tag, attrs):
             if normalized_tag not in _VOID_HTML_TAGS:
                 self._volatile_skip_tags.append(normalized_tag)
+            return
+        if _is_explicitly_hidden(attrs):
+            if normalized_tag not in _VOID_HTML_TAGS:
+                self._hidden_tags.append(normalized_tag)
             return
         if self.capture_markup:
             self._parts.append(
@@ -735,9 +772,11 @@ class _CanonicalHTMLParser(HTMLParser):
         normalized_tag = tag.lower()
         if (
             self._volatile_skip_tags
+            or self._hidden_tags
             or self._skip_depth
             or normalized_tag in _SKIPPED_CONTENT_TAGS
             or _is_volatile_plugin_element(normalized_tag, attrs)
+            or _is_explicitly_hidden(attrs)
         ):
             return
         if self.capture_markup:
@@ -751,6 +790,10 @@ class _CanonicalHTMLParser(HTMLParser):
             if normalized_tag == self._volatile_skip_tags[-1]:
                 self._volatile_skip_tags.pop()
             return
+        if self._hidden_tags:
+            if normalized_tag == self._hidden_tags[-1]:
+                self._hidden_tags.pop()
+            return
         if self._skip_depth:
             if self._skip_tags and normalized_tag == self._skip_tags[-1]:
                 self._skip_tags.pop()
@@ -760,7 +803,7 @@ class _CanonicalHTMLParser(HTMLParser):
             self._parts.append(f"</{normalized_tag}>")
 
     def handle_data(self, data: str) -> None:
-        if self._skip_depth or self._volatile_skip_tags:
+        if self._skip_depth or self._volatile_skip_tags or self._hidden_tags:
             return
         collapsed = _WHITESPACE_PATTERN.sub(" ", data).strip()
         if not collapsed:
@@ -899,6 +942,42 @@ def _normalize_url_attribute(value: str) -> str:
 
 def _is_volatile_instance_value(value: str) -> bool:
     return bool(_INSTANCE_ID_VALUE_PATTERN.fullmatch(value.strip()))
+
+
+def _is_explicitly_hidden(attrs: list[tuple[str, str | None]]) -> bool:
+    """Return whether HTML explicitly marks an element as not visible.
+
+    This intentionally handles only stable, local signals that can be
+    determined without executing CSS or JavaScript: the boolean ``hidden``
+    attribute and the final inline values of ``display``/``visibility``.
+    Class names and external stylesheets are not interpreted here because
+    doing so would require a browser's computed-style engine and would blur
+    the boundary between initial page content and post-interaction state.
+    """
+
+    attributes = {name.lower(): value for name, value in attrs if name}
+    if "hidden" in attributes:
+        return True
+
+    style = attributes.get("style")
+    if not isinstance(style, str):
+        return False
+
+    declarations: dict[str, str] = {}
+    for declaration in re.sub(r"/\*.*?\*/", "", style, flags=re.S).split(";"):
+        if ":" not in declaration:
+            continue
+        name, value = declaration.split(":", 1)
+        normalized_name = name.strip().lower()
+        if normalized_name not in {"display", "visibility"}:
+            continue
+        declarations[normalized_name] = re.sub(
+            r"\s*!important\s*$", "", value.strip().lower()
+        )
+
+    return declarations.get("display") == "none" or declarations.get(
+        "visibility"
+    ) == "hidden"
 
 
 def _visible_text(content: str) -> str:
