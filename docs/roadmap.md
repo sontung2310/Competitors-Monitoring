@@ -42,7 +42,9 @@ end-to-end on website monitoring alone.
   - [x] Generic exclusion of explicitly hidden HTML content from normalization (TON-20; applies to consent, utility, duplicate, and hidden-variant markup)
   - [x] Concrete Playwright browser fetcher for the 1.4 HTTP fallback gap (TON-19; HTTP remains first, browser rendering is used only for unusable responses)
   - [x] Text-blob display diff granularity for informative summaries (TON-17; hashing remains unchanged)
-- [ ] 1.14 Simulated-change verification tooling for blog and product-listing scenarios, using offline LLM-generated fixtures with strict isolation from real fetch history
+- [x] 1.14 Simulated-change verification tooling for blog and product-listing scenarios, using offline LLM-generated fixtures with strict isolation from real fetch history
+  - Reusable environment-configured LLM provider client is available for future consumers.
+  - CandidateClassifier provider unification (1.2b) remains separately deferred; this step does not wire the provider into discovery classification.
 
 ## Step 2: Backend (Flask) — Website Monitoring Only
 

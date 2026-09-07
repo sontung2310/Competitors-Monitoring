@@ -102,6 +102,11 @@ class BaseMongoRepository:
             cursor = cursor.sort(list(sort))
         return [serialize_document(document) for document in cursor]
 
+    def count(self, query: Optional[Mapping[str, Any]] = None) -> int:
+        """Count documents through the repository boundary."""
+
+        return int(self.collection.count_documents(dict(query or {})))
+
     @staticmethod
     def _matched(result: Any) -> bool:
         """Read PyMongo's match count while remaining friendly to test doubles."""
