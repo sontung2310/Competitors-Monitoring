@@ -718,6 +718,11 @@ class DiscoveryTests(unittest.TestCase):
                     403,
                     {"Content-Type": "text/plain"},
                 ),
+                browser_fetcher=lambda _: HttpResponse(
+                    "Forbidden by bot protection",
+                    403,
+                    {"Content-Type": "text/plain"},
+                ),
             )
 
         target_repository = _FakeTargetRepository()
