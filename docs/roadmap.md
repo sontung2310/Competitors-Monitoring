@@ -40,6 +40,7 @@ end-to-end on website monitoring alone.
 - [ ] 1.13 Implement `ProductListingProcessor` for `PRODUCT_LISTING` pages (structured extraction, keyed diff, and `NEW_PRODUCT`/`PRODUCT_REMOVED`/`PRICE_CHANGE` events)
   - [x] WordPress comment-form/plugin volatile-noise normalization (TON-18; known false-positive change retained and documented)
   - [x] Generic exclusion of explicitly hidden HTML content from normalization (TON-20; applies to consent, utility, duplicate, and hidden-variant markup)
+  - [x] Concrete Playwright browser fetcher for the 1.4 HTTP fallback gap (TON-19; HTTP remains first, browser rendering is used only for unusable responses)
 - [ ] 1.14 Simulated-change verification tooling for blog and product-listing scenarios, using offline LLM-generated fixtures with strict isolation from real fetch history
 
 ## Step 2: Backend (Flask) — Website Monitoring Only
