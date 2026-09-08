@@ -190,10 +190,14 @@ class DiscoveryService:
         self,
         competitor_id: Any,
         status: str = "SUGGESTED",
+        *,
+        company_id: Any = None,
     ) -> list[dict[str, Any]]:
         """List reviewable candidates without exposing repository details."""
 
         normalized_status = _normalize_candidate_status(status)
+        if company_id is not None:
+            self._get_competitor(competitor_id, company_id=company_id)
         candidates = self.monitoring_target_repository.list_for_competitor(
             competitor_id,
             discovery_status=None
@@ -211,6 +215,8 @@ class DiscoveryService:
     def list_active_targets(
         self,
         competitor_id: Any | None = None,
+        *,
+        company_id: Any = None,
     ) -> list[dict[str, Any]]:
         """Return only targets eligible for monitoring or scheduling.
 
@@ -218,9 +224,20 @@ class DiscoveryService:
         querying the shared candidates/targets collection directly.
         """
 
-        return self.monitoring_target_repository.list_active_targets(competitor_id)
+        if company_id is None:
+            return self.monitoring_target_repository.list_active_targets(competitor_id)
+        competitors = self.competitor_repository.list_for_company(company_id)
+        competitor_ids = {competitor.get("id") for competitor in competitors}
+        if competitor_id is not None:
+            if str(competitor_id) not in {str(value) for value in competitor_ids}:
+                return []
+            return self.monitoring_target_repository.list_active_targets(competitor_id)
+        rows: list[dict[str, Any]] = []
+        for scoped_competitor_id in competitor_ids:
+            rows.extend(self.monitoring_target_repository.list_active_targets(scoped_competitor_id))
+        return rows
 
-    def activate_candidate(self, candidate_id: Any) -> dict[str, Any]:
+    def activate_candidate(self, candidate_id: Any, *, company_id: Any = None) -> dict[str, Any]:
         """Promote an inactive candidate to an active Layer 2 target.
 
         Candidate and target are one document in the current schema. Updating
@@ -228,7 +245,7 @@ class DiscoveryService:
         safe: no second monitoring-target row can be created.
         """
 
-        candidate = self._get_candidate(candidate_id)
+        candidate = self._get_candidate(candidate_id, company_id=company_id)
         if candidate.get("discovery_status") == "DISCARDED":
             raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} is DISCARDED and cannot be activated"
@@ -258,10 +275,16 @@ class DiscoveryService:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be activated")
         return updated
 
-    def add_candidate(self, competitor_id: Any, url: str) -> dict[str, Any]:
+    def add_candidate(
+        self,
+        competitor_id: Any,
+        url: str,
+        *,
+        company_id: Any = None,
+    ) -> dict[str, Any]:
         """Add a manual candidate that still requires user activation."""
 
-        competitor = self._get_competitor(competitor_id)
+        competitor = self._get_competitor(competitor_id, company_id=company_id)
         candidate_url = _candidate_url_for_competitor(url, competitor["website_url"])
         existing = self.monitoring_target_repository.find_by_url(
             competitor_id,
@@ -287,6 +310,8 @@ class DiscoveryService:
         competitor_id: Any,
         url: str,
         page_type: str | None = None,
+        *,
+        company_id: Any = None,
     ) -> dict[str, Any]:
         """Create an already-active user-selected Layer 2 target.
 
@@ -303,7 +328,7 @@ class DiscoveryService:
         manual request is a user decision to monitor that page.
         """
 
-        competitor = self._get_competitor(competitor_id)
+        competitor = self._get_competitor(competitor_id, company_id=company_id)
         try:
             canonical_url = canonicalize_raw_url(url)
         except (TypeError, ValueError) as exc:
@@ -373,17 +398,23 @@ class DiscoveryService:
             **updates,
         )
 
-    def edit_candidate(self, candidate_id: Any, new_url: str) -> dict[str, Any]:
+    def edit_candidate(
+        self,
+        candidate_id: Any,
+        new_url: str,
+        *,
+        company_id: Any = None,
+    ) -> dict[str, Any]:
         """Change an unactivated candidate's URL while retaining its metadata."""
 
-        candidate = self._get_candidate(candidate_id)
+        candidate = self._get_candidate(candidate_id, company_id=company_id)
         if _is_activated(candidate):
             raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} is already activated and cannot be edited"
             )
 
         competitor_id = candidate.get("competitor_id")
-        competitor = self._get_competitor(competitor_id)
+        competitor = self._get_competitor(competitor_id, company_id=company_id)
         candidate_url = _candidate_url_for_competitor(new_url, competitor["website_url"])
         existing = self.monitoring_target_repository.find_by_url(
             competitor_id,
@@ -404,10 +435,10 @@ class DiscoveryService:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be edited")
         return updated
 
-    def discard_candidate(self, candidate_id: Any) -> dict[str, Any]:
+    def discard_candidate(self, candidate_id: Any, *, company_id: Any = None) -> dict[str, Any]:
         """Mark an unactivated candidate DISCARDED without deleting its row."""
 
-        candidate = self._get_candidate(candidate_id)
+        candidate = self._get_candidate(candidate_id, company_id=company_id)
         if _is_activated(candidate):
             raise DiscoveryConflictError(
                 f"candidate {candidate_id!r} is already activated and cannot be discarded"
@@ -423,7 +454,7 @@ class DiscoveryService:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be discarded")
         return updated
 
-    def remove_candidate(self, candidate_id: Any) -> bool:
+    def remove_candidate(self, candidate_id: Any, *, company_id: Any = None) -> bool:
         """Delete an unactivated/historyless target or deactivate its history.
 
         Candidates and active targets share one collection. An ACTIVE row with
@@ -434,7 +465,7 @@ class DiscoveryService:
         rows with no history are safe to hard-delete.
         """
 
-        candidate = self._get_candidate(candidate_id)
+        candidate = self._get_candidate(candidate_id, company_id=company_id)
         if _is_activated(candidate):
             if self.snapshot_repository is None or self.change_repository is None:
                 raise DiscoveryError(
@@ -471,14 +502,19 @@ class DiscoveryService:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be removed")
         return True
 
-    def _get_candidate(self, candidate_id: Any) -> dict[str, Any]:
+    def _get_candidate(self, candidate_id: Any, *, company_id: Any = None) -> dict[str, Any]:
         candidate = self.monitoring_target_repository.get(candidate_id)
         if candidate is None:
             raise DiscoveryNotFoundError(f"candidate {candidate_id!r} was not found")
+        if company_id is not None:
+            self._get_competitor(candidate.get("competitor_id"), company_id=company_id)
         return candidate
 
-    def _get_competitor(self, competitor_id: Any) -> dict[str, Any]:
-        competitor = self.competitor_repository.get(competitor_id)
+    def _get_competitor(self, competitor_id: Any, *, company_id: Any = None) -> dict[str, Any]:
+        competitor = self.competitor_repository.get(
+            competitor_id,
+            company_id=company_id,
+        ) if company_id is not None else self.competitor_repository.get(competitor_id)
         if competitor is None:
             raise DiscoveryNotFoundError(f"competitor {competitor_id!r} was not found")
         return competitor
@@ -488,10 +524,17 @@ class DiscoveryService:
         competitor_id: Any,
         *,
         user_id: Optional[str] = None,
+        company_id: Any = None,
     ) -> list[dict[str, Any]]:
         """Discover, classify, and persist Layer 2 candidates for one competitor."""
 
-        competitor = self.competitor_repository.get(competitor_id, user_id=user_id)
+        if company_id is not None:
+            competitor = self.competitor_repository.get(
+                competitor_id,
+                company_id=company_id,
+            )
+        else:
+            competitor = self.competitor_repository.get(competitor_id, user_id=user_id)
         if competitor is None:
             raise DiscoveryNotFoundError(f"competitor {competitor_id!r} was not found")
         website_url = competitor["website_url"]

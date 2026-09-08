@@ -12,6 +12,9 @@ from werkzeug.exceptions import HTTPException
 from backend.flask.change_detection.repository import ChangeRepository
 from backend.flask.change_detection.routes import changes_blueprint
 from backend.flask.change_detection.service import ChangeService
+from backend.flask.companies.repository import CompanyRepository
+from backend.flask.companies.routes import companies_blueprint
+from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.competitors.routes import competitors_blueprint
 from backend.flask.competitors.service import CompetitorService
@@ -22,6 +25,7 @@ from backend.flask.errors import APIError, error_from_exception
 from backend.flask.snapshot.repository import SnapshotRepository
 from backend.flask.snapshot.service import SnapshotService
 from backend.flask.snapshot.storage import SnapshotStorage
+from backend.flask.website_monitoring.simulated_persistence import SimulationPersistenceService
 from backend.flask.website_monitoring.repository import (
     MonitoringRunRepository,
     MonitoringTargetRepository,
@@ -74,6 +78,7 @@ def create_app(
         app.extensions["mongo_client"] = client
 
     app.register_blueprint(competitors_blueprint, url_prefix="/api")
+    app.register_blueprint(companies_blueprint, url_prefix="/api")
     app.register_blueprint(discovery_blueprint, url_prefix="/api")
     app.register_blueprint(monitoring_blueprint, url_prefix="/api")
     app.register_blueprint(changes_blueprint, url_prefix="/api")
@@ -88,6 +93,7 @@ def _build_services(
     storage_root: str | None,
 ) -> dict[str, Any]:
     competitor_repository = CompetitorRepository.from_database(database)
+    company_repository = CompanyRepository.from_database(database)
     target_repository = MonitoringTargetRepository.from_database(database)
     snapshot_repository = SnapshotRepository.from_database(database)
     change_repository = ChangeRepository.from_database(database)
@@ -96,6 +102,7 @@ def _build_services(
     # Index creation belongs to repositories; the factory only invokes their
     # public setup operation before exposing them to business services.
     for repository in (
+        company_repository,
         competitor_repository,
         target_repository,
         snapshot_repository,
@@ -104,24 +111,46 @@ def _build_services(
     ):
         repository.ensure_indexes()
 
+    company_service = CompanyService(company_repository)
+    demo_companies = company_service.ensure_demo_companies()
+    company_by_host = {
+        "lyfemarketing.com": demo_companies[0]["id"],
+        "jd-sports.com.au": demo_companies[1]["id"],
+    }
+    competitor_repository.migrate_legacy_user_ids(company_by_host)
+
     discovery_service = DiscoveryService(
         competitor_repository,
         target_repository,
         snapshot_repository=snapshot_repository,
         change_repository=change_repository,
     )
-    change_service = ChangeService(change_repository, target_repository)
-    target_service = MonitoringTargetService(target_repository, discovery_service)
+    change_service = ChangeService(
+        change_repository,
+        target_repository,
+        competitor_repository=competitor_repository,
+    )
+    target_service = MonitoringTargetService(
+        target_repository,
+        discovery_service,
+        competitor_repository=competitor_repository,
+    )
     monitoring_service = MonitoringRunService.from_database(
         database,
         storage_root=storage_root,
     )
+    simulation_service = SimulationPersistenceService.from_database(
+        database,
+        storage_root=storage_root,
+    )
     return {
+        "companies": company_service,
         "competitors": CompetitorService(competitor_repository, user_id=user_id),
         "discovery": discovery_service,
         "targets": target_service,
         "changes": change_service,
         "monitoring": monitoring_service,
+        "simulation": simulation_service,
     }
 
 

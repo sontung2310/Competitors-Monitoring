@@ -36,6 +36,7 @@ class SnapshotRepository(BaseMongoRepository):
         storage_path: str,
         fetch_method: str,
         http_status: int,
+        is_simulated: bool = False,
         now: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Insert snapshot metadata and return its serialized representation."""
@@ -46,6 +47,8 @@ class SnapshotRepository(BaseMongoRepository):
         _require_relative_storage_path(storage_path)
         _require_text(fetch_method, "fetch_method")
         _require_http_status(http_status)
+        if not isinstance(is_simulated, bool):
+            raise ValueError("is_simulated must be a boolean")
 
         timestamp = now or utc_now()
         document = {
@@ -59,6 +62,8 @@ class SnapshotRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
+        if is_simulated:
+            document["is_simulated"] = True
         result = self.collection.insert_one(document)
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:
@@ -72,11 +77,27 @@ class SnapshotRepository(BaseMongoRepository):
             self.collection.find_one({"_id": to_object_id(snapshot_id)})
         )
 
-    def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
-        """Return a target's snapshot history, newest first."""
+    def list_for_target(
+        self,
+        monitoring_target_id: Any,
+        *,
+        include_simulated: bool = True,
+    ) -> list[dict[str, Any]]:
+        """Return a target's snapshot history, newest first.
 
+        ``include_simulated=False`` is the explicit real-history query used by
+        the monitoring engine. Legacy rows without the flag are real rows.
+        """
+
+        query: dict[str, Any] = {
+            "monitoring_target_id": to_object_id(monitoring_target_id),
+        }
+        if not isinstance(include_simulated, bool):
+            raise ValueError("include_simulated must be a boolean")
+        if not include_simulated:
+            query["is_simulated"] = {"$ne": True}
         return self._find_sorted(
-            {"monitoring_target_id": to_object_id(monitoring_target_id)},
+            query,
             [("captured_at", -1)],
         )
 

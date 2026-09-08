@@ -31,6 +31,10 @@ from .simulated_verification import (
     simulate_services_change,
     simulate_text_change,
 )
+from .simulated_persistence import (
+    SimulationPersistenceError,
+    SimulationPersistenceService,
+)
 from .service import (
     AlreadyRunningError,
     BROWSER_FETCH_METHOD,
@@ -78,6 +82,8 @@ __all__ = [
     "ProcessResult",
     "ProductSimulationResult",
     "SimulatedVerificationError",
+    "SimulationPersistenceError",
+    "SimulationPersistenceService",
     "TextBlobProcessor",
     "diff_by_key",
     "extract_products",

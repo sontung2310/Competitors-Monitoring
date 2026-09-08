@@ -73,10 +73,12 @@ class ChangeService:
         monitoring_target_repository: MonitoringTargetReader,
         *,
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
+        competitor_repository: Any | None = None,
     ) -> None:
         self.change_repository = change_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.snapshot_content_loader = snapshot_content_loader
+        self.competitor_repository = competitor_repository
 
     @classmethod
     def from_database(
@@ -85,6 +87,7 @@ class ChangeService:
         monitoring_target_repository: MonitoringTargetReader,
         *,
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
+        competitor_repository: Any | None = None,
     ) -> "ChangeService":
         """Build a service with a repository backed by a database handle."""
 
@@ -92,6 +95,7 @@ class ChangeService:
             ChangeRepository.from_database(database),
             monitoring_target_repository,
             snapshot_content_loader=snapshot_content_loader,
+            competitor_repository=competitor_repository,
         )
 
     def create_change(
@@ -103,6 +107,7 @@ class ChangeService:
         detected_at: Optional[datetime] = None,
         change_type: Optional[str] = None,
         summary: Optional[str] = None,
+        is_simulated: bool = False,
     ) -> dict[str, Any]:
         """Persist a change from two snapshots whose hashes differ.
 
@@ -151,6 +156,8 @@ class ChangeService:
             if not isinstance(summary, str) or not summary.strip():
                 raise ChangeError("summary override must be a non-empty string")
             resolved_summary = summary.strip()
+        if not isinstance(is_simulated, bool):
+            raise ChangeError("is_simulated must be a boolean")
         return self.change_repository.create(
             monitoring_target_id=target_id,
             previous_snapshot_id=_snapshot_id(previous_snapshot, "previous_snapshot"),
@@ -159,6 +166,7 @@ class ChangeService:
             change_type=resolved_change_type,
             summary=resolved_summary,
             status=DEFAULT_CHANGE_STATUS,
+            is_simulated=is_simulated,
         )
 
     def _load_content(
@@ -178,22 +186,62 @@ class ChangeService:
             )
         return content
 
-    def get_change(self, change_id: Any) -> dict[str, Any] | None:
+    def get_change(
+        self,
+        change_id: Any,
+        *,
+        company_id: Any | None = None,
+    ) -> dict[str, Any] | None:
         """Return one persisted change for the read-only changes endpoint."""
 
-        return self.change_repository.get(change_id)
+        change = self.change_repository.get(change_id)
+        if change is None or company_id is None:
+            return change
+        self._require_company_repository()
+        target = self.monitoring_target_repository.get(change.get("monitoring_target_id"))
+        if target is None:
+            return None
+        competitor = self.competitor_repository.get(
+            target.get("competitor_id"),
+            company_id=company_id,
+        )
+        return change if competitor is not None else None
 
     def list_changes(
         self,
         *,
         competitor_id: Any | None = None,
         target_id: Any | None = None,
+        company_id: Any | None = None,
         since: datetime | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         """Read a bounded latest-change feed without bypassing repositories."""
 
         target_ids: list[Any] | None = None
+        if company_id is not None:
+            self._require_company_repository()
+            scoped_competitors = self.competitor_repository.list_for_company(company_id)
+            scoped_competitor_ids = [competitor["id"] for competitor in scoped_competitors]
+            if competitor_id is not None and str(competitor_id) not in {
+                str(value) for value in scoped_competitor_ids
+            }:
+                return []
+            if target_id is not None:
+                target = self.monitoring_target_repository.get(target_id)
+                if target is None or str(target.get("competitor_id")) not in {
+                    str(value) for value in scoped_competitor_ids
+                }:
+                    return []
+            if competitor_id is None:
+                target_ids = []
+                for scoped_competitor_id in scoped_competitor_ids:
+                    target_ids.extend(
+                        target["id"]
+                        for target in self.monitoring_target_repository.list_for_competitor(
+                            scoped_competitor_id
+                        )
+                    )
         if target_id is not None:
             target = self.monitoring_target_repository.get(target_id)
             if target is None:
@@ -222,6 +270,10 @@ class ChangeService:
             limit=limit,
         )
 
+    def _require_company_repository(self) -> None:
+        if self.competitor_repository is None:
+            raise ChangeError("company-scoped changes require a competitor repository")
+
 
 def create_change(
     target_id: Any,
@@ -234,6 +286,7 @@ def create_change(
     detected_at: Optional[datetime] = None,
     change_type: Optional[str] = None,
     summary: Optional[str] = None,
+    is_simulated: bool = False,
 ) -> dict[str, Any]:
     """Functional entry point for repository-backed change creation."""
 
@@ -248,6 +301,7 @@ def create_change(
         detected_at=detected_at,
         change_type=change_type,
         summary=summary,
+        is_simulated=is_simulated,
     )
 
 
