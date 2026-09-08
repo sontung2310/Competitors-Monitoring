@@ -36,6 +36,7 @@ class ChangeRepository(BaseMongoRepository):
         change_type: str,
         summary: str,
         status: str,
+        is_simulated: bool = False,
         now: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Insert a change record and return its serialized representation."""
@@ -44,6 +45,8 @@ class ChangeRepository(BaseMongoRepository):
         _require_text(change_type, "change_type")
         _require_text(summary, "summary")
         _require_text(status, "status")
+        if not isinstance(is_simulated, bool):
+            raise ValueError("is_simulated must be a boolean")
 
         timestamp = now or utc_now()
         document = {
@@ -57,6 +60,8 @@ class ChangeRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
+        if is_simulated:
+            document["is_simulated"] = True
         result = self.collection.insert_one(document)
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:
