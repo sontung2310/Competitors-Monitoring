@@ -57,6 +57,7 @@ CANDIDATE = {
 class FakeAPIClient:
     def __init__(self) -> None:
         self.manual_error = False
+        self.discovery_timeout = False
         self.companies = [COMPANY]
         self.competitors = [COMPETITOR]
         self.targets = [TARGET, CANDIDATE]
@@ -106,6 +107,16 @@ class FakeAPIClient:
             )
         return TARGET
 
+    def discover(self, competitor_id, company_id):
+        assert competitor_id == COMPETITOR["id"]
+        assert company_id == COMPANY["id"]
+        if self.discovery_timeout:
+            raise APIClientError(
+                "the monitoring API could not be reached: timed out",
+                code="backend_timeout",
+            )
+        return {"candidates": [CANDIDATE], "summary": None}
+
 
 class DjangoFrontendViewTests(SimpleTestCase):
     def setUp(self):
@@ -154,3 +165,17 @@ class DjangoFrontendViewTests(SimpleTestCase):
             "manual target URL &#x27;https://www.lyfemarketing.com/dead-page&#x27; failed liveness checks after 3 attempts; target was not created",
             status_code=400,
         )
+
+    def test_discovery_timeout_uses_friendly_polling_state(self):
+        self.client_data.discovery_timeout = True
+        response = self.client.post(
+            "/competitors/competitor-lyfe/discover/",
+            {"company_id": COMPANY["id"]},
+        )
+
+        self.assertEqual(response.status_code, 202)
+        self.assertContains(response, "Discovery is still working", status_code=202)
+        self.assertContains(response, "This can take a few minutes for larger sites.", status_code=202)
+        self.assertContains(response, "data-auto-refresh", status_code=202)
+        self.assertContains(response, "discovery_pending=1", status_code=202)
+        self.assertNotContains(response, "the monitoring API could not be reached: timed out", status_code=202)

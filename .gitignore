@@ -7,5 +7,6 @@
 .DS_Store
 __pycache__/
 *.py[cod]
+frontend.sqlite3
 storage/snapshots/*
 !storage/snapshots/.gitkeep

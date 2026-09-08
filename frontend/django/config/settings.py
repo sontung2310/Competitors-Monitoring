@@ -58,4 +58,4 @@ STATICFILES_DIRS = [FRONTEND_DIR / "static"]
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 FLASK_API_BASE_URL = os.environ.get("FLASK_API_BASE_URL", "http://localhost:5000/api")
-FLASK_API_TIMEOUT_SECONDS = float(os.environ.get("FLASK_API_TIMEOUT_SECONDS", "180"))
+FLASK_API_TIMEOUT_SECONDS = float(os.environ.get("FLASK_API_TIMEOUT_SECONDS", "60"))

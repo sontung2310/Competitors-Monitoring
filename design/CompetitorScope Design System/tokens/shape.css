@@ -1,0 +1,13 @@
+:root{
+  --radius-sm:6px;   /* inputs, small badges */
+  --radius-md:10px;  /* buttons */
+  --radius-lg:16px;  /* cards, panels */
+  --radius-pill:999px; /* status badges, segmented switchers, icon badges */
+
+  --border-width:1px;
+
+  /* Cards are flat by default. Shadow appears on hover only when clickable. */
+  --shadow-none:none;
+  --shadow-hover:0 4px 16px rgba(26,26,26,.08);
+  --shadow-overlay:0 12px 32px rgba(26,26,26,.14); /* dropdowns, modals */
+}

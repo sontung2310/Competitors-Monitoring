@@ -32,4 +32,13 @@ document.addEventListener("DOMContentLoaded", () => {
       if (!window.confirm(form.dataset.confirm)) event.preventDefault();
     });
   });
+
+  document.querySelectorAll("[data-auto-refresh]").forEach((notice) => {
+    const refreshUrl = notice.dataset.autoRefresh || window.location.href;
+    const delay = Number(notice.dataset.refreshDelay || 15000);
+    window.setTimeout(() => {
+      const separator = refreshUrl.includes("?") ? "&" : "?";
+      window.location.replace(`${refreshUrl}${separator}discovery_poll=${Date.now()}`);
+    }, delay);
+  });
 });

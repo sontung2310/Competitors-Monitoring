@@ -8,6 +8,7 @@ the Flask service/repository boundary.
 from __future__ import annotations
 
 import json
+import socket
 from dataclasses import dataclass
 from typing import Any, Mapping
 from urllib.error import HTTPError, URLError
@@ -30,7 +31,7 @@ class APIClientError(RuntimeError):
 class APIClient:
     """HTTP client for company-scoped CompetitorScope operations."""
 
-    def __init__(self, base_url: str, *, timeout: float = 180.0) -> None:
+    def __init__(self, base_url: str, *, timeout: float = 60.0) -> None:
         self.base_url = base_url.rstrip("/") + "/"
         self.timeout = timeout
 
@@ -209,9 +210,15 @@ class APIClient:
             payload = _decode_json(raw_body)
             raise _error_from_payload(payload, status_code) from exc
         except (URLError, TimeoutError, OSError) as exc:
+            reason = getattr(exc, "reason", None)
+            timed_out = (
+                isinstance(exc, (TimeoutError, socket.timeout))
+                or isinstance(reason, (TimeoutError, socket.timeout))
+                or "timed out" in str(exc).lower()
+            )
             raise APIClientError(
                 f"the monitoring API could not be reached: {exc}",
-                code="backend_unavailable",
+                code="backend_timeout" if timed_out else "backend_unavailable",
             ) from exc
 
         if not 200 <= status_code < 300:

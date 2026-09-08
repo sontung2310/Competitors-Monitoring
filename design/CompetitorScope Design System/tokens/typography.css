@@ -1,0 +1,30 @@
+:root{
+  --font-family:'Inter',-apple-system,'Segoe UI',Roboto,sans-serif;
+  --font-sans:var(--font-family);
+
+  --font-size-h1:32px;
+  --font-size-h2:24px;
+  --font-size-h3:18px;
+  --font-size-body:15px;
+  --font-size-small:13px;
+
+  --font-weight-regular:400;
+  --font-weight-medium:500;
+  --font-weight-semibold:600;
+  --font-weight-bold:700;
+
+  --line-height-heading:1.2;
+  --line-height-body:1.5;
+
+  /* Semantic aliases */
+  --type-h1:var(--font-weight-bold) var(--font-size-h1)/var(--line-height-heading) var(--font-family);
+  --type-h2:var(--font-weight-bold) var(--font-size-h2)/var(--line-height-heading) var(--font-family);
+  --type-h3:var(--font-weight-semibold) var(--font-size-h3)/var(--line-height-heading) var(--font-family);
+  --type-body:var(--font-weight-regular) var(--font-size-body)/var(--line-height-body) var(--font-family);
+  --type-meta:var(--font-weight-regular) var(--font-size-small)/var(--line-height-body) var(--font-family);
+  --type-label:var(--font-weight-semibold) var(--font-size-small)/var(--line-height-body) var(--font-family);
+
+  /* Stat-tile metric label: small, muted, uppercase */
+  --label-letter-spacing:.06em;
+  --label-transform:uppercase; /* @kind other */
+}

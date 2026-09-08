@@ -96,8 +96,10 @@ def run_discovery(request: HttpRequest, competitor_id: str) -> HttpResponse:
     if request.method != "POST":
         return redirect(_detail_url(competitor_id, request.GET.get("company_id")))
     client = get_api_client()
+    before_count = 0
     try:
         companies, selected_company = _load_company_context(request, client)
+        before_count = len(client.list_candidates(competitor_id, selected_company["id"], status="ALL"))
         discovery_result = client.discover(competitor_id, selected_company["id"])
         context = _detail_context(
             request,
@@ -109,6 +111,31 @@ def run_discovery(request: HttpRequest, competitor_id: str) -> HttpResponse:
         context["discovery_result"] = discovery_result
         return render(request, "pages/competitor_detail.html", context)
     except APIClientError as exc:
+        if exc.code == "backend_timeout":
+            timeout_message = (
+                "Discovery is still working — larger sites can take a few minutes. "
+                "This page will refresh automatically."
+            )
+            company_id = request.POST.get("company_id") or request.GET.get("company_id")
+            poll_url = _detail_url(
+                competitor_id,
+                company_id,
+                discovery_pending=True,
+                discovery_before_count=before_count,
+            )
+            return _detail_error_response(
+                request,
+                client,
+                competitor_id,
+                timeout_message,
+                status_code=202,
+                extra_context={
+                    "page_error": None,
+                    "discovery_pending": True,
+                    "discovery_complete": False,
+                    "discovery_poll_url": poll_url,
+                },
+            )
         return _detail_error_response(
             request,
             client,
@@ -381,6 +408,9 @@ def _detail_context(
         # Discovery can return hundreds of candidates. Keep the review screen
         # responsive while retaining the API-backed total in the tab count.
         candidates = candidates[:50]
+    pending_requested = request.GET.get("discovery_pending") == "1"
+    before_count = _as_int(request.GET.get("discovery_before_count"))
+    discovery_complete = pending_requested and before_count is not None and len(review_candidates) > before_count
     company_changes = client.list_changes(
         selected_company["id"],
         competitor_id=competitor_id,
@@ -401,6 +431,15 @@ def _detail_context(
             "targets": targets,
             "rows": candidates,
             "total_rows": total_rows,
+            "candidate_total": len(review_candidates),
+            "discovery_pending": pending_requested and not discovery_complete,
+            "discovery_complete": discovery_complete,
+            "discovery_poll_url": _detail_url(
+                competitor_id,
+                selected_company["id"],
+                discovery_pending=True,
+                discovery_before_count=before_count,
+            ) if pending_requested and before_count is not None and not discovery_complete else None,
             "status": status,
             "suggested_count": sum(candidate.get("discovery_status") == "SUGGESTED" for candidate in review_candidates),
             "active_count": sum(
@@ -488,13 +527,31 @@ def _dashboard_url(company_id: str | None) -> str:
     return f"{url}?{urlencode({'company_id': company_id})}" if company_id else url
 
 
-def _detail_url(competitor_id: str, company_id: str | None, *, status: str | None = None) -> str:
+def _detail_url(
+    competitor_id: str,
+    company_id: str | None,
+    *,
+    status: str | None = None,
+    discovery_pending: bool = False,
+    discovery_before_count: int | None = None,
+) -> str:
     url = reverse("competitor_detail", args=[competitor_id])
     params = {"company_id": company_id}
     if status:
         params["status"] = status
+    if discovery_pending:
+        params["discovery_pending"] = "1"
+    if discovery_before_count is not None:
+        params["discovery_before_count"] = discovery_before_count
     params = {key: value for key, value in params.items() if value is not None}
     return f"{url}?{urlencode(params)}" if params else url
+
+
+def _as_int(value: str | None) -> int | None:
+    try:
+        return int(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
 
 def _error_page(request: HttpRequest, message: str, *, status_code: int) -> HttpResponse:
