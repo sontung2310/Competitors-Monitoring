@@ -1,0 +1,42 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>{% block title %}CompetitorScope{% endblock %}</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="{% static 'competitor_scope/css/app.css' %}?v=3">
+  </head>
+  <body>
+    <div class="app-shell">
+      {% include "partials/sidebar.html" %}
+      <main class="app-main">
+        <header class="topbar">
+          <div class="topbar-heading">
+            {% if topbar_breadcrumb %}<div class="eyebrow">{{ topbar_breadcrumb }}</div>{% endif %}
+            <h1>{{ topbar_title|default:"CompetitorScope" }}</h1>
+            {% if topbar_meta %}<p>{{ topbar_meta }}</p>{% endif %}
+          </div>
+          <div class="topbar-actions">{% block topbar_actions %}{% endblock %}</div>
+        </header>
+        <section class="page-content">
+          <div class="content-wrap">
+            {% if page_error %}
+              <div class="alert alert-error" role="alert">
+                <span class="status-dot" aria-hidden="true"></span>
+                <div><strong>Request could not be completed</strong><p>{{ page_error }}</p></div>
+              </div>
+            {% endif %}
+            {% block content %}{% endblock %}
+          </div>
+        </section>
+      </main>
+    </div>
+    <div class="navigation-loading" aria-hidden="true"><span class="spinner"></span> Loading company data…</div>
+    <script src="{% static 'competitor_scope/js/app.js' %}?v=3"></script>
+    {% block page_scripts %}{% endblock %}
+  </body>
+</html>

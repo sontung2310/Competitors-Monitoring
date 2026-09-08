@@ -97,6 +97,12 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 
 **v1 PoC complete at this point** — website-only monitoring, working end-to-end.
 
+## PoC-specific frontend slice (TON-28)
+
+- [x] Django frontend with a single Flask API client, company-scoped dashboard,
+  discovery review, live simulation result, and changes feed screens; validated
+  with real API data, loading/error states, and browser screenshots.
+
 ---
 
 ## Step 5: Social Media Monitoring (LinkedIn, Instagram, TikTok)

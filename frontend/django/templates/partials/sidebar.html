@@ -1,0 +1,38 @@
+<aside class="sidebar">
+  <a class="wordmark" href="{% url 'dashboard' %}{% if selected_company %}?company_id={{ selected_company.id }}{% endif %}">CompetitorScope</a>
+
+  <nav class="sidebar-nav" aria-label="Main navigation">
+    {% if selected_company %}
+      <a class="nav-item {% if topbar_title == selected_company.name %}is-active{% endif %}" href="{% url 'dashboard' %}?company_id={{ selected_company.id }}">
+        <span class="nav-icon" aria-hidden="true">⌂</span><span>Dashboard</span>
+      </a>
+      {% if nav_competitor_count %}
+        <a class="nav-item {% if topbar_breadcrumb == 'Competitors' or topbar_title == 'Simulate a Change' %}is-active{% endif %}" href="{% url 'competitor_detail' competitors.0.id %}?company_id={{ selected_company.id }}">
+          <span class="nav-icon" aria-hidden="true">◎</span><span>Competitors</span><span class="nav-count">{{ nav_competitor_count }}</span>
+        </a>
+      {% else %}
+        <span class="nav-item is-disabled"><span class="nav-icon" aria-hidden="true">◎</span><span>Competitors</span></span>
+      {% endif %}
+      <a class="nav-item {% if topbar_title == 'Changes' %}is-active{% endif %}" href="{% url 'changes_feed' %}?company_id={{ selected_company.id }}">
+        <span class="nav-icon" aria-hidden="true">◌</span><span>Changes</span><span class="nav-count">{{ nav_changes_count }}</span>
+      </a>
+    {% else %}
+      <span class="nav-item is-disabled"><span class="nav-icon" aria-hidden="true">⌂</span><span>Dashboard</span></span>
+      <span class="nav-item is-disabled"><span class="nav-icon" aria-hidden="true">◎</span><span>Competitors</span></span>
+      <span class="nav-item is-disabled"><span class="nav-icon" aria-hidden="true">◌</span><span>Changes</span></span>
+    {% endif %}
+  </nav>
+
+  <div class="sidebar-footer">
+    <form class="company-switcher" method="get" action="{% url 'dashboard' %}" data-company-switch>
+      <label for="company-select">Company</label>
+      <select id="company-select" name="company_id" {% if not companies %}disabled{% endif %}>
+        {% for company in companies %}
+          <option value="{{ company.id }}" {% if selected_company and company.id == selected_company.id %}selected{% endif %}>{{ company.name }}</option>
+        {% empty %}
+          <option>No companies available</option>
+        {% endfor %}
+      </select>
+    </form>
+  </div>
+</aside>

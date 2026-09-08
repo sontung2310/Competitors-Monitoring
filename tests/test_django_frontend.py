@@ -1,0 +1,156 @@
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+
+FRONTEND_DIR = Path(__file__).resolve().parents[1] / "frontend" / "django"
+if str(FRONTEND_DIR) not in sys.path:
+    sys.path.insert(0, str(FRONTEND_DIR))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+
+import django
+
+django.setup()
+
+from django.test import SimpleTestCase
+
+from monitoring import views
+from monitoring.api_client import APIClientError
+
+
+COMPANY = {
+    "id": "company-marketing-eye",
+    "name": "Marketing Eye",
+    "website_url": "https://marketingeye.com.au",
+}
+COMPETITOR = {
+    "id": "competitor-lyfe",
+    "company_id": COMPANY["id"],
+    "name": "Lyfe Marketing",
+    "website_url": "https://www.lyfemarketing.com/",
+    "active": True,
+}
+TARGET = {
+    "id": "target-blog",
+    "competitor_id": COMPETITOR["id"],
+    "url": "https://www.lyfemarketing.com/blog",
+    "page_type": "BLOG",
+    "discovery_status": "ACTIVE",
+    "classification_method": "RULE",
+    "active": True,
+    "check_interval_minutes": 720,
+}
+CANDIDATE = {
+    "id": "candidate-pricing",
+    "competitor_id": COMPETITOR["id"],
+    "url": "https://www.lyfemarketing.com/pricing",
+    "page_type": "PRICING",
+    "discovery_status": "SUGGESTED",
+    "classification_method": "RULE",
+    "active": False,
+    "check_interval_minutes": 1440,
+}
+
+
+class FakeAPIClient:
+    def __init__(self) -> None:
+        self.manual_error = False
+        self.companies = [COMPANY]
+        self.competitors = [COMPETITOR]
+        self.targets = [TARGET, CANDIDATE]
+        self.changes = [
+            {
+                "id": "change-simulated",
+                "monitoring_target_id": TARGET["id"],
+                "change_type": "NEW_BLOG",
+                "summary": "NEW_BLOG: a simulated article was added.",
+                "detected_at": "2026-09-08T01:02:03Z",
+                "status": "NEW",
+                "is_simulated": True,
+            }
+        ]
+
+    def get_companies(self):
+        return self.companies
+
+    def list_competitors(self, company_id):
+        assert company_id == COMPANY["id"]
+        return self.competitors
+
+    def get_competitor(self, competitor_id, company_id):
+        assert competitor_id == COMPETITOR["id"]
+        assert company_id == COMPANY["id"]
+        return COMPETITOR
+
+    def list_candidates(self, competitor_id, company_id, *, status="ALL"):
+        assert status == "ALL"
+        return [CANDIDATE]
+
+    def list_targets(self, company_id, competitor_id):
+        assert company_id == COMPANY["id"]
+        assert competitor_id == COMPETITOR["id"]
+        return self.targets
+
+    def list_changes(self, company_id, *, competitor_id=None, target_id=None, limit=50):
+        assert company_id == COMPANY["id"]
+        return self.changes
+
+    def add_manual_target(self, **kwargs):
+        if self.manual_error:
+            raise APIClientError(
+                "manual target URL 'https://www.lyfemarketing.com/dead-page' failed liveness checks after 3 attempts; target was not created",
+                status_code=400,
+                code="validation_error",
+            )
+        return TARGET
+
+
+class DjangoFrontendViewTests(SimpleTestCase):
+    def setUp(self):
+        self.client_data = FakeAPIClient()
+        self.get_client = views.get_api_client
+        views.get_api_client = lambda: self.client_data
+
+    def tearDown(self):
+        views.get_api_client = self.get_client
+
+    def test_dashboard_renders_live_company_and_competitor_data(self):
+        response = self.client.get("/?company_id=company-marketing-eye")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Marketing Eye")
+        self.assertContains(response, "Lyfe Marketing")
+        self.assertContains(response, "https://www.lyfemarketing.com/")
+        self.assertNotContains(response, "JD Sports AU")
+
+    def test_detail_renders_candidate_and_simulated_marker_from_api_flag(self):
+        response = self.client.get("/competitors/competitor-lyfe/?company_id=company-marketing-eye")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "https://www.lyfemarketing.com/pricing")
+        self.assertContains(response, "Activate")
+        self.assertNotContains(response, "The Athletes Foot")
+
+        response = self.client.get("/changes/?company_id=company-marketing-eye")
+        self.assertContains(response, "🧪 SIMULATED")
+        self.assertContains(response, "NEW_BLOG: a simulated article was added.")
+
+    def test_manual_target_error_uses_exact_backend_message(self):
+        self.client_data.manual_error = True
+        response = self.client.post(
+            "/competitors/competitor-lyfe/targets/add/",
+            {
+                "company_id": COMPANY["id"],
+                "url": "https://www.lyfemarketing.com/dead-page",
+                "page_type": "",
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertContains(
+            response,
+            "manual target URL &#x27;https://www.lyfemarketing.com/dead-page&#x27; failed liveness checks after 3 attempts; target was not created",
+            status_code=400,
+        )

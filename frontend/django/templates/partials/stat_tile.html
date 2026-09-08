@@ -1,0 +1,8 @@
+<article class="stat-tile">
+  <div>
+    <div class="metric-label">{{ stat.label }}</div>
+    <div class="metric-value">{{ stat.value }}</div>
+    {% if stat.detail %}<div class="metric-detail">{{ stat.detail }}</div>{% endif %}
+  </div>
+  <span class="stat-icon stat-icon-{{ stat.tone|default:'neutral' }}" aria-hidden="true">{{ stat.icon }}</span>
+</article>
