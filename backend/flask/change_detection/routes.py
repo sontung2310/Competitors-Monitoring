@@ -23,19 +23,21 @@ def list_changes():
     if not 1 <= limit <= 100:
         raise RequestValidationError("limit must be an integer between 1 and 100")
     since = _parse_since(request.args.get("since"))
-    return json_response(
-        service("changes").list_changes(
-            competitor_id=request.args.get("competitor_id"),
-            target_id=request.args.get("target_id"),
-            since=since,
-            limit=limit,
-        )
-    )
+    kwargs = {
+        "competitor_id": request.args.get("competitor_id"),
+        "target_id": request.args.get("target_id"),
+        "since": since,
+        "limit": limit,
+    }
+    if request.args.get("company_id") is not None:
+        kwargs["company_id"] = request.args["company_id"]
+    return json_response(service("changes").list_changes(**kwargs))
 
 
 @changes_blueprint.get("/changes/<change_id>")
 def get_change(change_id: str):
-    change = service("changes").get_change(change_id)
+    kwargs = {"company_id": request.args["company_id"]} if "company_id" in request.args else {}
+    change = service("changes").get_change(change_id, **kwargs)
     if change is None:
         raise NotFoundError(f"change {change_id!r} was not found")
     return json_response(change)

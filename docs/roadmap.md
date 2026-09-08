@@ -84,6 +84,17 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 - [ ] 4.5 Fix contract mismatches found during integration (update api-contract.md, not just the code)
 - [ ] 4.6 Reliability check: failed monitoring run doesn't break dashboard, doesn't overwrite last snapshot
 
+## PoC-specific backend slice (TON-27)
+
+- [x] Companies collection and idempotent demo seeding; migrate legacy
+  competitor `user_id` into `company_id`, assign Lyfe Marketing and JD Sports
+  AU, and leave Brown Bag Marketing/Elevation Marketing unassigned.
+- [x] Company-scoped competitor, candidate, monitoring-target, and change
+  endpoints; synchronous discovery and tagged simulation trigger endpoints.
+- [x] Persistence-enabled simulation wrapper that preserves the original
+  zero-write simulation helpers and excludes `is_simulated=true` snapshots from
+  genuine monitor comparisons.
+
 **v1 PoC complete at this point** — website-only monitoring, working end-to-end.
 
 ---

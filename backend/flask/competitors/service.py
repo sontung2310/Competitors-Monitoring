@@ -12,17 +12,30 @@ from .repository import CompetitorRepository
 class CompetitorService:
     """Apply current-user scoping and business validation to competitor CRUD."""
 
-    def __init__(self, repository: CompetitorRepository, *, user_id: str) -> None:
-        if not isinstance(user_id, str) or not user_id.strip():
+    def __init__(self, repository: CompetitorRepository, *, user_id: str | None = None) -> None:
+        if user_id is not None and (not isinstance(user_id, str) or not user_id.strip()):
             raise ValueError("user_id must be a non-empty string")
         self.repository = repository
         self.user_id = user_id
 
-    def list_competitors(self, *, active: Optional[bool] = None) -> list[dict[str, Any]]:
-        return self.repository.list_for_user(self.user_id, active=active)
+    def list_competitors(
+        self,
+        *,
+        active: Optional[bool] = None,
+        company_id: Any = None,
+    ) -> list[dict[str, Any]]:
+        if company_id is not None:
+            return self.repository.list_for_company(company_id, active=active)
+        if self.user_id is not None:
+            return self.repository.list_for_user(self.user_id, active=active)
+        return self.repository.list_all(active=active)
 
-    def get_competitor(self, competitor_id: Any) -> dict[str, Any]:
-        competitor = self.repository.get(competitor_id, user_id=self.user_id)
+    def get_competitor(self, competitor_id: Any, *, company_id: Any = None) -> dict[str, Any]:
+        competitor = self.repository.get(
+            competitor_id,
+            user_id=self.user_id if company_id is None else None,
+            company_id=company_id,
+        )
         if competitor is None:
             raise NotFoundError(f"competitor {competitor_id!r} was not found")
         return competitor
@@ -33,6 +46,7 @@ class CompetitorService:
         name: str,
         website_url: str,
         active: bool = True,
+        company_id: Any = None,
     ) -> dict[str, Any]:
         if not isinstance(name, str) or not name.strip():
             raise RequestValidationError("name must be a non-empty string")
@@ -41,7 +55,8 @@ class CompetitorService:
         if not isinstance(active, bool):
             raise RequestValidationError("active must be a boolean")
         return self.repository.create(
-            user_id=self.user_id,
+            user_id=self.user_id if company_id is None else None,
+            company_id=company_id,
             name=name.strip(),
             website_url=website_url.strip(),
             active=active,
@@ -51,18 +66,25 @@ class CompetitorService:
         self,
         competitor_id: Any,
         updates: Mapping[str, Any],
+        *,
+        company_id: Any = None,
     ) -> dict[str, Any]:
         if not isinstance(updates, Mapping) or not updates:
             raise RequestValidationError("at least one competitor field is required")
         updated = self.repository.update(
             competitor_id,
             updates,
-            user_id=self.user_id,
+            user_id=self.user_id if company_id is None else None,
+            company_id=company_id,
         )
         if updated is None:
             raise NotFoundError(f"competitor {competitor_id!r} was not found")
         return updated
 
-    def delete_competitor(self, competitor_id: Any) -> None:
-        if not self.repository.delete(competitor_id, user_id=self.user_id):
+    def delete_competitor(self, competitor_id: Any, *, company_id: Any = None) -> None:
+        if not self.repository.delete(
+            competitor_id,
+            user_id=self.user_id if company_id is None else None,
+            company_id=company_id,
+        ):
             raise NotFoundError(f"competitor {competitor_id!r} was not found")

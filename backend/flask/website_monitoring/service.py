@@ -465,7 +465,12 @@ class SnapshotCreator(Protocol):
 class SnapshotHistoryReader(Protocol):
     """Snapshot repository boundary used to find the previous valid snapshot."""
 
-    def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
+    def list_for_target(
+        self,
+        monitoring_target_id: Any,
+        *,
+        include_simulated: bool = True,
+    ) -> list[dict[str, Any]]:
         """Return snapshots newest first."""
 
 
@@ -624,7 +629,7 @@ class MonitoringRunService:
                 ) from exc
             _validate_fetch_result(fetched, url)
 
-            snapshots = self.snapshot_repository.list_for_target(target_id)
+            snapshots = _list_real_snapshots(self.snapshot_repository, target_id)
             previous_snapshot = snapshots[0] if snapshots else None
             previous_snapshot = self._load_previous_snapshot_content(previous_snapshot)
             processor = resolve_content_processor(
@@ -763,6 +768,23 @@ def monitor_target(
 
 def _is_active_monitoring_target(target: Mapping[str, Any]) -> bool:
     return target.get("active") is True and target.get("discovery_status") == "ACTIVE"
+
+
+def _list_real_snapshots(
+    repository: SnapshotHistoryReader,
+    target_id: Any,
+) -> list[dict[str, Any]]:
+    """Read only non-simulated snapshots before a genuine monitor comparison."""
+
+    try:
+        snapshots = repository.list_for_target(target_id, include_simulated=False)
+    except TypeError as exc:
+        # Older injected test doubles predate the keyword. Keep them usable,
+        # while still applying the invariant at this service boundary.
+        if "include_simulated" not in str(exc):
+            raise
+        snapshots = repository.list_for_target(target_id)
+    return [snapshot for snapshot in snapshots if snapshot.get("is_simulated") is not True]
 
 
 def _validate_fetch_result(result: Any, url: str) -> None:
@@ -1283,34 +1305,67 @@ class MonitoringTargetService:
     operations for target endpoints so routes never call a repository.
     """
 
-    def __init__(self, repository: MonitoringTargetRepository, discovery_service: Any) -> None:
+    def __init__(
+        self,
+        repository: MonitoringTargetRepository,
+        discovery_service: Any,
+        competitor_repository: Any | None = None,
+    ) -> None:
         self.repository = repository
         self.discovery_service = discovery_service
+        self.competitor_repository = competitor_repository
 
-    def list_targets(self, *, competitor_id: Any | None = None) -> list[dict[str, Any]]:
-        return self.repository.list(competitor_id=competitor_id)
+    def list_targets(
+        self,
+        *,
+        competitor_id: Any | None = None,
+        company_id: Any | None = None,
+    ) -> list[dict[str, Any]]:
+        if company_id is None:
+            return self.repository.list(competitor_id=competitor_id)
+        competitor_ids = self._competitor_ids_for_company(company_id)
+        if competitor_id is not None:
+            if str(competitor_id) not in {str(value) for value in competitor_ids}:
+                return []
+            return self.repository.list(competitor_id=competitor_id)
+        rows: list[dict[str, Any]] = []
+        for scoped_competitor_id in competitor_ids:
+            rows.extend(self.repository.list(competitor_id=scoped_competitor_id))
+        return rows
 
-    def get_target(self, target_id: Any) -> dict[str, Any] | None:
-        return self.repository.get(target_id)
+    def get_target(self, target_id: Any, *, company_id: Any | None = None) -> dict[str, Any] | None:
+        target = self.repository.get(target_id)
+        if target is None or company_id is None:
+            return target
+        if str(target.get("competitor_id")) not in {
+            str(value) for value in self._competitor_ids_for_company(company_id)
+        }:
+            return None
+        return target
 
     def add_manual_target(
         self,
         competitor_id: Any,
         url: str,
         page_type: str | None = None,
+        *,
+        company_id: Any | None = None,
     ) -> dict[str, Any]:
         return self.discovery_service.add_manual_target(
             competitor_id,
             url,
             page_type=page_type,
+            company_id=company_id,
         )
 
     def update_target(
         self,
         target_id: Any,
         updates: Mapping[str, Any],
+        *,
+        company_id: Any | None = None,
     ) -> dict[str, Any]:
-        current = self.repository.get(target_id)
+        current = self.get_target(target_id, company_id=company_id)
         if current is None:
             from backend.flask.errors import NotFoundError
 
@@ -1335,14 +1390,25 @@ class MonitoringTargetService:
             raise NotFoundError(f"monitoring target {target_id!r} was not found")
         return updated
 
-    def remove_target(self, target_id: Any) -> dict[str, Any] | None:
-        current = self.repository.get(target_id)
+    def remove_target(self, target_id: Any, *, company_id: Any | None = None) -> dict[str, Any] | None:
+        current = self.get_target(target_id, company_id=company_id)
         if current is None:
             from backend.flask.errors import NotFoundError
 
             raise NotFoundError(f"monitoring target {target_id!r} was not found")
-        self.discovery_service.remove_candidate(target_id)
+        self.discovery_service.remove_candidate(
+            target_id,
+            **({"company_id": company_id} if company_id is not None else {}),
+        )
         return self.repository.get(target_id)
+
+    def _competitor_ids_for_company(self, company_id: Any) -> list[Any]:
+        if self.competitor_repository is None:
+            raise ValueError("company-scoped target access requires a competitor repository")
+        return [
+            competitor["id"]
+            for competitor in self.competitor_repository.list_for_company(company_id)
+        ]
 
 
 __all__ = [

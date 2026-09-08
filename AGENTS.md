@@ -20,6 +20,7 @@ project/
 │
 ├── backend/
 │   └── flask/
+│       ├── companies/
 │       ├── competitors/
 │       │   ├── routes.py       # presentation
 │       │   ├── service.py      # application/business logic

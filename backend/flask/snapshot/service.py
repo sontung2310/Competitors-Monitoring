@@ -59,6 +59,7 @@ class SnapshotService:
         *,
         fetch_method: str = HTTP_FETCH_METHOD,
         http_status: int = 200,
+        is_simulated: bool = False,
         captured_at: Optional[datetime] = None,
     ) -> dict[str, Any]:
         """Create one snapshot from fetched content on every successful check.
@@ -94,6 +95,7 @@ class SnapshotService:
                 storage_path=storage_path,
                 fetch_method=fetch_method,
                 http_status=http_status,
+                is_simulated=is_simulated,
             )
         except Exception as exc:
             self.storage.delete_snapshot(storage_path)
@@ -110,6 +112,7 @@ def create_snapshot(
     storage: Optional[SnapshotStorage] = None,
     fetch_method: str = HTTP_FETCH_METHOD,
     http_status: int = 200,
+    is_simulated: bool = False,
     captured_at: Optional[datetime] = None,
 ) -> dict[str, Any]:
     """Functional entry point backed by injected repository and storage objects."""
@@ -119,5 +122,6 @@ def create_snapshot(
         content,
         fetch_method=fetch_method,
         http_status=http_status,
+        is_simulated=is_simulated,
         captured_at=captured_at,
     )
