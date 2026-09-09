@@ -72,6 +72,7 @@ class SimulationPersistenceService:
         storage_root: str | None = None,
         fetcher: Callable[[str], FetchResult] = fetch_page,
         provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
+        narrative_provider_factory: Callable[[], Any] | None = None,
     ) -> "SimulationPersistenceService":
         """Build a repository-backed simulator using the normal storage path."""
 
@@ -92,6 +93,11 @@ class SimulationPersistenceService:
             ChangeRepository.from_database(database),
             target_repository,
             snapshot_content_loader=loader,
+            narrative_provider_factory=(
+                narrative_provider_factory
+                if narrative_provider_factory is not None
+                else provider_factory
+            ),
         )
         return cls(
             target_repository,
@@ -177,6 +183,7 @@ class SimulationPersistenceService:
                     change_type=change_type,
                     summary=summary,
                     is_simulated=True,
+                    narrative_provider=provider,
                 )
             )
         if not persisted_changes:

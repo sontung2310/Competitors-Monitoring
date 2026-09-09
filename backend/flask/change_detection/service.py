@@ -1,8 +1,10 @@
-"""Deterministic change creation from already-different snapshots.
+"""Change creation from already-different snapshots.
 
-No LLM is used here. Hash comparison remains upstream in the monitoring
-engine; this service defensively rejects equal hashes so an accidental call
-cannot create a false change record.
+Hash comparison and the mechanical diff remain deterministic and upstream in
+the monitoring engine. This service defensively rejects equal hashes so an
+accidental call cannot create a false change record. Eligible blog and generic
+page changes may also receive an optional LLM narrative; its failure never
+prevents the mechanical change record from being persisted.
 
 Only BLOG and PRICING receive special event types because those are the page
 types with explicit, justified mappings in the current specification and
@@ -18,16 +20,21 @@ detection with user acknowledgement.
 
 from __future__ import annotations
 
+import logging
 from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Protocol
 
 from backend.flask.database.base_repository import utc_now
+from backend.flask.llm_provider import OpenAIProvider
 from backend.flask.website_monitoring.service import (
     compare_hashes,
     generate_diff,
 )
 
 from .repository import ChangeRepository
+
+
+logger = logging.getLogger(__name__)
 
 
 class ChangeError(RuntimeError):
@@ -57,11 +64,17 @@ CHANGE_TYPE_BY_PAGE_TYPE = {
     "BLOG": "NEW_BLOG",
     "PRICING": "PRICE_CHANGE",
 }
+NARRATIVE_CHANGE_TYPES = frozenset({"NEW_BLOG", "PAGE_UPDATE"})
 PROCESSOR_CHANGE_TYPES = frozenset(
     {"NEW_PRODUCT", "PRODUCT_REMOVED", "PRICE_CHANGE"}
 )
 DEFAULT_CHANGE_TYPE = "PAGE_UPDATE"
 DEFAULT_CHANGE_STATUS = "NEW"
+NARRATIVE_SUMMARY_INSTRUCTIONS = """You write concise plain-language summaries for a competitor monitoring feed.
+Describe only observable changes in the supplied page diff. Do not speculate about
+reasons, intent, or business impact. Do not mention line counts, the diff, or these
+instructions. Return only one or two sentences of narrative text, with no markdown
+heading or preamble."""
 
 
 class ChangeService:
@@ -74,11 +87,13 @@ class ChangeService:
         *,
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
         competitor_repository: Any | None = None,
+        narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
     ) -> None:
         self.change_repository = change_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.snapshot_content_loader = snapshot_content_loader
         self.competitor_repository = competitor_repository
+        self.narrative_provider_factory = narrative_provider_factory
 
     @classmethod
     def from_database(
@@ -88,6 +103,7 @@ class ChangeService:
         *,
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
         competitor_repository: Any | None = None,
+        narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
     ) -> "ChangeService":
         """Build a service with a repository backed by a database handle."""
 
@@ -96,6 +112,7 @@ class ChangeService:
             monitoring_target_repository,
             snapshot_content_loader=snapshot_content_loader,
             competitor_repository=competitor_repository,
+            narrative_provider_factory=narrative_provider_factory,
         )
 
     def create_change(
@@ -108,6 +125,7 @@ class ChangeService:
         change_type: Optional[str] = None,
         summary: Optional[str] = None,
         is_simulated: bool = False,
+        narrative_provider: Any | None = None,
     ) -> dict[str, Any]:
         """Persist a change from two snapshots whose hashes differ.
 
@@ -158,6 +176,32 @@ class ChangeService:
             resolved_summary = summary.strip()
         if not isinstance(is_simulated, bool):
             raise ChangeError("is_simulated must be a boolean")
+        narrative_summary = None
+        if resolved_change_type in NARRATIVE_CHANGE_TYPES:
+            try:
+                provider = (
+                    narrative_provider
+                    if narrative_provider is not None
+                    else self.narrative_provider_factory()
+                )
+                narrative_summary = generate_narrative_summary(
+                    change_type=resolved_change_type,
+                    diff=diff,
+                    target_url=_target_url(target),
+                    page_type=page_type,
+                    provider=provider,
+                )
+            except Exception as exc:
+                # Narrative text enriches a change but must never make change
+                # detection unavailable. The deterministic mechanical summary
+                # remains the complete fallback display value.
+                logger.warning(
+                    "narrative summary generation failed for %s target %r; "
+                    "persisting the mechanical summary only: %s",
+                    resolved_change_type,
+                    target_id,
+                    exc,
+                )
         return self.change_repository.create(
             monitoring_target_id=target_id,
             previous_snapshot_id=_snapshot_id(previous_snapshot, "previous_snapshot"),
@@ -165,6 +209,7 @@ class ChangeService:
             detected_at=detected_at or utc_now(),
             change_type=resolved_change_type,
             summary=resolved_summary,
+            narrative_summary=narrative_summary,
             status=DEFAULT_CHANGE_STATUS,
             is_simulated=is_simulated,
         )
@@ -287,6 +332,8 @@ def create_change(
     change_type: Optional[str] = None,
     summary: Optional[str] = None,
     is_simulated: bool = False,
+    narrative_provider: Any | None = None,
+    narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
 ) -> dict[str, Any]:
     """Functional entry point for repository-backed change creation."""
 
@@ -294,6 +341,7 @@ def create_change(
         change_repository,
         monitoring_target_repository,
         snapshot_content_loader=snapshot_content_loader,
+        narrative_provider_factory=narrative_provider_factory,
     ).create_change(
         target_id,
         previous_snapshot,
@@ -302,6 +350,7 @@ def create_change(
         change_type=change_type,
         summary=summary,
         is_simulated=is_simulated,
+        narrative_provider=narrative_provider,
     )
 
 
@@ -335,6 +384,51 @@ def summarize_diff(change_type: str, diff: str) -> str:
     )
 
 
+def generate_narrative_summary(
+    *,
+    change_type: str,
+    diff: str,
+    target_url: str,
+    page_type: str,
+    provider: Any,
+) -> str:
+    """Ask the shared LLM provider to describe one eligible page change.
+
+    This helper deliberately has no fallback of its own. Callers that sit on
+    the real change-creation path must decide whether provider failure is
+    recoverable; ChangeService catches it and persists None. Backfill uses the
+    same helper so both paths have identical prompting and output validation.
+    """
+
+    if change_type not in NARRATIVE_CHANGE_TYPES:
+        raise ValueError(f"narrative summaries are not supported for {change_type!r}")
+    if not isinstance(diff, str) or not diff.strip():
+        raise ValueError("narrative summary diff must be non-empty")
+    if not isinstance(target_url, str) or not target_url.strip():
+        raise ValueError("narrative summary target_url must be non-empty")
+    if not isinstance(page_type, str) or not page_type.strip():
+        raise ValueError("narrative summary page_type must be non-empty")
+    if provider is None or not callable(getattr(provider, "generate", None)):
+        raise ValueError("narrative summary provider must implement generate")
+
+    prompt = (
+        "Target URL: "
+        f"{target_url.strip()}\n"
+        f"Page type: {page_type.strip().upper()}\n\n"
+        "Describe what changed in this page:\n"
+        "<page-diff>\n"
+        f"{diff}\n"
+        "</page-diff>"
+    )
+    output = provider.generate(
+        prompt,
+        instructions=NARRATIVE_SUMMARY_INSTRUCTIONS,
+    )
+    if not isinstance(output, str) or not output.strip():
+        raise ValueError("narrative summary provider returned empty output")
+    return output.strip()
+
+
 def _diff_text(content: str) -> str:
     """Give line-oriented diffs a terminator without changing page content."""
 
@@ -358,3 +452,10 @@ def _snapshot_id(snapshot: Mapping[str, Any], label: str) -> Any:
     if value is None:
         raise ChangeError(f"{label} has no id")
     return value
+
+
+def _target_url(target: Mapping[str, Any]) -> str:
+    value = target.get("url")
+    if not isinstance(value, str) or not value.strip():
+        raise ChangeError("monitoring target has no url")
+    return value.strip()

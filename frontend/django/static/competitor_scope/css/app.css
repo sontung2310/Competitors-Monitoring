@@ -131,6 +131,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .simulated-badge-large { min-height: 32px; padding: 8px 12px; font-size: 13px; }
 .change-copy { min-width: 0; flex: 1 1 auto; }
 .change-summary { color: var(--color-text); }
+.change-narrative { color: var(--color-text); font-weight: 500; }
+.change-mechanical { margin-top: 4px; color: var(--color-text-muted); font-size: 13px; }
 .change-target, .change-time, .price-detail { margin-top: 4px; color: var(--color-text-muted); font-size: 13px; }
 .change-target { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .change-time { flex: 0 0 auto; margin-top: 2px; white-space: nowrap; }

@@ -161,6 +161,7 @@ class _ChangeService:
             "monitoring_target_id": "b" * 24,
             "change_type": "PAGE_UPDATE",
             "summary": "PAGE_UPDATE: one paragraph changed.",
+            "narrative_summary": "The monitored page changed a paragraph.",
             "detected_at": NOW,
             "status": "NEW",
             "previous_snapshot_id": "f" * 24,
@@ -278,6 +279,10 @@ class HTTPAPITests(unittest.TestCase):
         response = self.client.get("/api/changes?limit=10")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.json[0]["change_type"], "PAGE_UPDATE")
+        self.assertEqual(
+            response.json[0]["narrative_summary"],
+            "The monitored page changed a paragraph.",
+        )
         self.assertEqual(response.json[0]["detected_at"], "2026-09-08T01:02:03Z")
 
         response = self.client.get("/api/changes/" + "e" * 24)

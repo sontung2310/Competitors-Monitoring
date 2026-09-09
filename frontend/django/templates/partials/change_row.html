@@ -5,7 +5,12 @@
     {% if change.is_simulated is True %}<span class="simulated-badge">🧪 SIMULATED</span>{% endif %}
   </div>
   <div class="change-copy">
-    <div class="change-summary">{{ change.summary }}</div>
+    {% if change.narrative_summary %}
+      <div class="change-narrative">{{ change.narrative_summary }}</div>
+      <div class="change-mechanical">{{ change.summary }}</div>
+    {% else %}
+      <div class="change-summary">{{ change.summary }}</div>
+    {% endif %}
     {% if change.old_value or change.new_value %}<div class="price-detail">{{ change.old_value }} <span aria-hidden="true">→</span> {{ change.new_value }}</div>{% endif %}
     {% if change.target_url %}<div class="change-target">{{ change.target_url }}</div>{% endif %}
   </div>
