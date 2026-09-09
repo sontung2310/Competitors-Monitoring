@@ -80,6 +80,12 @@ class ChangeRepository(BaseMongoRepository):
             self.collection.find_one({"_id": to_object_id(change_id)})
         )
 
+    def delete_by_id(self, change_id: Any) -> bool:
+        """Delete exactly one change record by id and report whether it existed."""
+
+        result = self.collection.delete_one({"_id": to_object_id(change_id)})
+        return self._deleted(result)
+
     def list_for_target(self, monitoring_target_id: Any) -> list[dict[str, Any]]:
         """Return change history for one target, newest first."""
 
