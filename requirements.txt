@@ -2,4 +2,6 @@ pymongo>=4.6,<5
 openai>=1.68
 playwright>=1.52,<2
 python-dotenv>=1.0,<2
+Flask>=3.1,<4
 Django>=5.2,<6
+pytest>=8,<9
