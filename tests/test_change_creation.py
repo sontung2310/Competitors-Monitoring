@@ -112,6 +112,22 @@ class _FailingNarrativeProvider:
         raise TimeoutError("forced narrative timeout")
 
 
+class _StructuredNarrativeProvider:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def generate_json(self, prompt, *, instructions, response_format):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "instructions": instructions,
+                "response_format": response_format,
+            }
+        )
+        return self.payload
+
+
 class ChangeCreationTests(unittest.TestCase):
     def setUp(self):
         self.collection = _FakeCollection()
@@ -226,6 +242,123 @@ class ChangeCreationTests(unittest.TestCase):
 
         self.assertIsNone(change["narrative_summary"])
         self.assertEqual(self.narrative_provider.calls, [])
+
+    def test_new_blog_uses_one_structured_call_and_validated_specific_url(self):
+        provider = _StructuredNarrativeProvider(
+            {
+                "narrative_summary": "A new article was added.",
+                "detected_url": "https://example.com/blog/new-article",
+            }
+        )
+        checked_urls = []
+        service = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=lambda: provider,
+            detected_url_liveness_checker=lambda url: checked_urls.append(url) or True,
+        )
+        previous = self._snapshot("000000000000000000000016", "<main>Old post</main>")
+        current = self._snapshot("000000000000000000000017", "<main>New post</main>")
+
+        change = service.create_change(self.target_id, previous, current)
+
+        self.assertEqual(change["detected_url"], "https://example.com/blog/new-article")
+        self.assertEqual(checked_urls, ["https://example.com/blog/new-article"])
+        self.assertEqual(len(provider.calls), 1)
+        self.assertEqual(
+            provider.calls[0]["response_format"]["name"],
+            "change_narrative_and_detected_url",
+        )
+
+    def test_blog_wrong_domain_and_dead_url_fall_back_to_tracked_page(self):
+        previous = self._snapshot("000000000000000000000018", "<main>Old post</main>")
+        current = self._snapshot("000000000000000000000019", "<main>New post</main>")
+        checked_urls = []
+
+        wrong_domain = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=lambda: _StructuredNarrativeProvider(
+                {
+                    "narrative_summary": "A post changed.",
+                    "detected_url": "https://evil.example/blog/post",
+                }
+            ),
+            detected_url_liveness_checker=lambda url: checked_urls.append(url) or True,
+        ).create_change(self.target_id, previous, current)
+
+        self.assertEqual(wrong_domain["detected_url"], "https://example.com/blog")
+        self.assertEqual(checked_urls, [])
+
+        dead = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=lambda: _StructuredNarrativeProvider(
+                {
+                    "narrative_summary": "A different post changed.",
+                    "detected_url": "https://example.com/blog/dead-post",
+                }
+            ),
+            detected_url_liveness_checker=lambda url: checked_urls.append(url) or False,
+        ).create_change(self.target_id, previous, current)
+
+        self.assertEqual(dead["detected_url"], "https://example.com/blog")
+        self.assertEqual(checked_urls, ["https://example.com/blog/dead-post"])
+
+    def test_page_update_without_specific_post_uses_target_without_liveness_check(self):
+        self.target_repository.page_type = "SERVICES"
+        provider = _StructuredNarrativeProvider(
+            {"narrative_summary": "A wording change was made.", "detected_url": None}
+        )
+        checker = lambda _url: self.fail("PAGE_UPDATE fallback must not be checked")
+        previous = self._snapshot("000000000000000000000020", "<main>Old copy</main>")
+        current = self._snapshot("000000000000000000000021", "<main>New copy</main>")
+
+        change = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=lambda: provider,
+            detected_url_liveness_checker=checker,
+        ).create_change(self.target_id, previous, current)
+
+        self.assertEqual(change["change_type"], "PAGE_UPDATE")
+        self.assertEqual(change["detected_url"], "https://example.com/blog")
+
+    def test_product_urls_are_deterministic_and_removed_url_skips_liveness(self):
+        self.target_repository.page_type = "PRODUCT_LISTING"
+        previous = self._snapshot(
+            "000000000000000000000022",
+            '[{"key":"/product/gone","name":"Gone","price":"10.00"}]',
+        )
+        current = self._snapshot(
+            "000000000000000000000023",
+            '[{"key":"/product/new","name":"New","price":"12.00"}]',
+        )
+        checker = lambda _url: self.fail("product events must not use liveness validation")
+
+        new_product = self.service.create_change(
+            self.target_id,
+            previous,
+            current,
+            change_type="NEW_PRODUCT",
+            summary="NEW_PRODUCT: New (12.00) at /product/new",
+            detected_url="/product/new",
+        )
+        removed = ChangeService(
+            self.repository,
+            self.target_repository,
+            detected_url_liveness_checker=checker,
+        ).create_change(
+            self.target_id,
+            previous,
+            current,
+            change_type="PRODUCT_REMOVED",
+            summary="PRODUCT_REMOVED: Gone (10.00) at /product/gone",
+            detected_url="/product/gone",
+        )
+
+        self.assertEqual(new_product["detected_url"], "https://example.com/product/new")
+        self.assertEqual(removed["detected_url"], "https://example.com/product/gone")
 
     def test_narrative_failure_keeps_change_and_mechanical_summary(self):
         service = ChangeService(

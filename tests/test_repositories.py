@@ -488,6 +488,10 @@ class RepositoryTests(unittest.TestCase):
             [row["id"] for row in repository.list_needing_narrative_summary()],
             [change["id"]],
         )
+        self.assertEqual(
+            [row["id"] for row in repository.list_needing_detected_url()],
+            [change["id"]],
+        )
         updated = repository.update_narrative_summary(
             change["id"],
             "A new article was added to the blog.",
@@ -497,7 +501,17 @@ class RepositoryTests(unittest.TestCase):
             updated["narrative_summary"],
             "A new article was added to the blog.",
         )
+        updated = repository.update_enrichment(
+            change["id"],
+            detected_url="https://example.com/blog/new-article",
+            now=self.timestamp,
+        )
+        self.assertEqual(
+            updated["detected_url"],
+            "https://example.com/blog/new-article",
+        )
         self.assertEqual(repository.list_needing_narrative_summary(), [])
+        self.assertEqual(repository.list_needing_detected_url(), [])
         self.assertIsNone(
             repository.update_narrative_summary(
                 change["id"],

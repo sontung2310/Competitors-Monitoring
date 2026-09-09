@@ -13,11 +13,21 @@ from backend.flask.database.base_repository import (
 )
 
 
+_UNSET = object()
+
+
 class ChangeRepository(BaseMongoRepository):
     """Persistence operations for the ``changes`` collection."""
 
     collection_name = "changes"
     narrative_backfill_change_types = ("NEW_BLOG", "PAGE_UPDATE")
+    detected_url_backfill_change_types = (
+        "NEW_BLOG",
+        "PAGE_UPDATE",
+        "NEW_PRODUCT",
+        "PRICE_CHANGE",
+        "PRODUCT_REMOVED",
+    )
 
     def ensure_indexes(self) -> None:
         """Create the target-scoped history index used by change readers."""
@@ -40,6 +50,7 @@ class ChangeRepository(BaseMongoRepository):
         is_simulated: bool = False,
         now: Optional[Any] = None,
         narrative_summary: Optional[str] = None,
+        detected_url: Optional[str] = None,
     ) -> dict[str, Any]:
         """Insert a change record and return its serialized representation."""
 
@@ -48,6 +59,8 @@ class ChangeRepository(BaseMongoRepository):
         _require_text(summary, "summary")
         if narrative_summary is not None:
             _require_text(narrative_summary, "narrative_summary")
+        if detected_url is not None:
+            _require_text(detected_url, "detected_url")
         _require_text(status, "status")
         if not isinstance(is_simulated, bool):
             raise ValueError("is_simulated must be a boolean")
@@ -61,6 +74,7 @@ class ChangeRepository(BaseMongoRepository):
             "change_type": change_type,
             "summary": summary,
             "narrative_summary": narrative_summary,
+            "detected_url": detected_url,
             "status": status,
             "created_at": timestamp,
             "updated_at": timestamp,
@@ -176,6 +190,81 @@ class ChangeRepository(BaseMongoRepository):
                     "updated_at": now or utc_now(),
                 }
             },
+        )
+        if not self._matched(result):
+            return None
+        return self.get(change_id)
+
+    def list_needing_detected_url(
+        self,
+        *,
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return all change types eligible for detected-URL backfill."""
+
+        if limit is not None and (
+            isinstance(limit, bool) or not isinstance(limit, int) or limit < 1
+        ):
+            raise ValueError("limit must be a positive integer")
+        query = {
+            "change_type": {"$in": list(self.detected_url_backfill_change_types)},
+            "$or": [
+                {"detected_url": {"$exists": False}},
+                {"detected_url": None},
+                {"detected_url": ""},
+            ],
+        }
+        cursor = self.collection.find(query)
+        if hasattr(cursor, "sort"):
+            cursor = cursor.sort([("detected_at", 1)])
+        if limit is not None and hasattr(cursor, "limit"):
+            cursor = cursor.limit(limit)
+        return [serialize_document(document) for document in cursor]
+
+    def update_detected_url(
+        self,
+        change_id: Any,
+        detected_url: str,
+        *,
+        now: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Populate a missing detected URL without changing other fields."""
+
+        return self.update_enrichment(
+            change_id,
+            detected_url=detected_url,
+            now=now,
+        )
+
+    def update_enrichment(
+        self,
+        change_id: Any,
+        *,
+        narrative_summary: Any = _UNSET,
+        detected_url: Any = _UNSET,
+        now: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Set one or both enrichment fields while preserving the rest."""
+
+        values: dict[str, Any] = {}
+        if narrative_summary is not _UNSET:
+            if narrative_summary is not None:
+                _require_text(narrative_summary, "narrative_summary")
+            values["narrative_summary"] = (
+                narrative_summary.strip() if isinstance(narrative_summary, str) else None
+            )
+        if detected_url is not _UNSET:
+            if detected_url is not None:
+                _require_text(detected_url, "detected_url")
+            values["detected_url"] = (
+                detected_url.strip() if isinstance(detected_url, str) else None
+            )
+        if not values:
+            raise ValueError("at least one enrichment field is required")
+        values["updated_at"] = now or utc_now()
+        result = self.collection.update_one(
+            {"_id": to_object_id(change_id)},
+            {"$set": values},
         )
         if not self._matched(result):
             return None

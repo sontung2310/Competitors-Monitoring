@@ -12,7 +12,22 @@
       <div class="change-summary">{{ change.summary }}</div>
     {% endif %}
     {% if change.old_value or change.new_value %}<div class="price-detail">{{ change.old_value }} <span aria-hidden="true">→</span> {{ change.new_value }}</div>{% endif %}
-    {% if change.target_url %}<div class="change-target">{{ change.target_url }}</div>{% endif %}
+    {% if change.detected_url and change.detected_url != change.target_url %}
+      <div class="change-detected-link{% if change.change_type == 'PRODUCT_REMOVED' %} change-detected-link-removed{% endif %}">
+        {% if change.change_type == 'PRODUCT_REMOVED' %}
+          <span class="change-link-warning">Last known URL — may no longer be available</span>
+        {% else %}
+          <span class="change-link-label">Detected page</span>
+        {% endif %}
+        <a href="{{ change.detected_url }}" target="_blank" rel="noopener noreferrer">{{ change.detected_url }}</a>
+      </div>
+      {% if change.target_url %}<div class="change-target">Tracked page: {{ change.target_url }}</div>{% endif %}
+    {% elif change.target_url %}
+      <div class="change-target change-target-link">
+        <span>Tracked page:</span>
+        <a href="{{ change.target_url }}" target="_blank" rel="noopener noreferrer">{{ change.target_url }}</a>
+      </div>
+    {% endif %}
   </div>
   <time class="change-time" datetime="{{ change.detected_at }}">{{ change.detected_at|display_time }}</time>
 </article>

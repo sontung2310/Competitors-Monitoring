@@ -1,8 +1,8 @@
-"""Backfill LLM narratives for existing blog and generic page changes.
+"""Backfill narratives and detected URLs for existing change records.
 
 The command reads both snapshot contents through SnapshotStorage and writes
-only the optional narrative_summary field through ChangeRepository. It is
-safe to re-run: already-populated rows are not selected.
+the optional enrichment fields through ChangeRepository. It is safe to re-run:
+already-populated detected URLs are not selected.
 
 Example:
 
@@ -28,7 +28,9 @@ if __package__ in {None, ""}:
 
 from backend.flask.change_detection.repository import ChangeRepository
 from backend.flask.change_detection.service import (
-    generate_narrative_summary,
+    generate_narrative_summary_with_url,
+    resolve_blog_detected_url,
+    resolve_product_detected_url,
 )
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.llm_provider import OpenAIProvider
@@ -59,8 +61,8 @@ def run_backfill(
         targets = MonitoringTargetRepository.from_database(database)
         snapshots = SnapshotRepository.from_database(database)
         storage = SnapshotStorage(storage_root)
-        rows = changes.list_needing_narrative_summary(limit=limit)
-        provider = None if dry_run else OpenAIProvider.from_env()
+        rows = changes.list_needing_detected_url(limit=limit)
+        provider = None
         report: dict[str, Any] = {
             "database": settings.database_name,
             "selected": len(rows),
@@ -77,44 +79,80 @@ def run_backfill(
                 "change_id": change_id,
                 "change_type": change.get("change_type"),
                 "before_narrative_summary": before,
+                "before_detected_url": change.get("detected_url"),
             }
             if dry_run:
-                entry["after_narrative_summary"] = None
+                entry["after_narrative_summary"] = before
+                target = targets.get(change["monitoring_target_id"])
+                if target is None:
+                    entry["error"] = "monitoring target metadata is missing"
+                    report["failed"] += 1
+                else:
+                    entry["after_detected_url"] = _dry_run_detected_url(
+                        change,
+                        target_url=str(target["url"]),
+                    )
                 report["changes"].append(entry)
                 print(json.dumps(entry, ensure_ascii=False))
                 continue
             try:
                 target = targets.get(change["monitoring_target_id"])
-                previous = snapshots.get(change["previous_snapshot_id"])
-                current = snapshots.get(change["current_snapshot_id"])
-                if target is None or previous is None or current is None:
-                    raise RuntimeError("target or snapshot metadata is missing")
-                previous_content = _read_snapshot(storage, previous)
-                current_content = _read_snapshot(storage, current)
-                diff = generate_diff(
-                    _with_final_newline(previous_content),
-                    _with_final_newline(current_content),
-                )
-                if not diff:
-                    raise RuntimeError("stored snapshots produced no diff")
-                narrative = generate_narrative_summary(
-                    change_type=str(change["change_type"]),
-                    diff=diff,
-                    target_url=str(target["url"]),
-                    page_type=str(target["page_type"]),
-                    provider=provider,
-                )
-                if dry_run:
-                    after = narrative
-                else:
-                    updated = changes.update_narrative_summary(change_id, narrative)
+                if target is None:
+                    raise RuntimeError("monitoring target metadata is missing")
+                change_type = str(change["change_type"])
+                if change_type in {"NEW_PRODUCT", "PRICE_CHANGE", "PRODUCT_REMOVED"}:
+                    detected_url = resolve_product_detected_url(
+                        change_type=change_type,
+                        detected_url=change.get("detected_url"),
+                        summary=str(change.get("summary", "")),
+                        target_url=str(target["url"]),
+                    )
+                    updated = changes.update_enrichment(
+                        change_id,
+                        detected_url=detected_url,
+                    )
                     if updated is None:
-                        raise RuntimeError(
-                            "row was already populated or is no longer eligible"
-                        )
+                        raise RuntimeError("change row could not be updated")
                     after = updated.get("narrative_summary")
-                    report["updated"] += 1
+                    after_url = updated.get("detected_url")
+                else:
+                    previous = snapshots.get(change["previous_snapshot_id"])
+                    current = snapshots.get(change["current_snapshot_id"])
+                    if previous is None or current is None:
+                        raise RuntimeError("snapshot metadata is missing")
+                    previous_content = _read_snapshot(storage, previous)
+                    current_content = _read_snapshot(storage, current)
+                    diff = generate_diff(
+                        _with_final_newline(previous_content),
+                        _with_final_newline(current_content),
+                    )
+                    if not diff:
+                        raise RuntimeError("stored snapshots produced no diff")
+                    if provider is None:
+                        provider = OpenAIProvider.from_env()
+                    result = generate_narrative_summary_with_url(
+                        change_type=change_type,
+                        diff=diff,
+                        target_url=str(target["url"]),
+                        page_type=str(target["page_type"]),
+                        provider=provider,
+                    )
+                    values: dict[str, Any] = {
+                        "detected_url": resolve_blog_detected_url(
+                            result.detected_url,
+                            str(target["url"]),
+                        ),
+                    }
+                    if not isinstance(before, str) or not before.strip():
+                        values["narrative_summary"] = result.narrative_summary
+                    updated = changes.update_enrichment(change_id, **values)
+                    if updated is None:
+                        raise RuntimeError("change row could not be updated")
+                    after = updated.get("narrative_summary")
+                    after_url = updated.get("detected_url")
+                report["updated"] += 1
                 entry["after_narrative_summary"] = after
+                entry["after_detected_url"] = after_url
             except Exception as exc:
                 report["failed"] += 1
                 entry["error"] = str(exc)
@@ -132,6 +170,24 @@ def _read_snapshot(storage: SnapshotStorage, snapshot: dict[str, Any]) -> str:
 
 def _with_final_newline(content: str) -> str:
     return content if content.endswith("\n") else f"{content}\n"
+
+
+def _dry_run_detected_url(change: dict[str, Any], *, target_url: str) -> str:
+    """Show backfill output without network or LLM calls."""
+
+    if change.get("change_type") not in {
+        "NEW_PRODUCT",
+        "PRICE_CHANGE",
+        "PRODUCT_REMOVED",
+    }:
+        return target_url
+    summary = str(change.get("summary", ""))
+    return resolve_product_detected_url(
+        change_type=str(change["change_type"]),
+        detected_url=change.get("detected_url"),
+        summary=summary,
+        target_url=target_url,
+    )
 
 
 def main() -> int:
