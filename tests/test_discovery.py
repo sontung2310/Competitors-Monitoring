@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import unittest
 from dataclasses import dataclass
 from types import SimpleNamespace
@@ -18,6 +19,7 @@ from backend.flask.discovery.classification import (
 from backend.flask.discovery.normalization import (
     discovery_scope,
     is_html_candidate_url,
+    is_item_type_excluded,
     is_system_path,
     normalize_url,
 )
@@ -53,13 +55,62 @@ class _FakeCompetitorRepository:
 
 
 class _FakeTargetRepository:
-    def __init__(self):
-        self.saved = []
+    def __init__(self, candidates=()):
+        self.saved = [dict(candidate) for candidate in candidates]
 
     def upsert_discovered_candidate(self, **candidate):
         result = {"id": f"candidate-{len(self.saved) + 1}", **candidate, "active": False}
         self.saved.append(result)
         return result
+
+    def list_for_competitor(self, competitor_id, *, discovery_status=None):
+        return [
+            dict(candidate)
+            for candidate in self.saved
+            if candidate.get("competitor_id") == competitor_id
+            and (
+                discovery_status is None
+                or candidate.get("discovery_status") == discovery_status
+            )
+        ]
+
+    def update(self, candidate_id, updates=None, *, competitor_id=None, **fields):
+        values = {**(updates or {}), **fields}
+        for candidate in self.saved:
+            if candidate["id"] == candidate_id and (
+                competitor_id is None
+                or candidate.get("competitor_id") == competitor_id
+            ):
+                candidate.update(values)
+                return dict(candidate)
+        return None
+
+    def discard_discovered_candidates_by_url_patterns(
+        self, competitor_id, *, url_patterns
+    ):
+        changed = 0
+        for candidate in self.saved:
+            if (
+                candidate.get("competitor_id") != competitor_id
+                or candidate.get("active") is True
+                or candidate.get("discovery_status") == "ACTIVE"
+                or candidate.get("discovery_source") not in {"SITEMAP", "LINKS"}
+                or not any(
+                    re.search(pattern, candidate.get("url", ""), flags=re.IGNORECASE)
+                    for pattern in url_patterns
+                )
+            ):
+                continue
+            candidate.update(
+                {
+                    "active": False,
+                    "page_type": "OTHER",
+                    "discovery_status": "DISCARDED",
+                    "classification_method": "RULE",
+                }
+            )
+            changed += 1
+        return changed
 
 
 class _ReviewTargetRepository:
@@ -261,6 +312,15 @@ class DiscoveryTests(unittest.TestCase):
             discovery_scope("https://example.com/products/widget"),
             "ITEM",
         )
+        self.assertTrue(
+            is_item_type_excluded(
+                "https://www.jd-sports.com.au/product/blue-shoe/16486396_jdsportsau/"
+            )
+        )
+        self.assertFalse(
+            is_item_type_excluded("https://www.jd-sports.com.au/product/blue-shoe")
+        )
+        self.assertFalse(is_item_type_excluded("https://www.jd-sports.com.au/sale/"))
         self.assertEqual(
             discovery_scope("https://example.com/blog-posts/local-seo-mastery"),
             "INDEX",
@@ -767,6 +827,104 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(target_repository.saved), 2)
         self.assertNotIn("SEARCH", service.last_summary.source_breakdown)
 
+    def test_product_detail_leaf_is_filtered_but_aggregate_listing_is_not(self):
+        target_repository = _FakeTargetRepository()
+        classifier = _RecordingClassifier()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            target_repository,
+            fallback_classifier=classifier,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL(
+                        "https://example.com/product/blue-shoe/sku-1",
+                        "SITEMAP",
+                    ),
+                    DiscoveredURL("https://example.com/products", "SITEMAP"),
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        listing = next(row for row in persisted if row["url"].endswith("/products"))
+        self.assertEqual(
+            [row for row in persisted if "/product/" in row["url"]],
+            [],
+        )
+        self.assertEqual(listing["discovery_status"], "SUGGESTED")
+        self.assertEqual(listing["page_type"], "PRODUCTS")
+        self.assertEqual(listing["classification_method"], "RULE")
+        self.assertEqual(len(classifier.batches), 0)
+
+    def test_discovery_reconciles_old_product_detail_rows_without_touching_manual_or_active(self):
+        target_repository = _FakeTargetRepository(
+            (
+                {
+                    "id": "old-product",
+                    "competitor_id": "competitor-1",
+                    "url": "https://example.com/product/blue-shoe/sku-1",
+                    "discovery_source": "SITEMAP",
+                    "discovery_status": "SUGGESTED",
+                    "classification_method": "RULE",
+                    "page_type": "PRODUCTS",
+                    "active": False,
+                },
+                {
+                    "id": "manual-product",
+                    "competitor_id": "competitor-1",
+                    "url": "https://example.com/product/manual/sku-1",
+                    "discovery_source": "MANUAL",
+                    "discovery_status": "SUGGESTED",
+                    "classification_method": "MANUAL",
+                    "page_type": "OTHER",
+                    "active": False,
+                },
+                {
+                    "id": "active-product",
+                    "competitor_id": "competitor-1",
+                    "url": "https://example.com/product/active/sku-1",
+                    "discovery_source": "SITEMAP",
+                    "discovery_status": "ACTIVE",
+                    "classification_method": "RULE",
+                    "page_type": "PRODUCTS",
+                    "active": True,
+                },
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        service.discover_website("competitor-1", user_id="company-a")
+
+        rows = {row["id"]: row for row in target_repository.saved}
+        self.assertEqual(rows["old-product"]["discovery_status"], "DISCARDED")
+        self.assertEqual(rows["old-product"]["page_type"], "OTHER")
+        self.assertEqual(rows["manual-product"]["discovery_status"], "SUGGESTED")
+        self.assertEqual(rows["active-product"]["discovery_status"], "ACTIVE")
+
     def test_discovery_service_degrades_when_fallback_classifier_fails(self):
         target_repository = _FakeTargetRepository()
         service = DiscoveryService(
@@ -1115,6 +1273,11 @@ class CandidateReviewTests(unittest.TestCase):
             "competitor-1",
             "https://example.com/pricing/",
         )
+        sale = service.add_manual_target(
+            "competitor-1",
+            "https://example.com/sale/",
+            page_type="PRODUCT_LISTING",
+        )
         other = service.add_manual_target(
             "competitor-1",
             "https://example.com/custom-offer",
@@ -1125,11 +1288,14 @@ class CandidateReviewTests(unittest.TestCase):
         self.assertEqual(pricing["discovery_status"], "ACTIVE")
         self.assertTrue(pricing["active"])
         self.assertEqual(pricing["classification_method"], "MANUAL")
+        self.assertEqual(sale["url"], "https://example.com/sale")
+        self.assertEqual(sale["page_type"], "PRODUCT_LISTING")
+        self.assertEqual(sale["discovery_status"], "ACTIVE")
         self.assertEqual(other["page_type"], "OTHER")
         self.assertEqual(other["check_interval_minutes"], 1440)
         self.assertEqual(
             {target["id"] for target in service.list_active_targets("competitor-1")},
-            {pricing["id"], other["id"]},
+            {pricing["id"], sale["id"], other["id"]},
         )
 
     def test_add_manual_target_rejects_dead_url_without_persisting(self):

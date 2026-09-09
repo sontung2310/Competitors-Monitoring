@@ -27,9 +27,11 @@ from .classification import (
     classify_candidates,
 )
 from .normalization import (
+    ITEM_TYPE_EXCLUSION_PATTERNS,
     canonicalize_raw_url,
     discovery_scope,
     is_html_candidate_url,
+    is_item_type_excluded,
     is_same_site,
     is_system_path,
     is_structural_path,
@@ -560,13 +562,17 @@ class DiscoveryService:
             website_url=website_url,
         )
 
-        normalized = _apply_liveness_gate(
-            normalized,
-            self.liveness_checker,
-            attempts=self.liveness_attempts,
-            backoff_seconds=self.liveness_backoff_seconds,
-            sleep=self.liveness_sleep,
-        )
+        normalized = [
+            candidate
+            for candidate in _apply_liveness_gate(
+                normalized,
+                self.liveness_checker,
+                attempts=self.liveness_attempts,
+                backoff_seconds=self.liveness_backoff_seconds,
+                sleep=self.liveness_sleep,
+            )
+            if not is_item_type_excluded(candidate.url)
+        ]
         classification_inputs = tuple(
             CandidateForClassification(
                 raw_url=candidate.raw_url,
@@ -592,6 +598,7 @@ class DiscoveryService:
                     classification_method=classification.classification_method,
                 )
             )
+        self._reconcile_excluded_candidates(competitor_id)
         suggested_count = sum(
             classification.discovery_status == "SUGGESTED"
             for classification in classifications
@@ -645,6 +652,23 @@ class DiscoveryService:
             },
         )
         return persisted
+
+    def _reconcile_excluded_candidates(self, competitor_id: Any) -> None:
+        """Repair old discovery rows that now match an item/detail exclusion.
+
+        Discovery sources can change between runs, so an old candidate is not
+        guaranteed to be emitted again. Newly learned exclusion patterns must
+        therefore also be applied to existing, unactivated discovery rows;
+        active targets and user-created manual rows remain untouched.
+        """
+
+        self.monitoring_target_repository.discard_discovered_candidates_by_url_patterns(
+            competitor_id,
+            url_patterns=tuple(
+                pattern.pattern.removeprefix("^")
+                for pattern in ITEM_TYPE_EXCLUSION_PATTERNS
+            )
+        )
 
     def _safe_sitemap_declarations(self, website_url: str) -> Sequence[str]:
         try:
@@ -770,7 +794,11 @@ def _normalize_and_dedupe(
                 raw_url = _canonicalize_for_site(raw_url, canonical_site)
             if not is_html_candidate_url(raw_url):
                 continue
-            force_discarded = candidate.force_discarded or discovery_scope(raw_url) == "UNMATCHED"
+            force_discarded = (
+                candidate.force_discarded
+                or discovery_scope(raw_url) == "UNMATCHED"
+                or is_item_type_excluded(raw_url)
+            )
             if (
                 candidate.source == "LINKS"
                 and candidate.priority >= 2

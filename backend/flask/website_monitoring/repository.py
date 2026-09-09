@@ -232,6 +232,43 @@ class MonitoringTargetRepository(BaseMongoRepository):
             now=now,
         )
 
+    def discard_discovered_candidates_by_url_patterns(
+        self,
+        competitor_id: Any,
+        *,
+        url_patterns: tuple[str, ...],
+    ) -> int:
+        """Discard inactive discovery rows matching newly excluded URL shapes.
+
+        This repairs candidates from earlier discovery runs in one database
+        operation. Active targets and manually created rows are deliberately
+        excluded because they represent an explicit user decision.
+        """
+
+        if not url_patterns:
+            return 0
+        result = self.collection.update_many(
+            {
+                "competitor_id": to_object_id(competitor_id),
+                "active": False,
+                "discovery_status": {"$ne": "ACTIVE"},
+                "discovery_source": {"$in": ["SITEMAP", "LINKS"]},
+                "$or": [
+                    {"url": {"$regex": pattern, "$options": "i"}}
+                    for pattern in url_patterns
+                ],
+            },
+            {
+                "$set": {
+                    "active": False,
+                    "page_type": "OTHER",
+                    "discovery_status": "DISCARDED",
+                    "classification_method": "RULE",
+                }
+            },
+        )
+        return int(getattr(result, "modified_count", 0) or 0)
+
     def list(
         self,
         *,
