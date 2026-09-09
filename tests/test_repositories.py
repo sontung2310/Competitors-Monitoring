@@ -506,6 +506,23 @@ class RepositoryTests(unittest.TestCase):
             )
         )
 
+    def test_change_repository_delete_by_id_removes_only_requested_record(self):
+        repository = ChangeRepository.from_database(self.database)
+        change = repository.create(
+            monitoring_target_id="1" * 24,
+            previous_snapshot_id="2" * 24,
+            current_snapshot_id="3" * 24,
+            detected_at=self.timestamp,
+            change_type="NEW_BLOG",
+            summary="NEW_BLOG: one line changed.",
+            status="NEW",
+            now=self.timestamp,
+        )
+
+        self.assertTrue(repository.delete_by_id(change["id"]))
+        self.assertIsNone(repository.get(change["id"]))
+        self.assertFalse(repository.delete_by_id(change["id"]))
+
     def test_mongo_settings_require_uri_and_support_database_aliases(self):
         with self.assertRaises(MongoConfigurationError):
             MongoSettings.from_env({})
