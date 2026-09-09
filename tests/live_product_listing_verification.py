@@ -28,8 +28,11 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from backend.flask.change_detection.service import ChangeService
+from backend.flask.change_detection.repository import ChangeRepository
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.database.connection import MongoSettings, connect_database
+from backend.flask.snapshot.repository import SnapshotRepository
+from backend.flask.website_monitoring.repository import MonitoringRunRepository
 from backend.flask.website_monitoring.content_processing import (
     diff_by_key,
     extract_products,
@@ -94,6 +97,10 @@ def run_live_verification() -> dict[str, Any]:
         client.admin.command("ping")
         competitors = CompetitorRepository.from_database(database)
         targets = MonitoringTargetRepository.from_database(database)
+        snapshots = SnapshotRepository.from_database(database)
+        changes = ChangeRepository.from_database(database)
+        runs = MonitoringRunRepository.from_database(database)
+        before_counts = _counts(competitors, targets, snapshots, changes, runs)
         competitor = _find_competitor(competitors)
         target = _find_target(targets, competitor["id"])
         if target.get("page_type") != PRODUCT_LISTING_PAGE_TYPE:
@@ -195,8 +202,18 @@ def run_live_verification() -> dict[str, Any]:
                 f"product events performed unexpected URL checks: {liveness_attempts}"
             )
 
+        after_counts = _counts(competitors, targets, snapshots, changes, runs)
+        if after_counts != before_counts:
+            raise AssertionError(
+                f"read-only product verification changed Atlas counts: "
+                f"before={before_counts} after={after_counts}"
+            )
+
         report = {
             "database": database.name,
+            "before_counts": before_counts,
+            "after_counts": after_counts,
+            "counts_unchanged": before_counts == after_counts,
             "competitor_id": competitor["id"],
             "target_id": target["id"],
             "target_url": target["url"],
@@ -339,6 +356,11 @@ def _card_containing(raw_html: str, key: str) -> str | None:
 def _print_report(report: dict[str, Any]) -> None:
     print(f"database={report['database']}")
     print(
+        f"atlas_counts_before={report['before_counts']} "
+        f"atlas_counts_after={report['after_counts']} "
+        f"unchanged={report['counts_unchanged']}"
+    )
+    print(
         f"competitor_id={report['competitor_id']} target_id={report['target_id']} "
         f"target={report['target_url']} page_type={report['page_type']} "
         f"interval_minutes={report['check_interval_minutes']} active={report['target_active']}"
@@ -370,6 +392,11 @@ def _print_report(report: dict[str, Any]) -> None:
         )
     print(f"product_liveness_attempts={report['product_liveness_attempts']}")
     print(f"removed_url_is_last_known={report['removed_url_is_last_known']}")
+
+
+def _counts(*repositories: Any) -> dict[str, int]:
+    names = ("competitors", "monitoring_targets", "snapshots", "changes", "monitoring_runs")
+    return {name: repository.count() for name, repository in zip(names, repositories)}
 
 
 if __name__ == "__main__":

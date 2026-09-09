@@ -1,49 +1,86 @@
-"""Opt-in end-to-end verification for the company-scoped backend PoC.
+"""Opt-in read-only live verification for the company-scoped backend PoC.
 
 Run from the repository root with the dedicated Atlas test database and the
 OpenAI provider configured:
 
-    set -a
-    source .env.mongodb
-    source .env
-    set +a
-    export MONGODB_DATABASE=competitors_monitoring_test
-    RUN_LIVE_POC=1 python -u tests/live_poc_backend_verification.py
+    RUN_LIVE_POC=1 MONGODB_DATABASE=competitors_monitoring_test \
+      python -u tests/live_poc_backend_verification.py
 
-This intentionally leaves the tagged simulated snapshots/changes and genuine
-monitoring runs in the test database as evidence. It must never be pointed at
-another database.
+The verifier reads existing company, competitor, target, and real-baseline
+records, then fetches the two live pages. Simulated content is processed by
+the real simulation and change-service boundaries using in-memory snapshots
+and changes. It never calls the persistence-enabled ``/simulate`` endpoint,
+``monitor_target``, or any repository write method.
 """
 
 from __future__ import annotations
 
 import os
+import re
 import sys
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
+from urllib.parse import urlsplit
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.flask.app import create_app
 from backend.flask.change_detection.repository import ChangeRepository
+from backend.flask.change_detection.service import ChangeService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.database.connection import MongoSettings, connect_database
+from backend.flask.llm_provider import OpenAIProvider
 from backend.flask.snapshot.repository import SnapshotRepository
-from backend.flask.website_monitoring.repository import MonitoringTargetRepository
+from backend.flask.snapshot.storage import SnapshotStorage
+from backend.flask.website_monitoring.repository import (
+    MonitoringRunRepository,
+    MonitoringTargetRepository,
+)
+from backend.flask.website_monitoring.service import (
+    fetch_page,
+    hash_content,
+    normalize_content,
+)
+from backend.flask.website_monitoring.simulated_verification import (
+    simulate_blog_change,
+    simulate_product_mutation,
+)
 
 
 TEST_DATABASE = "competitors_monitoring_test"
+LYFE_WEBSITE_URL = "https://www.lyfemarketing.com/"
+JD_WEBSITE_URL = "https://www.jd-sports.com.au/"
+LYFE_BLOG_PATH = "/blog"
+JD_SALE_PATH = "/sale"
+TEST_SCAFFOLDING_MARKERS = re.compile(
+    r"(forced narrative|verification marker|ton[- ]?21|synthetic product|test fixture)",
+    re.IGNORECASE,
+)
+
+
+class _InMemoryChangeRepository:
+    """Minimal repository boundary for verification-only change records."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def create(self, **values: Any) -> dict[str, Any]:
+        record = dict(values)
+        record["id"] = f"in-memory-{len(self.records) + 1}"
+        self.records.append(record)
+        return record
 
 
 def run_live_verification() -> dict[str, Any]:
+    """Run live read checks plus in-memory blog and product simulations."""
+
     if os.environ.get("RUN_LIVE_POC") != "1":
         raise SystemExit("Set RUN_LIVE_POC=1 to run live PoC verification")
 
     settings = MongoSettings.from_env()
     if settings.database_name != TEST_DATABASE:
         raise RuntimeError(
-            f"refusing to write outside {TEST_DATABASE!r}; "
+            f"refusing to inspect outside {TEST_DATABASE!r}; "
             f"configured database is {settings.database_name!r}"
         )
 
@@ -53,148 +90,105 @@ def run_live_verification() -> dict[str, Any]:
     )
     try:
         mongo_client.admin.command("ping")
-        app = create_app(
-            database=database,
-            user_id="live-verification",
-            testing=True,
-        )
-        http = app.test_client()
-        companies = _expect(http.get("/api/companies"), 200)
-        if len(companies) != 2:
-            raise AssertionError(f"expected exactly two companies, got {companies!r}")
-        companies_by_name = {company["name"]: company for company in companies}
-        expected_company_names = {"Marketing Eye", "The Athletes Foot"}
-        if set(companies_by_name) != expected_company_names:
-            raise AssertionError(
-                f"unexpected PoC companies: {sorted(companies_by_name)}"
-            )
-
-        marketing_eye = companies_by_name["Marketing Eye"]
-        athletes_foot = companies_by_name["The Athletes Foot"]
-        marketing_id = marketing_eye["id"]
-        athletes_id = athletes_foot["id"]
-
-        scoped_marketing = _expect(
-            http.get(f"/api/competitors?company_id={marketing_id}"),
-            200,
-        )
-        scoped_athletes = _expect(
-            http.get(f"/api/competitors?company_id={athletes_id}"),
-            200,
-        )
-        if len(scoped_marketing) != 1 or len(scoped_athletes) != 1:
-            raise AssertionError(
-                "company-scoped competitor lists did not contain exactly one record"
-            )
-        if "lyfe" not in scoped_marketing[0]["website_url"].lower():
-            raise AssertionError(f"Marketing Eye scope is wrong: {scoped_marketing!r}")
-        if "jd-sports" not in scoped_athletes[0]["website_url"].lower():
-            raise AssertionError(f"The Athletes Foot scope is wrong: {scoped_athletes!r}")
-
-        all_competitors = _expect(http.get("/api/competitors"), 200)
-        unassigned_names = {
-            row["name"]
-            for row in all_competitors
-            if "company_id" not in row
-        }
-        if not {"Brown Bag Marketing", "Elevation Marketing"}.issubset(unassigned_names):
-            raise AssertionError(
-                f"Brown Bag/Elevation were not left unassigned: {all_competitors!r}"
-            )
-
-        lyfe_id = scoped_marketing[0]["id"]
-        jd_id = scoped_athletes[0]["id"]
-        lyfe_discovery = _expect(
-            http.post(f"/api/competitors/{lyfe_id}/discover?company_id={marketing_id}"),
-            200,
-        )
-        if lyfe_discovery["summary"] is None:
-            raise AssertionError("real discovery endpoint returned no summary")
-
+        competitors = CompetitorRepository.from_database(database)
         targets = MonitoringTargetRepository.from_database(database)
         snapshots = SnapshotRepository.from_database(database)
         changes = ChangeRepository.from_database(database)
-        lyfe_blog = _find_active_target(
-            _expect(http.get(f"/api/monitoring-targets?company_id={marketing_id}"), 200),
-            page_type="BLOG",
-        )
-        jd_product = _find_active_target(
-            _expect(http.get(f"/api/monitoring-targets?company_id={athletes_id}"), 200),
-            page_type="PRODUCT_LISTING",
-        )
+        runs = MonitoringRunRepository.from_database(database)
+        storage = SnapshotStorage()
+        before_counts = _counts(competitors, targets, snapshots, changes, runs)
 
-        blog_baseline = _latest_real_snapshot(snapshots, lyfe_blog["id"])
-        blog_simulation = _expect(
-            http.post(
-                f"/api/monitoring-targets/{lyfe_blog['id']}/simulate?company_id={marketing_id}"
-            ),
-            200,
-        )
-        _assert_simulation_response(blog_simulation, expected_page_type="BLOG")
-        if blog_simulation["change"]["change_type"] != "NEW_BLOG":
-            raise AssertionError(f"blog simulation had the wrong event: {blog_simulation!r}")
-        _assert_persisted_simulation(
+        lyfe = _find_competitor(competitors, LYFE_WEBSITE_URL)
+        jd = _find_competitor(competitors, JD_WEBSITE_URL)
+        lyfe_target = _find_active_target(targets, lyfe["id"], LYFE_BLOG_PATH)
+        jd_target = _find_active_target(targets, jd["id"], JD_SALE_PATH)
+        if lyfe_target is None:
+            raise AssertionError("no active Lyfe BLOG target was found")
+        if jd_target is None or jd_target.get("page_type") != "PRODUCT_LISTING":
+            raise AssertionError("no active JD PRODUCT_LISTING target was found")
+
+        provider = OpenAIProvider.from_env()
+        lyfe_fetch = fetch_page(lyfe_target["url"])
+        lyfe_baseline = _latest_real_snapshot(
             snapshots,
-            changes,
-            blog_simulation,
+            storage,
+            lyfe_target["id"],
         )
-        blog_monitor = app.extensions["api_services"]["monitoring"].monitor_target(
-            lyfe_blog["id"]
+        blog_result = simulate_blog_change(
+            lyfe_fetch.content,
+            provider,
+            previous_snapshot=lyfe_baseline,
         )
-        _assert_real_monitor_used_baseline(blog_monitor, blog_baseline, blog_simulation)
+        blog_event = blog_result.process_result.change_events[0]
+        if blog_event.get("change_type") != "NEW_BLOG":
+            raise AssertionError(f"unexpected blog event: {blog_event!r}")
 
-        jd_baseline = _latest_real_snapshot(snapshots, jd_product["id"])
-        product_simulation = _expect(
-            http.post(
-                f"/api/monitoring-targets/{jd_product['id']}/simulate?company_id={athletes_id}",
-                json={"mutation_type": "NEW_PRODUCT"},
-            ),
-            200,
+        in_memory_changes = _InMemoryChangeRepository()
+        change_service = ChangeService(
+            in_memory_changes,
+            targets,
+            narrative_provider_factory=lambda: provider,
+            detected_url_liveness_checker=fetch_page,
         )
-        _assert_simulation_response(
-            product_simulation,
-            expected_page_type="PRODUCT_LISTING",
+        blog_snapshot = _in_memory_snapshot(
+            "in-memory-blog-before",
+            lyfe_fetch.content,
         )
-        if product_simulation.get("mutation_type") != "NEW_PRODUCT":
-            raise AssertionError(f"product simulation did not honor mutation_type: {product_simulation!r}")
-        if product_simulation["change"]["change_type"] != "NEW_PRODUCT":
-            raise AssertionError(f"product simulation had the wrong event: {product_simulation!r}")
-        _assert_persisted_simulation(snapshots, changes, product_simulation)
-        jd_monitor = app.extensions["api_services"]["monitoring"].monitor_target(
-            jd_product["id"]
+        mutated_blog_snapshot = _in_memory_snapshot(
+            "in-memory-blog-after",
+            blog_result.mutated_content,
         )
-        _assert_real_monitor_used_baseline(jd_monitor, jd_baseline, product_simulation)
+        blog_change = change_service.create_change(
+            lyfe_target["id"],
+            blog_snapshot,
+            mutated_blog_snapshot,
+            change_type=blog_event["change_type"],
+            summary=blog_event["summary"],
+            is_simulated=True,
+        )
+        narrative = blog_change.get("narrative_summary") or ""
+        if TEST_SCAFFOLDING_MARKERS.search(narrative):
+            raise AssertionError(
+                f"generated narrative contains test scaffolding: {narrative!r}"
+            )
 
-        feed = _expect(
-            http.get(f"/api/changes?company_id={marketing_id}&limit=100"),
-            200,
+        jd_fetch = fetch_page(jd_target["url"])
+        product_result = simulate_product_mutation(
+            jd_fetch.content,
+            provider,
+            mutation_type="NEW_PRODUCT",
         )
-        if not any(
-            row.get("id") == blog_simulation["change"]["id"]
-            and row.get("is_simulated") is True
-            for row in feed
-        ):
-            raise AssertionError("simulated blog change was not visible in the scoped feed")
+        product_event = product_result.events[0]
+        if product_event.get("change_type") != "NEW_PRODUCT":
+            raise AssertionError(f"unexpected product event: {product_event!r}")
+
+        after_counts = _counts(competitors, targets, snapshots, changes, runs)
+        if after_counts != before_counts:
+            raise AssertionError(
+                f"read-only PoC verification changed Atlas counts: "
+                f"before={before_counts} after={after_counts}"
+            )
 
         report = {
             "database": database.name,
-            "companies": companies,
-            "scoped_competitors": {
-                "Marketing Eye": scoped_marketing,
-                "The Athletes Foot": scoped_athletes,
-            },
-            "unassigned_competitors": sorted(unassigned_names),
-            "discovery": {
-                "competitor_id": lyfe_discovery["competitor_id"],
-                "summary": lyfe_discovery["summary"],
-                "candidate_count": len(lyfe_discovery["candidates"]),
-            },
-            "blog": _simulation_report(blog_simulation, blog_monitor, blog_baseline),
-            "product": _simulation_report(product_simulation, jd_monitor, jd_baseline),
-            "scoped_feed_contains_simulated_blog": True,
-            "snapshot_counts": {
-                "lyfe_blog": len(targets.list_for_competitor(lyfe_id)),
-                "jd_product": len(targets.list_for_competitor(jd_id)),
+            "before_counts": before_counts,
+            "after_counts": after_counts,
+            "counts_unchanged": before_counts == after_counts,
+            "persisted_test_records_created": 0,
+            "in_memory_change_ids": [record["id"] for record in in_memory_changes.records],
+            "lyfe_target_id": lyfe_target["id"],
+            "lyfe_fetch": f"{lyfe_fetch.fetch_method}/{lyfe_fetch.http_status}",
+            "lyfe_baseline_snapshot_id": lyfe_baseline["id"],
+            "blog_change_type": blog_change["change_type"],
+            "blog_narrative": narrative,
+            "blog_narrative_test_scaffolding_markers": sorted(
+                set(match.group(0) for match in TEST_SCAFFOLDING_MARKERS.finditer(narrative))
+            ),
+            "jd_target_id": jd_target["id"],
+            "jd_fetch": f"{jd_fetch.fetch_method}/{jd_fetch.http_status}",
+            "jd_product_event": {
+                "change_type": product_event["change_type"],
+                "summary": product_event["summary"],
             },
         }
         _print_report(report)
@@ -203,106 +197,82 @@ def run_live_verification() -> dict[str, Any]:
         mongo_client.close()
 
 
-def _find_active_target(rows: list[dict[str, Any]], *, page_type: str) -> dict[str, Any]:
-    for row in rows:
-        if (
-            row.get("page_type") == page_type
-            and row.get("active") is True
-            and row.get("discovery_status") == "ACTIVE"
-        ):
-            return row
-    raise AssertionError(f"no active {page_type} target found in {rows!r}")
+def _counts(*repositories: Any) -> dict[str, int]:
+    names = ("competitors", "monitoring_targets", "snapshots", "changes", "monitoring_runs")
+    return {name: repository.count() for name, repository in zip(names, repositories)}
 
 
-def _latest_real_snapshot(repository: SnapshotRepository, target_id: str) -> dict[str, Any] | None:
-    rows = repository.list_for_target(target_id, include_simulated=False)
-    return rows[0] if rows else None
-
-
-def _assert_simulation_response(
-    response: Mapping[str, Any],
-    *,
-    expected_page_type: str,
-) -> None:
-    if response.get("page_type") != expected_page_type:
-        raise AssertionError(f"wrong simulation page type: {response!r}")
-    if response.get("is_simulated") is not True:
-        raise AssertionError(f"simulation response is not tagged: {response!r}")
-    if response.get("snapshot", {}).get("is_simulated") is not True:
-        raise AssertionError(f"simulated snapshot is not tagged: {response!r}")
-    if not response.get("changes") or response["change"] is None:
-        raise AssertionError(f"simulation returned no persisted change: {response!r}")
-    if any(change.get("is_simulated") is not True for change in response["changes"]):
-        raise AssertionError(f"simulated changes are not tagged: {response!r}")
-
-
-def _assert_persisted_simulation(
-    snapshots: SnapshotRepository,
-    changes: ChangeRepository,
-    response: Mapping[str, Any],
-) -> None:
-    stored_snapshot = snapshots.get(response["snapshot"]["id"])
-    stored_change = changes.get(response["change"]["id"])
-    if stored_snapshot is None or stored_snapshot.get("is_simulated") is not True:
-        raise AssertionError(f"simulation snapshot was not persisted/tagged: {stored_snapshot!r}")
-    if stored_change is None or stored_change.get("is_simulated") is not True:
-        raise AssertionError(f"simulation change was not persisted/tagged: {stored_change!r}")
-
-
-def _assert_real_monitor_used_baseline(
-    monitor_result: Mapping[str, Any],
-    baseline: Mapping[str, Any] | None,
-    simulation: Mapping[str, Any],
-) -> None:
-    if monitor_result["run"]["status"] != "SUCCESS":
-        raise AssertionError(f"genuine monitor failed: {monitor_result!r}")
-    previous = monitor_result.get("previous_snapshot")
-    expected_id = baseline["id"] if baseline is not None else simulation["previous_snapshot"]["id"]
-    if previous is None or previous.get("id") != expected_id:
-        raise AssertionError(
-            f"genuine monitor did not use the pre-simulation real baseline: "
-            f"expected={expected_id!r} previous={previous!r}"
-        )
-    if previous.get("is_simulated") is True:
-        raise AssertionError("genuine monitor compared against a simulated snapshot")
-
-
-def _simulation_report(
-    simulation: Mapping[str, Any],
-    monitor: Mapping[str, Any],
-    baseline: Mapping[str, Any] | None,
+def _find_competitor(
+    repository: CompetitorRepository,
+    website_url: str,
 ) -> dict[str, Any]:
+    wanted_host = urlsplit(website_url).netloc
+    for competitor in repository.list_all(active=True):
+        if urlsplit(str(competitor.get("website_url", ""))).netloc == wanted_host:
+            return competitor
+    raise AssertionError(f"no active competitor matched {website_url!r}")
+
+
+def _find_active_target(
+    repository: MonitoringTargetRepository,
+    competitor_id: Any,
+    path: str,
+) -> dict[str, Any] | None:
+    wanted_path = path.rstrip("/") or "/"
+    for target in repository.list_active_targets(competitor_id):
+        target_path = urlsplit(str(target.get("url", ""))).path.rstrip("/") or "/"
+        if target_path == wanted_path:
+            return target
+    return None
+
+
+def _latest_real_snapshot(
+    repository: SnapshotRepository,
+    storage: SnapshotStorage,
+    target_id: Any,
+) -> dict[str, Any]:
+    rows = repository.list_for_target(target_id, include_simulated=False)
+    if not rows:
+        raise AssertionError(f"no real baseline snapshot for {target_id!r}")
+    snapshot = dict(rows[0])
+    snapshot["content"] = storage.read_snapshot_bytes(
+        snapshot["storage_path"]
+    ).decode("utf-8")
+    return snapshot
+
+
+def _in_memory_snapshot(snapshot_id: str, content: str) -> dict[str, str]:
+    normalized = normalize_content(content)
     return {
-        "target_id": simulation["monitoring_target_id"],
-        "page_type": simulation["page_type"],
-        "mutation_type": simulation.get("mutation_type"),
-        "baseline_snapshot_id": baseline["id"] if baseline else simulation["previous_snapshot"]["id"],
-        "simulated_snapshot_id": simulation["snapshot"]["id"],
-        "simulated_change_ids": [change["id"] for change in simulation["changes"]],
-        "simulated_change_types": [change["change_type"] for change in simulation["changes"]],
-        "genuine_monitor_run_id": monitor["run"]["id"],
-        "genuine_monitor_previous_snapshot_id": monitor["previous_snapshot"]["id"],
+        "id": snapshot_id,
+        "content": normalized,
+        "content_hash": hash_content(normalized),
     }
 
 
-def _expect(response: Any, status_code: int) -> Any:
-    if response.status_code != status_code:
-        raise AssertionError(
-            f"expected HTTP {status_code}, got {response.status_code}: "
-            f"{response.get_json(silent=True)!r}"
-        )
-    return response.get_json()
-
-
-def _print_report(report: Mapping[str, Any]) -> None:
+def _print_report(report: dict[str, Any]) -> None:
     print(f"database={report['database']}")
-    print(f"companies={[company['name'] for company in report['companies']]}")
-    print(f"scoped_competitors={report['scoped_competitors']}")
-    print(f"unassigned_competitors={report['unassigned_competitors']}")
-    print(f"discovery={report['discovery']}")
-    print(f"blog={report['blog']}")
-    print(f"product={report['product']}")
-    print(f"scoped_feed_contains_simulated_blog={report['scoped_feed_contains_simulated_blog']}")
+    print(
+        f"atlas_counts_before={report['before_counts']} "
+        f"atlas_counts_after={report['after_counts']} "
+        f"unchanged={report['counts_unchanged']}"
+    )
+    print(f"persisted_test_records_created={report['persisted_test_records_created']}")
+    print(f"in_memory_change_ids={report['in_memory_change_ids']}")
+    print(
+        f"lyfe_target_id={report['lyfe_target_id']} fetch={report['lyfe_fetch']} "
+        f"baseline_snapshot_id={report['lyfe_baseline_snapshot_id']}"
+    )
+    print(
+        f"blog_change_type={report['blog_change_type']} "
+        f"narrative={report['blog_narrative']!r} "
+        f"narrative_test_scaffolding_markers="
+        f"{report['blog_narrative_test_scaffolding_markers']}"
+    )
+    print(
+        f"jd_target_id={report['jd_target_id']} fetch={report['jd_fetch']} "
+        f"product_event={report['jd_product_event']}"
+    )
 
 
 if __name__ == "__main__":
