@@ -11,7 +11,7 @@
   <span class="status-badge status-{{ record.discovery_status|lower }}">{{ record.discovery_status }}</span>
   <div class="row-actions">
     {% if record.discovery_status == 'SUGGESTED' %}
-      <form method="post" action="{% url 'activate_candidate' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-primary button-small" type="submit">Activate</button></form>
+      <form method="post" action="{% url 'activate_candidate' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><input type="hidden" name="status" value="SUGGESTED"><button class="button button-primary button-small" type="submit">Activate</button></form>
       <form method="post" action="{% url 'discard_candidate' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Discard</button></form>
     {% elif record.discovery_status == 'ACTIVE' and record.active is True %}
       <form class="simulate-form row-simulate-form" method="post" action="{% url 'simulate_target' competitor.id record.id %}" data-loading="simulate" data-loading-text="Simulating…">
@@ -27,6 +27,10 @@
       <form method="post" action="{% url 'deactivate_target' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Deactivate</button></form>
       <form method="post" action="{% url 'delete_target' competitor.id record.id %}" data-confirm="Remove this target?">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Remove</button></form>
     {% elif record.discovery_status == 'DISCARDED' %}
+      <form method="post" action="{% url 'activate_candidate' competitor.id record.id %}">
+        {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><input type="hidden" name="status" value="DISCARDED"><input type="hidden" name="url" value="{{ record.url }}"><input type="hidden" name="page_type" value="{{ record.page_type }}">
+        <button class="button button-primary button-small" type="submit">Activate anyway</button>
+      </form>
       <form method="post" action="{% url 'edit_candidate' competitor.id record.id %}" class="inline-edit-form">
         {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><input type="hidden" name="status" value="DISCARDED">
         <label class="sr-only" for="edit-{{ record.id }}">Edit candidate URL</label><input id="edit-{{ record.id }}" name="url" value="{{ record.url }}" type="url">

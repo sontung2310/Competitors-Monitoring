@@ -29,6 +29,7 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
   - [x] 1.2b real OpenAI CandidateClassifier fallback (TON-25; the original gpt-5-nano placeholder is superseded by configurable OpenAI gpt-4o via the shared provider; provider failures retain deterministic DISCARDED fallback behavior)
 - [x] 1.3 Layer 1 UX support (backend service): expose SUGGESTED candidates for review; keep DISCARDED accessible, not deleted
 - [x] 1.3b Candidate CRUD service operations: activate suggested candidate, manually add/edit/remove through the normal repository layer (HTTP endpoints are wired in Step 2.3)
+- [x] 1.3c Reactivate discarded candidates in the review UI and sort Suggested/Active/Discarded lists by most-recently-changed (`updated_at`) (TON-32; reactivation reuses the existing liveness-gated manual-target promotion path)
 - [x] 1.4 Layer 2 — Monitoring engine
   - [x] fetch strategy: HTTP first, browser-fetch fallback for JS-heavy pages
   - [x] content normalization
