@@ -41,6 +41,7 @@ TARGET = {
     "classification_method": "RULE",
     "active": True,
     "check_interval_minutes": 720,
+    "updated_at": "2026-09-08T01:00:00Z",
 }
 CANDIDATE = {
     "id": "candidate-pricing",
@@ -51,6 +52,7 @@ CANDIDATE = {
     "classification_method": "RULE",
     "active": False,
     "check_interval_minutes": 1440,
+    "updated_at": "2026-09-08T02:00:00Z",
 }
 
 
@@ -61,9 +63,10 @@ class FakeAPIClient:
         self.discovery_run = None
         self.last_run_id = None
         self.discovery_add_candidate = False
+        self.reactivated_calls = []
         self.companies = [COMPANY]
         self.competitors = [COMPETITOR]
-        self.targets = [TARGET, CANDIDATE]
+        self.targets = [dict(TARGET), dict(CANDIDATE)]
         self.changes = [
             {
                 "id": "change-simulated",
@@ -114,6 +117,15 @@ class FakeAPIClient:
                 status_code=400,
                 code="validation_error",
             )
+        self.reactivated_calls.append(kwargs)
+        for target in self.targets:
+            if target.get("url") == kwargs.get("url"):
+                target.update(
+                    active=True,
+                    discovery_status="ACTIVE",
+                    updated_at="2026-09-09T03:00:00Z",
+                )
+                return target
         return TARGET
 
     def discover(self, competitor_id, company_id, *, run_id=None):
@@ -179,6 +191,148 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, 'href="https://www.lyfemarketing.com/blog/new-article"')
         self.assertContains(response, "Detected page")
         self.assertContains(response, "Tracked page:")
+
+    def test_discarded_candidate_can_be_reactivated_through_manual_liveness_path(self):
+        discarded = {
+            **CANDIDATE,
+            "id": "candidate-discarded",
+            "url": "https://www.lyfemarketing.com/about",
+            "discovery_status": "DISCARDED",
+        }
+        self.client_data.targets.append(discarded)
+
+        response = self.client.get(
+            "/competitors/competitor-lyfe/?company_id=company-marketing-eye&status=DISCARDED"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Activate anyway")
+        self.assertContains(response, 'name="status" value="DISCARDED"')
+
+        response = self.client.post(
+            "/competitors/competitor-lyfe/candidates/candidate-discarded/activate/",
+            {
+                "company_id": COMPANY["id"],
+                "status": "DISCARDED",
+                "url": discarded["url"],
+                "page_type": discarded["page_type"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(self.client_data.reactivated_calls[0]["competitor_id"], COMPETITOR["id"])
+        self.assertEqual(self.client_data.reactivated_calls[0]["url"], discarded["url"])
+        self.assertEqual(self.client_data.targets[-1]["discovery_status"], "ACTIVE")
+
+        active_response = self.client.get(response["Location"])
+        self.assertContains(active_response, discarded["url"])
+
+    def test_deactivated_history_target_is_shown_in_discarded_review(self):
+        deactivated = {
+            **TARGET,
+            "id": "target-deactivated",
+            "url": "https://www.lyfemarketing.com/deactivated-history",
+            "active": False,
+            "updated_at": "2026-09-09T04:00:00Z",
+        }
+        discarded_old = {
+            **CANDIDATE,
+            "id": "candidate-discarded-old",
+            "url": "https://www.lyfemarketing.com/discarded-old",
+            "discovery_status": "DISCARDED",
+            "updated_at": "2026-09-09T01:00:00Z",
+        }
+        self.client_data.targets.extend((deactivated, discarded_old))
+
+        response = self.client.get(
+            "/competitors/competitor-lyfe/?company_id=company-marketing-eye&status=DISCARDED"
+        )
+
+        self.assertEqual(response.status_code, 200)
+        content = response.content.decode()
+        self.assertLess(content.index(deactivated["url"]), content.index(discarded_old["url"]))
+        self.assertContains(response, "Activate anyway")
+
+    def test_discarded_reactivation_preserves_backend_liveness_error(self):
+        discarded = {
+            **CANDIDATE,
+            "id": "candidate-dead",
+            "url": "https://www.lyfemarketing.com/dead-page",
+            "discovery_status": "DISCARDED",
+        }
+        self.client_data.targets.append(discarded)
+        self.client_data.manual_error = True
+
+        response = self.client.post(
+            "/competitors/competitor-lyfe/candidates/candidate-dead/activate/",
+            {
+                "company_id": COMPANY["id"],
+                "status": "DISCARDED",
+                "url": discarded["url"],
+                "page_type": discarded["page_type"],
+            },
+        )
+
+        self.assertEqual(response.status_code, 400)
+        self.assertContains(
+            response,
+            "manual target URL &#x27;https://www.lyfemarketing.com/dead-page&#x27; failed liveness checks after 3 attempts; target was not created",
+            status_code=400,
+        )
+        self.assertContains(response, "Discarded", status_code=400)
+
+    def test_review_tabs_sort_rows_by_updated_at_descending(self):
+        self.client_data.targets = [
+            {
+                **CANDIDATE,
+                "id": "suggested-old",
+                "url": "https://www.lyfemarketing.com/suggested-old",
+                "updated_at": "2026-09-09T01:00:00Z",
+            },
+            {
+                **CANDIDATE,
+                "id": "suggested-new",
+                "url": "https://www.lyfemarketing.com/suggested-new",
+                "updated_at": "2026-09-09T02:00:00Z",
+            },
+            {
+                **CANDIDATE,
+                "id": "discarded-old",
+                "url": "https://www.lyfemarketing.com/discarded-old",
+                "discovery_status": "DISCARDED",
+                "updated_at": "2026-09-09T01:00:00Z",
+            },
+            {
+                **CANDIDATE,
+                "id": "discarded-new",
+                "url": "https://www.lyfemarketing.com/discarded-new",
+                "discovery_status": "DISCARDED",
+                "updated_at": "2026-09-09T02:00:00Z",
+            },
+            {
+                **TARGET,
+                "id": "active-old",
+                "url": "https://www.lyfemarketing.com/active-old",
+                "updated_at": "2026-09-09T01:00:00Z",
+            },
+            {
+                **TARGET,
+                "id": "active-new",
+                "url": "https://www.lyfemarketing.com/active-new",
+                "updated_at": "2026-09-09T02:00:00Z",
+            },
+        ]
+
+        for status, newest, oldest in (
+            ("SUGGESTED", "suggested-new", "suggested-old"),
+            ("ACTIVE", "active-new", "active-old"),
+            ("DISCARDED", "discarded-new", "discarded-old"),
+        ):
+            response = self.client.get(
+                f"/competitors/competitor-lyfe/?company_id={COMPANY['id']}&status={status}"
+            )
+            content = response.content.decode()
+            self.assertLess(content.index(newest), content.index(oldest))
 
     def test_removed_product_link_has_last_known_warning_treatment(self):
         self.client_data.changes.append(

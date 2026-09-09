@@ -154,7 +154,15 @@ def activate_candidate(request: HttpRequest, competitor_id: str, candidate_id: s
         client = get_api_client()
         try:
             company_id = _company_id_from_request(request)
-            client.activate_candidate(candidate_id, company_id)
+            if request.POST.get("status", "SUGGESTED").upper() == "DISCARDED":
+                client.add_manual_target(
+                    company_id=company_id,
+                    competitor_id=competitor_id,
+                    url=request.POST.get("url", "").strip(),
+                    page_type=request.POST.get("page_type", "").strip().upper() or None,
+                )
+            else:
+                client.activate_candidate(candidate_id, company_id)
             return redirect(_detail_url(competitor_id, company_id, status="ACTIVE"))
         except APIClientError as exc:
             return _detail_error_response(request, client, competitor_id, str(exc), exc.status_code or 502)
@@ -394,9 +402,14 @@ def _detail_context(
     competitor_id: str,
 ) -> dict[str, Any]:
     competitor = client.get_competitor(competitor_id, selected_company["id"])
-    review_candidates = client.list_candidates(competitor_id, selected_company["id"], status="ALL")
-    targets = client.list_targets(selected_company["id"], competitor_id)
-    status = request.GET.get("status", "SUGGESTED").upper()
+    targets = _sort_review_rows(client.list_targets(selected_company["id"], competitor_id))
+    review_candidates = _sort_review_rows(
+        [
+            *client.list_candidates(competitor_id, selected_company["id"], status="ALL"),
+            *_inactive_targets_for_review(targets),
+        ]
+    )
+    status = (request.GET.get("status") or request.POST.get("status") or "SUGGESTED").upper()
     if status not in {"SUGGESTED", "ACTIVE", "DISCARDED"}:
         status = "SUGGESTED"
     candidates = [candidate for candidate in review_candidates if candidate.get("discovery_status") == status]
@@ -548,6 +561,38 @@ def _decorate_changes(
         item["target_url"] = target.get("url") if target else None
         decorated.append(item)
     return decorated
+
+
+def _sort_review_rows(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Put the most recently changed review row first.
+
+    The API contract guarantees UTC ISO 8601 timestamps, whose string ordering
+    is chronological. Missing timestamps stay at the end without preventing
+    older rows from rendering.
+    """
+
+    return sorted(
+        (dict(row) for row in rows),
+        key=lambda row: str(row.get("updated_at") or ""),
+        reverse=True,
+    )
+
+
+def _inactive_targets_for_review(rows: Iterable[Mapping[str, Any]]) -> list[dict[str, Any]]:
+    """Expose deactivated history-bearing targets in the Discarded tab.
+
+    The backend intentionally preserves ``discovery_status=ACTIVE`` when a
+    target with history is deactivated, so its foreign-key references remain
+    valid. The review UI still needs to offer the same liveness-gated
+    reactivation action, so this creates a presentation-only DISCARDED view of
+    those inactive rows without changing their stored lifecycle status.
+    """
+
+    return [
+        {**row, "discovery_status": "DISCARDED"}
+        for row in rows
+        if row.get("active") is False and row.get("discovery_status") == "ACTIVE"
+    ]
 
 
 def _company_id_from_request(request: HttpRequest) -> str:
