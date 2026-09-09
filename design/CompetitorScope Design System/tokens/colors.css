@@ -1,0 +1,64 @@
+:root{
+  /* ── Brand ─────────────────────────────────────────────
+     Values transcribed verbatim from docs/design-guidelines.md.
+     Both brand hexes are documented there as VISUAL ESTIMATES read from a
+     screenshot of the reference app (roboticmarketer.com), not sampled.
+     An open TODO in that file asks for inspector-confirmed values. */
+  --color-primary:#E4362A;
+  --color-primary-hover:#C42E22;
+  --color-primary-light:#FDE8E5;
+  --color-secondary:#2FBF8F;
+  --color-secondary-light:#E3F7EF;
+
+  /* ── Surfaces ── */
+  --color-bg:#FFFFFF;
+  --color-bg-subtle:#F7F7F8;
+
+  /* ── Ink ── */
+  --color-text:#1A1A1A;
+  --color-text-muted:#6B7280;
+
+  /* ── Line ── */
+  --color-border:#E5E7EB;
+
+  /* ── Status ── */
+  --color-success:#16A34A;
+  --color-warning:#D97706;
+  --color-error:#DC2626;
+
+  /* ── Semantic aliases ───────────────────────────────────
+     Derived, not in the source doc: named for the roles the doc describes
+     in prose so consumers reach for meaning, not hex. */
+  --text-body:var(--color-text);
+  --text-heading:var(--color-text);        /* headings are ink, never brand red */
+  --text-meta:var(--color-text-muted);     /* timestamps, labels, small print */
+  --text-on-brand:#FFFFFF;
+
+  --surface-page:var(--color-bg-subtle);   /* dashboard main content ground */
+  --surface-card:var(--color-bg);          /* white cards sit on the page ground */
+  --surface-nav:var(--color-bg);           /* sidebar is white, not tinted */
+  --surface-selected:var(--color-primary-light);
+
+  --border-card:var(--color-border);
+  --border-input:var(--color-border);
+  --border-focus:var(--color-primary);
+
+  /* Favorable / unfavorable. --color-secondary means added/positive/favorable
+     and is never decorative; the red family means removed/negative. */
+  --signal-favorable:var(--color-secondary);
+  --signal-favorable-bg:var(--color-secondary-light);
+  --signal-unfavorable:var(--color-error);
+  --signal-neutral:var(--color-warning);   /* attention-worthy, not good/bad */
+  --signal-lowest:var(--color-text-muted);
+
+  /* The SIMULATED marker: solid warning fill + white bold text.
+     Reserved exclusively for is_simulated records. */
+  --simulated-bg:var(--color-warning);
+  --simulated-fg:#FFFFFF;
+
+  /* Status-badge tints — ~15% opacity bg + solid-color text (doc rule) */
+  --badge-success-bg:rgba(22,163,74,.15);
+  --badge-error-bg:rgba(220,38,38,.15);
+  --badge-warning-bg:rgba(217,119,6,.15);
+  --badge-muted-bg:rgba(107,114,128,.15);
+}

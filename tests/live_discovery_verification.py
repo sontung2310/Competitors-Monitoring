@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import re
 import sys
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -74,6 +75,39 @@ class _MemoryMonitoringTargetRepository:
         record = {"id": str(len(self.records) + 1), **candidate, "active": False}
         self.records.append(record)
         return record
+
+    def discard_discovered_candidates_by_url_patterns(
+        self, competitor_id: str, *, url_patterns: tuple[str, ...]
+    ) -> int:
+        """Mirror production reconciliation for this in-memory verifier."""
+
+        changed = 0
+        for record in self.records:
+            if (
+                record.get("competitor_id") != competitor_id
+                or record.get("active") is True
+                or record.get("discovery_status") == "ACTIVE"
+                or record.get("discovery_source") not in {"SITEMAP", "LINKS"}
+                or not any(
+                    re.search(
+                        pattern,
+                        str(record.get("url") or ""),
+                        flags=re.IGNORECASE,
+                    )
+                    for pattern in url_patterns
+                )
+            ):
+                continue
+            record.update(
+                {
+                    "active": False,
+                    "page_type": "OTHER",
+                    "discovery_status": "DISCARDED",
+                    "classification_method": "RULE",
+                }
+            )
+            changed += 1
+        return changed
 
 
 def run_live_verification() -> dict[str, list[dict[str, object]]]:

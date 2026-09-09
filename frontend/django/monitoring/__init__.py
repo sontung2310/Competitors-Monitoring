@@ -1,0 +1,1 @@
+"""CompetitorScope Django presentation app."""

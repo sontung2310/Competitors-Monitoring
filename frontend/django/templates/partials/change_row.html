@@ -1,0 +1,13 @@
+{% load monitoring_tags %}
+<article class="change-row" data-simulated="{% if change.is_simulated is True %}true{% else %}false{% endif %}">
+  <div class="change-badges">
+    <span class="change-type change-type-{{ change.change_type|lower }}">{{ change.change_type }}</span>
+    {% if change.is_simulated is True %}<span class="simulated-badge">🧪 SIMULATED</span>{% endif %}
+  </div>
+  <div class="change-copy">
+    <div class="change-summary">{{ change.summary }}</div>
+    {% if change.old_value or change.new_value %}<div class="price-detail">{{ change.old_value }} <span aria-hidden="true">→</span> {{ change.new_value }}</div>{% endif %}
+    {% if change.target_url %}<div class="change-target">{{ change.target_url }}</div>{% endif %}
+  </div>
+  <time class="change-time" datetime="{{ change.detected_at }}">{{ change.detected_at|display_time }}</time>
+</article>

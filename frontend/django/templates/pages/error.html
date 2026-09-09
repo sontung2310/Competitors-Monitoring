@@ -1,0 +1,7 @@
+{% extends "base.html" %}
+
+{% block title %}Request error · CompetitorScope{% endblock %}
+
+{% block content %}
+  <div class="empty-state error-state"><div class="empty-icon" aria-hidden="true">!</div><h2>Data is unavailable</h2><p>{{ page_error }}</p><a class="button button-primary" href="{% url 'dashboard' %}">Try again</a></div>
+{% endblock %}

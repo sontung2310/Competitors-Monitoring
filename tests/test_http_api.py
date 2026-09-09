@@ -68,6 +68,7 @@ class _DiscoveryService:
     def __init__(self):
         self.item = _candidate()
         self.removed = False
+        self.runs = {}
 
     def list_candidates(self, competitor_id, status="SUGGESTED"):
         if status == "ALL" or self.item["discovery_status"] == status:
@@ -91,6 +92,23 @@ class _DiscoveryService:
 
     def remove_candidate(self, candidate_id):
         self.removed = True
+
+    def discover_website(self, competitor_id, **kwargs):
+        run_id = kwargs.get("run_id")
+        if run_id:
+            self.runs[run_id] = {
+                "run_id": run_id,
+                "competitor_id": competitor_id,
+                "status": "SUCCESS",
+                "candidate_count": 1,
+            }
+        return [self.item]
+
+    def get_discovery_run(self, run_id, **kwargs):
+        run = self.runs.get(run_id)
+        if run is None:
+            raise NotFoundError("discovery run was not found")
+        return run
 
 
 class _TargetService:
@@ -273,6 +291,21 @@ class HTTPAPITests(unittest.TestCase):
         response = self.client.get("/api/changes?limit=not-an-int")
         self.assertEqual(response.status_code, 400)
         self.assertEqual(response.json["error"]["code"], "validation_error")
+
+    def test_discovery_trigger_and_run_status_route(self):
+        competitor_id = "c" * 24
+        response = self.client.post(
+            f"/api/competitors/{competitor_id}/discover?run_id=run-1"
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["competitor_id"], competitor_id)
+
+        response = self.client.get("/api/discovery-runs/run-1")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json["status"], "SUCCESS")
+
+        response = self.client.get("/api/discovery-runs/missing")
+        self.assertEqual(response.status_code, 404)
 
     def test_unexpected_service_error_is_safe_and_consistent(self):
         services = _services()

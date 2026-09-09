@@ -27,9 +27,11 @@ from .classification import (
     classify_candidates,
 )
 from .normalization import (
+    ITEM_TYPE_EXCLUSION_PATTERNS,
     canonicalize_raw_url,
     discovery_scope,
     is_html_candidate_url,
+    is_item_type_excluded,
     is_same_site,
     is_system_path,
     is_structural_path,
@@ -102,6 +104,34 @@ class TargetHistoryRepository(Protocol):
         """Return persisted history rows linked to one monitoring target."""
 
 
+class DiscoveryRunTracker(Protocol):
+    """Repository boundary for the status of an HTTP-triggered discovery run."""
+
+    def start(
+        self,
+        run_id: str,
+        *,
+        competitor_id: Any,
+        company_id: Any = None,
+    ) -> Mapping[str, Any]:
+        """Persist a RUNNING discovery record before source collection begins."""
+
+    def succeed(
+        self,
+        run_id: str,
+        *,
+        candidate_count: int,
+        summary: Mapping[str, Any] | None = None,
+    ) -> Mapping[str, Any] | None:
+        """Transition a discovery run to SUCCESS."""
+
+    def fail(self, run_id: str, error_message: str) -> Mapping[str, Any] | None:
+        """Transition a discovery run to FAILED."""
+
+    def get(self, run_id: str) -> Mapping[str, Any] | None:
+        """Read one discovery run by its public run identifier."""
+
+
 @dataclass(frozen=True)
 class _NormalizedCandidate:
     raw_url: str
@@ -152,6 +182,7 @@ class DiscoveryService:
         liveness_attempts: int = DEFAULT_LIVENESS_ATTEMPTS,
         liveness_backoff_seconds: float = DEFAULT_LIVENESS_BACKOFF_SECONDS,
         liveness_sleep: Optional[Callable[[float], None]] = None,
+        run_repository: Optional[DiscoveryRunTracker] = None,
     ) -> None:
         if (
             isinstance(liveness_attempts, bool)
@@ -185,6 +216,7 @@ class DiscoveryService:
         self.link_source = link_source or InternalLinkSource(fetcher or HttpFetcher())
         self.snapshot_repository = snapshot_repository
         self.change_repository = change_repository
+        self.run_repository = run_repository
 
     def list_candidates(
         self,
@@ -525,6 +557,88 @@ class DiscoveryService:
         *,
         user_id: Optional[str] = None,
         company_id: Any = None,
+        run_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Discover candidates and track an HTTP-triggered run when requested.
+
+        The discovery work remains synchronous inside Flask.  ``run_id`` is
+        optional so existing internal callers keep their original behavior;
+        the HTTP trigger supplies it so a client that times out can poll the
+        persisted lifecycle independently of candidate row counts.
+        """
+
+        if run_id is None or self.run_repository is None:
+            return self._discover_website_impl(
+                competitor_id,
+                user_id=user_id,
+                company_id=company_id,
+            )
+
+        if company_id is not None:
+            competitor = self.competitor_repository.get(
+                competitor_id,
+                company_id=company_id,
+            )
+        else:
+            competitor = self.competitor_repository.get(competitor_id, user_id=user_id)
+        if competitor is None:
+            raise DiscoveryNotFoundError(f"competitor {competitor_id!r} was not found")
+
+        self.run_repository.start(
+            run_id,
+            competitor_id=competitor_id,
+            company_id=company_id,
+        )
+        try:
+            persisted = self._discover_website_impl(
+                competitor_id,
+                user_id=user_id,
+                company_id=company_id,
+            )
+        except Exception as exc:
+            try:
+                self.run_repository.fail(run_id, str(exc))
+            except Exception:
+                logger.exception("could not mark discovery run failed run_id=%s", run_id)
+            raise
+
+        try:
+            self.run_repository.succeed(
+                run_id,
+                candidate_count=len(persisted),
+                summary=_discovery_summary_payload(self.last_summary),
+            )
+        except Exception as exc:
+            try:
+                self.run_repository.fail(run_id, str(exc))
+            except Exception:
+                logger.exception("could not mark discovery run failed run_id=%s", run_id)
+            raise
+        return persisted
+
+    def get_discovery_run(
+        self,
+        run_id: str,
+        *,
+        company_id: Any = None,
+    ) -> dict[str, Any]:
+        """Read one discovery lifecycle record, enforcing company scope."""
+
+        if self.run_repository is None:
+            raise DiscoveryNotFoundError(f"discovery run {run_id!r} was not found")
+        record = self.run_repository.get(run_id)
+        if record is None:
+            raise DiscoveryNotFoundError(f"discovery run {run_id!r} was not found")
+        if company_id is not None:
+            self._get_competitor(record.get("competitor_id"), company_id=company_id)
+        return dict(record)
+
+    def _discover_website_impl(
+        self,
+        competitor_id: Any,
+        *,
+        user_id: Optional[str] = None,
+        company_id: Any = None,
     ) -> list[dict[str, Any]]:
         """Discover, classify, and persist Layer 2 candidates for one competitor."""
 
@@ -560,13 +674,17 @@ class DiscoveryService:
             website_url=website_url,
         )
 
-        normalized = _apply_liveness_gate(
-            normalized,
-            self.liveness_checker,
-            attempts=self.liveness_attempts,
-            backoff_seconds=self.liveness_backoff_seconds,
-            sleep=self.liveness_sleep,
-        )
+        normalized = [
+            candidate
+            for candidate in _apply_liveness_gate(
+                normalized,
+                self.liveness_checker,
+                attempts=self.liveness_attempts,
+                backoff_seconds=self.liveness_backoff_seconds,
+                sleep=self.liveness_sleep,
+            )
+            if not is_item_type_excluded(candidate.url)
+        ]
         classification_inputs = tuple(
             CandidateForClassification(
                 raw_url=candidate.raw_url,
@@ -592,6 +710,7 @@ class DiscoveryService:
                     classification_method=classification.classification_method,
                 )
             )
+        self._reconcile_excluded_candidates(competitor_id)
         suggested_count = sum(
             classification.discovery_status == "SUGGESTED"
             for classification in classifications
@@ -645,6 +764,23 @@ class DiscoveryService:
             },
         )
         return persisted
+
+    def _reconcile_excluded_candidates(self, competitor_id: Any) -> None:
+        """Repair old discovery rows that now match an item/detail exclusion.
+
+        Discovery sources can change between runs, so an old candidate is not
+        guaranteed to be emitted again. Newly learned exclusion patterns must
+        therefore also be applied to existing, unactivated discovery rows;
+        active targets and user-created manual rows remain untouched.
+        """
+
+        self.monitoring_target_repository.discard_discovered_candidates_by_url_patterns(
+            competitor_id,
+            url_patterns=tuple(
+                pattern.pattern.removeprefix("^")
+                for pattern in ITEM_TYPE_EXCLUSION_PATTERNS
+            )
+        )
 
     def _safe_sitemap_declarations(self, website_url: str) -> Sequence[str]:
         try:
@@ -701,6 +837,29 @@ def _default_classifier() -> CandidateClassifier:
             exc,
         )
         return DeterministicStubClassifier()
+
+
+def _discovery_summary_payload(summary: DiscoverySummary | None) -> dict[str, Any] | None:
+    """Convert the in-process summary into a compact persisted API shape."""
+
+    if summary is None:
+        return None
+    return {
+        "website_url": summary.website_url,
+        "raw_count": summary.raw_count,
+        "normalized_count": summary.normalized_count,
+        "suggested_count": summary.suggested_count,
+        "discarded_count": summary.discarded_count,
+        "source_breakdown": {
+            source: {
+                "raw_count": details.raw_count,
+                "normalized_count": details.normalized_count,
+                "sampled_count": details.sampled_count,
+                "declared_sitemaps": details.declared_sitemaps,
+            }
+            for source, details in summary.source_breakdown.items()
+        },
+    }
 
 
 def _is_activated(candidate: Mapping[str, Any]) -> bool:
@@ -770,7 +929,11 @@ def _normalize_and_dedupe(
                 raw_url = _canonicalize_for_site(raw_url, canonical_site)
             if not is_html_candidate_url(raw_url):
                 continue
-            force_discarded = candidate.force_discarded or discovery_scope(raw_url) == "UNMATCHED"
+            force_discarded = (
+                candidate.force_discarded
+                or discovery_scope(raw_url) == "UNMATCHED"
+                or is_item_type_excluded(raw_url)
+            )
             if (
                 candidate.source == "LINKS"
                 and candidate.priority >= 2
