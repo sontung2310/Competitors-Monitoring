@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from backend.flask.companies.repository import CompanyRepository
 from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
+from backend.flask.discovery.repository import DiscoveryRunRepository
 from backend.flask.website_monitoring.service import FetchResult, hash_content
 from backend.flask.website_monitoring.simulated_persistence import (
     SimulationPersistenceService,
@@ -152,6 +153,28 @@ class CompanyAndScopingTests(unittest.TestCase):
         self.assertNotIn("company_id", unmapped)
         self.assertNotIn("user_id", unmapped)
         self.assertEqual(len(competitors.list_for_company(marketing_eye_id)), 1)
+
+    def test_discovery_run_repository_tracks_terminal_status(self):
+        database = _Database()
+        repository = DiscoveryRunRepository.from_database(database)
+        repository.ensure_indexes()
+
+        running = repository.start(
+            "run-1",
+            competitor_id="c" * 24,
+            company_id="a" * 24,
+        )
+        self.assertEqual(running["status"], "RUNNING")
+        self.assertEqual(repository.get("run-1")["status"], "RUNNING")
+
+        finished = repository.succeed(
+            "run-1",
+            candidate_count=0,
+            summary={"suggested_count": 0},
+        )
+        self.assertEqual(finished["status"], "SUCCESS")
+        self.assertEqual(finished["candidate_count"], 0)
+        self.assertEqual(repository.get("run-1")["summary"]["suggested_count"], 0)
 
     def test_migration_does_not_clear_explicit_company_assignments(self):
         database = _Database()

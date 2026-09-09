@@ -113,6 +113,35 @@ class _FakeTargetRepository:
         return changed
 
 
+class _FakeDiscoveryRunTracker:
+    def __init__(self):
+        self.records = {}
+
+    def start(self, run_id, *, competitor_id, company_id=None):
+        self.records[run_id] = {
+            "run_id": run_id,
+            "competitor_id": competitor_id,
+            "company_id": company_id,
+            "status": "RUNNING",
+        }
+        return self.records[run_id]
+
+    def succeed(self, run_id, *, candidate_count, summary=None):
+        self.records[run_id].update(
+            status="SUCCESS",
+            candidate_count=candidate_count,
+            summary=summary,
+        )
+        return self.records[run_id]
+
+    def fail(self, run_id, error_message):
+        self.records[run_id].update(status="FAILED", error_message=error_message)
+        return self.records[run_id]
+
+    def get(self, run_id):
+        return self.records.get(run_id)
+
+
 class _ReviewTargetRepository:
     """Repository double exposing the operations used by candidate review."""
 
@@ -826,6 +855,35 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(classifier.batches), 1)
         self.assertEqual(len(target_repository.saved), 2)
         self.assertNotIn("SEARCH", service.last_summary.source_breakdown)
+
+    def test_discovery_run_status_tracks_success_even_when_zero_candidates_persisted(self):
+        run_tracker = _FakeDiscoveryRunTracker()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            _FakeTargetRepository(),
+            fallback_classifier=_RecordingClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source(),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+            run_repository=run_tracker,
+        )
+
+        result = service.discover_website(
+            "competitor-1",
+            user_id="company-a",
+            run_id="run-zero",
+        )
+
+        self.assertEqual(result, [])
+        self.assertEqual(run_tracker.get("run-zero")["status"], "SUCCESS")
+        self.assertEqual(run_tracker.get("run-zero")["candidate_count"], 0)
 
     def test_product_detail_leaf_is_filtered_but_aggregate_listing_is_not(self):
         target_repository = _FakeTargetRepository()

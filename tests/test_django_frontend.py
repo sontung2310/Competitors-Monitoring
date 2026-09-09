@@ -58,6 +58,9 @@ class FakeAPIClient:
     def __init__(self) -> None:
         self.manual_error = False
         self.discovery_timeout = False
+        self.discovery_run = None
+        self.last_run_id = None
+        self.discovery_add_candidate = False
         self.companies = [COMPANY]
         self.competitors = [COMPETITOR]
         self.targets = [TARGET, CANDIDATE]
@@ -87,7 +90,11 @@ class FakeAPIClient:
 
     def list_candidates(self, competitor_id, company_id, *, status="ALL"):
         assert status == "ALL"
-        return [CANDIDATE]
+        return [
+            candidate
+            for candidate in self.targets
+            if candidate.get("discovery_status") in {"SUGGESTED", "DISCARDED"}
+        ]
 
     def list_targets(self, company_id, competitor_id):
         assert company_id == COMPANY["id"]
@@ -107,15 +114,32 @@ class FakeAPIClient:
             )
         return TARGET
 
-    def discover(self, competitor_id, company_id):
+    def discover(self, competitor_id, company_id, *, run_id=None):
         assert competitor_id == COMPETITOR["id"]
         assert company_id == COMPANY["id"]
+        self.last_run_id = run_id
+        self.discovery_run = {
+            "run_id": run_id,
+            "competitor_id": competitor_id,
+            "company_id": company_id,
+            "status": "RUNNING" if self.discovery_timeout else "SUCCESS",
+            "candidate_count": 0 if self.discovery_timeout else 1,
+            "error_message": None,
+        }
         if self.discovery_timeout:
             raise APIClientError(
                 "the monitoring API could not be reached: timed out",
                 code="backend_timeout",
             )
+        if self.discovery_add_candidate:
+            new_candidate = {**CANDIDATE, "id": "candidate-about", "url": "https://www.lyfemarketing.com/about"}
+            self.targets.append(new_candidate)
         return {"candidates": [CANDIDATE], "summary": None}
+
+    def get_discovery_run(self, run_id, company_id):
+        assert run_id == self.last_run_id
+        assert company_id == COMPANY["id"]
+        return self.discovery_run
 
 
 class DjangoFrontendViewTests(SimpleTestCase):
@@ -178,4 +202,39 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, "This can take a few minutes for larger sites.", status_code=202)
         self.assertContains(response, "data-auto-refresh", status_code=202)
         self.assertContains(response, "discovery_pending=1", status_code=202)
+        self.assertContains(response, "discovery_run_id=", status_code=202)
         self.assertNotContains(response, "the monitoring API could not be reached: timed out", status_code=202)
+
+    def test_discovery_poll_resolves_zero_new_candidates_from_success_status(self):
+        self.client_data.discovery_timeout = True
+        pending = self.client.post(
+            "/competitors/competitor-lyfe/discover/",
+            {"company_id": COMPANY["id"]},
+        )
+        self.assertEqual(pending.status_code, 202)
+        poll_url = views._detail_url(
+            COMPETITOR["id"],
+            COMPANY["id"],
+            discovery_pending=True,
+            discovery_run_id=self.client_data.last_run_id,
+        )
+
+        self.client_data.discovery_run["status"] = "SUCCESS"
+        self.client_data.discovery_run["candidate_count"] = 0
+        resolved = self.client.get(poll_url)
+
+        self.assertEqual(resolved.status_code, 200)
+        self.assertContains(resolved, "Discovery finished")
+        self.assertNotContains(resolved, "Discovery is still working")
+        self.assertContains(resolved, "candidate-pricing")
+
+    def test_discovery_success_path_still_renders_new_candidate_results(self):
+        self.client_data.discovery_add_candidate = True
+        response = self.client.post(
+            "/competitors/competitor-lyfe/discover/",
+            {"company_id": COMPANY["id"]},
+        )
+
+        self.assertEqual(response.status_code, 200)
+        self.assertContains(response, "Discovery complete")
+        self.assertContains(response, "https://www.lyfemarketing.com/about")

@@ -94,6 +94,10 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 - [x] Persistence-enabled simulation wrapper that preserves the original
   zero-write simulation helpers and excludes `is_simulated=true` snapshots from
   genuine monitor comparisons.
+- [x] Discovery item-type exclusion follow-up: individual
+  `/product/<slug>/<sku>` leaves are excluded without affecting aggregate
+  product-listing targets; JD Sports bug-artifact cleanup was scoped to the
+  exact discarded rows.
 
 **v1 PoC complete at this point** — website-only monitoring, working end-to-end.
 
@@ -102,6 +106,9 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 - [x] Django frontend with a single Flask API client, company-scoped dashboard,
   discovery review, live simulation result, and changes feed screens; validated
   with real API data, loading/error states, and browser screenshots.
+- [x] Timeout-safe discovery polling uses a persisted `RUNNING` → `SUCCESS` /
+  `FAILED` lifecycle rather than inferring completion from candidate-row count;
+  the JD Sports discovery timing limitation is documented in `PoC_story.md`.
 
 ---
 

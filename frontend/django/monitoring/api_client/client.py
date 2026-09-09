@@ -105,8 +105,24 @@ class APIClient:
     def delete_candidate(self, candidate_id: str, company_id: str) -> None:
         self._request("DELETE", f"candidates/{candidate_id}", params={"company_id": company_id})
 
-    def discover(self, competitor_id: str, company_id: str) -> dict[str, Any]:
-        return self._request("POST", f"competitors/{competitor_id}/discover", params={"company_id": company_id})
+    def discover(
+        self,
+        competitor_id: str,
+        company_id: str,
+        *,
+        run_id: str | None = None,
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {"company_id": company_id}
+        if run_id:
+            params["run_id"] = run_id
+        return self._request("POST", f"competitors/{competitor_id}/discover", params=params)
+
+    def get_discovery_run(self, run_id: str, company_id: str) -> dict[str, Any]:
+        return self._request(
+            "GET",
+            f"discovery-runs/{run_id}",
+            params={"company_id": company_id},
+        )
 
     def list_targets(self, company_id: str, competitor_id: str) -> list[dict[str, Any]]:
         return self._request(

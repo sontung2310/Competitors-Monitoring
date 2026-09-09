@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any, Iterable, Mapping
 from urllib.parse import urlencode
+from uuid import uuid4
 
 from django.conf import settings
 from django.http import HttpRequest, HttpResponse
@@ -96,11 +97,14 @@ def run_discovery(request: HttpRequest, competitor_id: str) -> HttpResponse:
     if request.method != "POST":
         return redirect(_detail_url(competitor_id, request.GET.get("company_id")))
     client = get_api_client()
-    before_count = 0
+    run_id = uuid4().hex
     try:
         companies, selected_company = _load_company_context(request, client)
-        before_count = len(client.list_candidates(competitor_id, selected_company["id"], status="ALL"))
-        discovery_result = client.discover(competitor_id, selected_company["id"])
+        discovery_result = client.discover(
+            competitor_id,
+            selected_company["id"],
+            run_id=run_id,
+        )
         context = _detail_context(
             request,
             client,
@@ -121,7 +125,7 @@ def run_discovery(request: HttpRequest, competitor_id: str) -> HttpResponse:
                 competitor_id,
                 company_id,
                 discovery_pending=True,
-                discovery_before_count=before_count,
+                discovery_run_id=run_id,
             )
             return _detail_error_response(
                 request,
@@ -409,8 +413,36 @@ def _detail_context(
         # responsive while retaining the API-backed total in the tab count.
         candidates = candidates[:50]
     pending_requested = request.GET.get("discovery_pending") == "1"
-    before_count = _as_int(request.GET.get("discovery_before_count"))
-    discovery_complete = pending_requested and before_count is not None and len(review_candidates) > before_count
+    discovery_run_id = request.GET.get("discovery_run_id")
+    discovery_run: dict[str, Any] | None = None
+    discovery_status: str | None = None
+    discovery_pending = False
+    discovery_complete = False
+    discovery_error: str | None = None
+    if pending_requested and discovery_run_id:
+        try:
+            discovery_run = client.get_discovery_run(
+                discovery_run_id,
+                selected_company["id"],
+            )
+            discovery_status = str(discovery_run.get("status", "")).upper()
+        except APIClientError as exc:
+            if exc.status_code == 404:
+                # The trigger may have timed out immediately after the Flask
+                # request began. Keep polling until its RUNNING record becomes
+                # visible rather than guessing from candidate rows.
+                discovery_status = "RUNNING"
+            else:
+                discovery_error = str(exc)
+        if discovery_status == "RUNNING":
+            discovery_pending = True
+        elif discovery_status == "SUCCESS":
+            discovery_complete = True
+        elif discovery_status == "FAILED":
+            discovery_error = (
+                discovery_run.get("error_message")
+                or "Discovery failed without an error message."
+            )
     company_changes = client.list_changes(
         selected_company["id"],
         competitor_id=competitor_id,
@@ -432,14 +464,16 @@ def _detail_context(
             "rows": candidates,
             "total_rows": total_rows,
             "candidate_total": len(review_candidates),
-            "discovery_pending": pending_requested and not discovery_complete,
+            "discovery_pending": discovery_pending,
             "discovery_complete": discovery_complete,
             "discovery_poll_url": _detail_url(
                 competitor_id,
                 selected_company["id"],
                 discovery_pending=True,
-                discovery_before_count=before_count,
-            ) if pending_requested and before_count is not None and not discovery_complete else None,
+                discovery_run_id=discovery_run_id,
+            ) if discovery_pending and discovery_run_id else None,
+            "discovery_run": discovery_run,
+            "discovery_status": discovery_status,
             "status": status,
             "suggested_count": sum(candidate.get("discovery_status") == "SUGGESTED" for candidate in review_candidates),
             "active_count": sum(
@@ -453,6 +487,7 @@ def _detail_context(
             "manual_error": None,
             "competitor_form_name": competitor["name"],
             "competitor_form_website": competitor["website_url"],
+            "page_error": discovery_error,
         }
     )
     return context
@@ -533,7 +568,7 @@ def _detail_url(
     *,
     status: str | None = None,
     discovery_pending: bool = False,
-    discovery_before_count: int | None = None,
+    discovery_run_id: str | None = None,
 ) -> str:
     url = reverse("competitor_detail", args=[competitor_id])
     params = {"company_id": company_id}
@@ -541,17 +576,10 @@ def _detail_url(
         params["status"] = status
     if discovery_pending:
         params["discovery_pending"] = "1"
-    if discovery_before_count is not None:
-        params["discovery_before_count"] = discovery_before_count
+    if discovery_run_id is not None:
+        params["discovery_run_id"] = discovery_run_id
     params = {key: value for key, value in params.items() if value is not None}
     return f"{url}?{urlencode(params)}" if params else url
-
-
-def _as_int(value: str | None) -> int | None:
-    try:
-        return int(value) if value is not None else None
-    except (TypeError, ValueError):
-        return None
 
 
 def _error_page(request: HttpRequest, message: str, *, status_code: int) -> HttpResponse:

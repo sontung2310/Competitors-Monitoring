@@ -88,6 +88,18 @@ If all six steps work through the UI alone, the PoC demo is considered successfu
 - Brown Bag Marketing / Elevation Marketing cleanup — they remain as unassigned backend test data,
   untouched by this work.
 
+## Known limitations
+
+### JD Sports discovery duration
+
+A full JD Sports AU discovery run can take up to approximately 12 minutes. The
+root cause was not fully characterized as of this note, even after the
+product-detail exclusion and legacy-row cleanup work.
+
+For a live demo, run JD Sports discovery once beforehand and start the session
+from the already-curated three-candidate state. Marketing Eye/Lyfe discovery
+completes in seconds and is suitable for triggering live.
+
 ---
 
 ## Deliverable
