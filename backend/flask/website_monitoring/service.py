@@ -490,6 +490,7 @@ class ChangeCreator(Protocol):
         detected_at: datetime,
         change_type: str | None = None,
         summary: str | None = None,
+        detected_url: str | None = None,
     ) -> dict[str, Any]:
         """Persist one change, using a processor-owned event when supplied."""
 
@@ -510,6 +511,7 @@ class MonitoringRunService:
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
         snapshot_content_loader: SnapshotContentLoader | None = None,
         content_processors: Mapping[str, ContentProcessor] | None = None,
+        detected_url_liveness_checker: Callable[[str], Any] | None = None,
     ) -> None:
         self.target_repository = target_repository
         self.run_repository = run_repository
@@ -521,6 +523,7 @@ class MonitoringRunService:
         self.stale_after = stale_after
         self.snapshot_content_loader = snapshot_content_loader
         self.content_processors = dict(content_processors or {})
+        self.detected_url_liveness_checker = detected_url_liveness_checker
         if isinstance(run_repository, MonitoringRunRepository):
             # The partial unique index is part of the runtime safety contract,
             # so repository-backed construction makes sure it exists before
@@ -538,6 +541,7 @@ class MonitoringRunService:
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
         content_processors: Mapping[str, ContentProcessor] | None = None,
         narrative_provider_factory: Callable[[], Any] | None = None,
+        detected_url_liveness_checker: Callable[[str], Any] | None = None,
     ) -> "MonitoringRunService":
         """Build the complete repository-backed monitoring service."""
 
@@ -566,6 +570,7 @@ class MonitoringRunService:
                 if narrative_provider_factory is not None
                 else OpenAIProvider.from_env
             ),
+            detected_url_liveness_checker=detected_url_liveness_checker,
         )
         return cls(
             target_repository,
@@ -578,6 +583,7 @@ class MonitoringRunService:
             stale_after=stale_after,
             snapshot_content_loader=snapshot_content_loader,
             content_processors=content_processors,
+            detected_url_liveness_checker=detected_url_liveness_checker,
         )
 
     def monitor_target(self, target_id: Any) -> dict[str, Any]:
@@ -671,14 +677,19 @@ class MonitoringRunService:
                         raise MonitoringRunError(
                             "content processor returned an event without summary"
                         )
+                    change_kwargs: dict[str, Any] = {
+                        "detected_at": detected_at,
+                        "change_type": event_change_type,
+                        "summary": event_summary,
+                    }
+                    if isinstance(event.get("detected_url"), str):
+                        change_kwargs["detected_url"] = event["detected_url"]
                     changes.append(
                         self.change_service.create_change(
                             target_id,
                             previous_snapshot,
                             current_snapshot,
-                            detected_at=detected_at,
-                            change_type=event_change_type,
-                            summary=event_summary,
+                            **change_kwargs,
                         )
                     )
                 if changes:
@@ -756,6 +767,7 @@ def monitor_target(
     stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
     snapshot_content_loader: SnapshotContentLoader | None = None,
     content_processors: Mapping[str, ContentProcessor] | None = None,
+    detected_url_liveness_checker: Callable[[str], Any] | None = None,
 ) -> dict[str, Any]:
     """Functional entry point for one repository-backed monitoring attempt."""
 
@@ -770,6 +782,7 @@ def monitor_target(
         stale_after=stale_after,
         snapshot_content_loader=snapshot_content_loader,
         content_processors=content_processors,
+        detected_url_liveness_checker=detected_url_liveness_checker,
     ).monitor_target(target_id)
 
 

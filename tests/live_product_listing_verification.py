@@ -22,6 +22,7 @@ import re
 import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urljoin, urlsplit
 
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
@@ -154,6 +155,14 @@ def run_live_verification() -> dict[str, Any]:
         if len(changes_after_negative) != len(changes_before_negative):
             raise AssertionError("unchanged JD content created a change record")
 
+        liveness_attempts: list[str] = []
+
+        def unexpected_product_liveness_check(url: str) -> bool:
+            liveness_attempts.append(url)
+            raise AssertionError(
+                f"product change unexpectedly performed a detected-URL liveness check: {url}"
+            )
+
         monitoring_mutation = MonitoringRunService.from_database(
             database,
             fetcher=lambda _url: FetchResult(
@@ -161,6 +170,7 @@ def run_live_verification() -> dict[str, Any]:
                 first_fetch.fetch_method,
                 first_fetch.http_status,
             ),
+            detected_url_liveness_checker=unexpected_product_liveness_check,
         )
         changes_before_mutation = changes.list_for_target(target["id"])
         mutation_run = monitoring_mutation.monitor_target(target["id"])
@@ -178,6 +188,20 @@ def run_live_verification() -> dict[str, Any]:
             )
         if mutation_run["run"]["status"] != "SUCCESS":
             raise AssertionError("JD mutation monitoring run did not succeed")
+        by_type = {record["change_type"]: record for record in new_change_records}
+        expected_by_type = {event["change_type"]: event for event in expected_events}
+        for change_type, record in by_type.items():
+            expected_event = expected_by_type[change_type]
+            expected_url = urljoin(target["url"], expected_event["detected_url"])
+            if record.get("detected_url") != expected_url:
+                raise AssertionError(
+                    f"{change_type} detected_url mismatch: "
+                    f"{record.get('detected_url')} != {expected_url}"
+                )
+        if liveness_attempts:
+            raise AssertionError(
+                f"product events performed unexpected URL checks: {liveness_attempts}"
+            )
 
         report = {
             "database": database.name,
@@ -209,12 +233,17 @@ def run_live_verification() -> dict[str, Any]:
                     "id": record["id"],
                     "change_type": record["change_type"],
                     "summary": record["summary"],
+                    "detected_url": record["detected_url"],
                 }
                 for record in sorted(
                     new_change_records,
                     key=lambda record: record["change_type"],
                 )
             ],
+            "product_liveness_attempts": liveness_attempts,
+            "removed_url_is_last_known": bool(
+                by_type["PRODUCT_REMOVED"].get("detected_url")
+            ),
         }
         _print_report(report)
         return report
@@ -345,8 +374,10 @@ def _print_report(report: dict[str, Any]) -> None:
     for record in report["change_records"]:
         print(
             f"change_id={record['id']} type={record['change_type']} "
-            f"summary={record['summary']}"
+            f"summary={record['summary']} detected_url={record['detected_url']}"
         )
+    print(f"product_liveness_attempts={report['product_liveness_attempts']}")
+    print(f"removed_url_is_last_known={report['removed_url_is_last_known']}")
 
 
 if __name__ == "__main__":

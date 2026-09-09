@@ -53,6 +53,7 @@ class SimulationPersistenceService:
         fetcher: Callable[[str], FetchResult] = fetch_page,
         snapshot_content_loader: Callable[[Mapping[str, Any]], str] | None = None,
         clock: Callable[[], datetime] = utc_now,
+        detected_url_liveness_checker: Callable[[str], Any] | None = None,
     ) -> None:
         self.target_repository = target_repository
         self.snapshot_repository = snapshot_repository
@@ -63,6 +64,7 @@ class SimulationPersistenceService:
         self.fetcher = fetcher
         self.snapshot_content_loader = snapshot_content_loader
         self.clock = clock
+        self.detected_url_liveness_checker = detected_url_liveness_checker
 
     @classmethod
     def from_database(
@@ -73,6 +75,7 @@ class SimulationPersistenceService:
         fetcher: Callable[[str], FetchResult] = fetch_page,
         provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
         narrative_provider_factory: Callable[[], Any] | None = None,
+        detected_url_liveness_checker: Callable[[str], Any] | None = None,
     ) -> "SimulationPersistenceService":
         """Build a repository-backed simulator using the normal storage path."""
 
@@ -98,6 +101,7 @@ class SimulationPersistenceService:
                 if narrative_provider_factory is not None
                 else provider_factory
             ),
+            detected_url_liveness_checker=detected_url_liveness_checker,
         )
         return cls(
             target_repository,
@@ -108,6 +112,7 @@ class SimulationPersistenceService:
             provider_factory=provider_factory,
             fetcher=fetcher,
             snapshot_content_loader=loader,
+            detected_url_liveness_checker=detected_url_liveness_checker,
         )
 
     def simulate_and_persist_change(
@@ -174,16 +179,21 @@ class SimulationPersistenceService:
                 raise SimulationPersistenceError("simulated event has no change_type")
             if not isinstance(summary, str) or not summary.strip():
                 raise SimulationPersistenceError("simulated event has no summary")
+            change_kwargs: dict[str, Any] = {
+                "detected_at": detected_at,
+                "change_type": change_type,
+                "summary": summary,
+                "is_simulated": True,
+                "narrative_provider": provider,
+            }
+            if isinstance(event.get("detected_url"), str):
+                change_kwargs["detected_url"] = event["detected_url"]
             persisted_changes.append(
                 self.change_service.create_change(
                     target_id,
                     baseline,
                     simulated_snapshot,
-                    detected_at=detected_at,
-                    change_type=change_type,
-                    summary=summary,
-                    is_simulated=True,
-                    narrative_provider=provider,
+                    **change_kwargs,
                 )
             )
         if not persisted_changes:

@@ -39,6 +39,7 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
   - [x] local file storage under storage/snapshots/<target_id>/
 - [x] 1.6 Change/event creation from diff (change_type derivation)
 - [x] 1.6b LLM narrative summaries for NEW_BLOG/PAGE_UPDATE changes (TON-30; summarization half only — mechanical summaries remain unchanged)
+- [x] 1.6b detected URLs for changes (TON-31; deterministic product URLs, validated LLM-extracted blog URLs, clickable frontend rendering, and enrichment backfill)
 - [ ] 1.6b Relevance filtering (separately deferred; not included in TON-30)
 - [x] 1.7 Monitoring run tracking (RUNNING / SUCCESS / FAILED), failed run must not overwrite last valid snapshot
 - [x] 1.8 Concurrency guard: prevent duplicate concurrent runs on the same target
