@@ -198,7 +198,9 @@ def _latest_snapshot(
     storage: SnapshotStorage,
     target_id: Any,
 ) -> dict[str, Any] | None:
-    rows = repository.list_for_target(target_id)
+    # Simulations must always build on the latest real baseline.  A tagged
+    # simulated snapshot is evidence for a demo, not a monitoring baseline.
+    rows = repository.list_for_target(target_id, include_simulated=False)
     if not rows:
         return None
     latest = dict(rows[0])

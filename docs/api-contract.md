@@ -227,7 +227,7 @@ Read the newest change feed. It never creates or mutates records.
   [{
     "id", "monitoring_target_id", "previous_snapshot_id",
     "current_snapshot_id", "change_type", "summary", "narrative_summary",
-    "detected_at", "status", "is_simulated", "created_at", "updated_at"
+    "detected_url", "detected_at", "status", "is_simulated", "created_at", "updated_at"
   }]
   ```
 
@@ -239,14 +239,21 @@ Read the newest change feed. It never creates or mutates records.
 
 - Optional query: `company_id=` for scoped access.
 - Response `200`: full change record, including
-  `previous_snapshot_id`, `current_snapshot_id`, `narrative_summary`, and
-  `is_simulated`.
+  `previous_snapshot_id`, `current_snapshot_id`, `narrative_summary`,
+  `detected_url`, and `is_simulated`.
 
 `narrative_summary` is nullable and is generated synchronously only for
 `NEW_BLOG` and `PAGE_UPDATE` changes. It is `null` (or omitted on older
 records) when the optional LLM call is unavailable. The mechanical `summary`
-is always retained and remains the fallback display text. Product change types
-do not request this narrative.
+is always retained and remains the fallback display text. `detected_url` is
+nullable for change types without a link. `NEW_PRODUCT`, `PRICE_CHANGE`, and
+`PRODUCT_REMOVED` use the structured product URL; the removed-product URL is
+the last-known URL and is not liveness-checked. `NEW_BLOG` and `PAGE_UPDATE`
+use a same-domain, usable-response-validated URL extracted by the same LLM
+call as the narrative, falling back to the monitoring target URL when no
+specific post URL is confidently available. Product change types do not
+request a narrative.
+Older records may omit `detected_url` until the enrichment backfill is run.
 - Response `404`: standard error envelope
 
 ## Deferred API areas

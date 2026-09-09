@@ -6,10 +6,14 @@ from .service import (
     DEFAULT_CHANGE_STATUS,
     DEFAULT_CHANGE_TYPE,
     PROCESSOR_CHANGE_TYPES,
+    NarrativeSummaryResult,
     ChangeError,
     ChangeService,
     create_change,
     derive_change_type,
+    generate_narrative_summary_with_url,
+    resolve_blog_detected_url,
+    resolve_product_detected_url,
 )
 
 __all__ = [
@@ -20,6 +24,10 @@ __all__ = [
     "DEFAULT_CHANGE_STATUS",
     "DEFAULT_CHANGE_TYPE",
     "PROCESSOR_CHANGE_TYPES",
+    "NarrativeSummaryResult",
     "create_change",
     "derive_change_type",
+    "generate_narrative_summary_with_url",
+    "resolve_blog_detected_url",
+    "resolve_product_detected_url",
 ]

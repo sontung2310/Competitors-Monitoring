@@ -102,8 +102,11 @@ class TextBlobProcessorTests(unittest.TestCase):
             ["NEW_PRODUCT", "PRODUCT_REMOVED", "PRICE_CHANGE"],
         )
         self.assertIn("/product/new", events[0]["summary"])
+        self.assertEqual(events[0]["detected_url"], "/product/new")
         self.assertIn("20.00", events[1]["summary"])
+        self.assertEqual(events[1]["detected_url"], "/product/remove")
         self.assertIn("10.00 -> 12.00", events[2]["summary"])
+        self.assertEqual(events[2]["detected_url"], "/product/keep")
 
     def test_product_listing_processor_serializes_canonical_list_and_owns_event_types(self):
         previous_content = '[{"key":"/product/old","name":"Old","price":"10.00"}]'

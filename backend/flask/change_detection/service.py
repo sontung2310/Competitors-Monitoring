@@ -20,9 +20,13 @@ detection with user acknowledgement.
 
 from __future__ import annotations
 
+import json
 import logging
+import re
+from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Callable, Mapping, Optional, Protocol
+from urllib.parse import urljoin, urlsplit
 
 from backend.flask.database.base_repository import utc_now
 from backend.flask.llm_provider import OpenAIProvider
@@ -70,11 +74,41 @@ PROCESSOR_CHANGE_TYPES = frozenset(
 )
 DEFAULT_CHANGE_TYPE = "PAGE_UPDATE"
 DEFAULT_CHANGE_STATUS = "NEW"
+NARRATIVE_RESPONSE_FORMAT = {
+    "type": "json_schema",
+    "name": "change_narrative_and_detected_url",
+    "strict": True,
+    "schema": {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "narrative_summary": {"type": "string"},
+            "detected_url": {"type": ["string", "null"]},
+        },
+        "required": ["narrative_summary", "detected_url"],
+    },
+}
 NARRATIVE_SUMMARY_INSTRUCTIONS = """You write concise plain-language summaries for a competitor monitoring feed.
 Describe only observable changes in the supplied page diff. Do not speculate about
 reasons, intent, or business impact. Do not mention line counts, the diff, or these
-instructions. Return only one or two sentences of narrative text, with no markdown
-heading or preamble."""
+instructions. Return a JSON object with exactly these fields:
+- narrative_summary: one or two sentences of narrative text, with no markdown heading or preamble.
+- detected_url: the specific new post URL only when the supplied diff contains enough
+  evidence to identify one; otherwise null. Copy the URL exactly from the diff and
+  never invent or guess one. For PAGE_UPDATE, return null when the change is a
+  wording or layout edit without a specific new post.
+"""
+
+
+@dataclass(frozen=True)
+class NarrativeSummaryResult:
+    """Structured output from the single narrative-and-URL LLM call."""
+
+    narrative_summary: str
+    detected_url: str | None
+
+
+DetectedURLLivenessChecker = Callable[[str], Any]
 
 
 class ChangeService:
@@ -88,12 +122,14 @@ class ChangeService:
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
         competitor_repository: Any | None = None,
         narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
+        detected_url_liveness_checker: DetectedURLLivenessChecker | None = None,
     ) -> None:
         self.change_repository = change_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.snapshot_content_loader = snapshot_content_loader
         self.competitor_repository = competitor_repository
         self.narrative_provider_factory = narrative_provider_factory
+        self.detected_url_liveness_checker = detected_url_liveness_checker
 
     @classmethod
     def from_database(
@@ -104,6 +140,7 @@ class ChangeService:
         snapshot_content_loader: Optional[SnapshotContentLoader] = None,
         competitor_repository: Any | None = None,
         narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
+        detected_url_liveness_checker: DetectedURLLivenessChecker | None = None,
     ) -> "ChangeService":
         """Build a service with a repository backed by a database handle."""
 
@@ -113,6 +150,7 @@ class ChangeService:
             snapshot_content_loader=snapshot_content_loader,
             competitor_repository=competitor_repository,
             narrative_provider_factory=narrative_provider_factory,
+            detected_url_liveness_checker=detected_url_liveness_checker,
         )
 
     def create_change(
@@ -126,6 +164,7 @@ class ChangeService:
         summary: Optional[str] = None,
         is_simulated: bool = False,
         narrative_provider: Any | None = None,
+        detected_url: str | None = None,
     ) -> dict[str, Any]:
         """Persist a change from two snapshots whose hashes differ.
 
@@ -176,20 +215,31 @@ class ChangeService:
             resolved_summary = summary.strip()
         if not isinstance(is_simulated, bool):
             raise ChangeError("is_simulated must be a boolean")
+        target_url = _target_url(target)
         narrative_summary = None
+        resolved_detected_url = None
         if resolved_change_type in NARRATIVE_CHANGE_TYPES:
+            # The target URL is the safe, deterministic fallback. A specific URL
+            # is accepted only after same-domain and liveness validation.
+            resolved_detected_url = target_url
             try:
                 provider = (
                     narrative_provider
                     if narrative_provider is not None
                     else self.narrative_provider_factory()
                 )
-                narrative_summary = generate_narrative_summary(
+                narrative_result = generate_narrative_summary_with_url(
                     change_type=resolved_change_type,
                     diff=diff,
-                    target_url=_target_url(target),
+                    target_url=target_url,
                     page_type=page_type,
                     provider=provider,
+                )
+                narrative_summary = narrative_result.narrative_summary
+                resolved_detected_url = resolve_blog_detected_url(
+                    narrative_result.detected_url,
+                    target_url,
+                    liveness_checker=self.detected_url_liveness_checker,
                 )
             except Exception as exc:
                 # Narrative text enriches a change but must never make change
@@ -202,6 +252,16 @@ class ChangeService:
                     target_id,
                     exc,
                 )
+        elif resolved_change_type in PROCESSOR_CHANGE_TYPES:
+            # ProductListingProcessor already extracted this URL. It is not an
+            # LLM-derived value and PRODUCT_REMOVED deliberately skips every
+            # liveness check so its last-known 404 remains informative.
+            resolved_detected_url = resolve_product_detected_url(
+                change_type=resolved_change_type,
+                detected_url=detected_url,
+                summary=resolved_summary,
+                target_url=target_url,
+            )
         return self.change_repository.create(
             monitoring_target_id=target_id,
             previous_snapshot_id=_snapshot_id(previous_snapshot, "previous_snapshot"),
@@ -210,6 +270,7 @@ class ChangeService:
             change_type=resolved_change_type,
             summary=resolved_summary,
             narrative_summary=narrative_summary,
+            detected_url=resolved_detected_url,
             status=DEFAULT_CHANGE_STATUS,
             is_simulated=is_simulated,
         )
@@ -333,7 +394,9 @@ def create_change(
     summary: Optional[str] = None,
     is_simulated: bool = False,
     narrative_provider: Any | None = None,
+    detected_url: str | None = None,
     narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
+    detected_url_liveness_checker: DetectedURLLivenessChecker | None = None,
 ) -> dict[str, Any]:
     """Functional entry point for repository-backed change creation."""
 
@@ -342,6 +405,7 @@ def create_change(
         monitoring_target_repository,
         snapshot_content_loader=snapshot_content_loader,
         narrative_provider_factory=narrative_provider_factory,
+        detected_url_liveness_checker=detected_url_liveness_checker,
     ).create_change(
         target_id,
         previous_snapshot,
@@ -351,6 +415,7 @@ def create_change(
         summary=summary,
         is_simulated=is_simulated,
         narrative_provider=narrative_provider,
+        detected_url=detected_url,
     )
 
 
@@ -394,10 +459,33 @@ def generate_narrative_summary(
 ) -> str:
     """Ask the shared LLM provider to describe one eligible page change.
 
-    This helper deliberately has no fallback of its own. Callers that sit on
-    the real change-creation path must decide whether provider failure is
-    recoverable; ChangeService catches it and persists None. Backfill uses the
-    same helper so both paths have identical prompting and output validation.
+    This compatibility wrapper preserves the original text-only helper API;
+    the underlying call also returns the optional detected URL.
+    """
+
+    return generate_narrative_summary_with_url(
+        change_type=change_type,
+        diff=diff,
+        target_url=target_url,
+        page_type=page_type,
+        provider=provider,
+    ).narrative_summary
+
+
+def generate_narrative_summary_with_url(
+    *,
+    change_type: str,
+    diff: str,
+    target_url: str,
+    page_type: str,
+    provider: Any,
+) -> NarrativeSummaryResult:
+    """Make one structured narrative call and return its optional URL.
+
+    Real providers implement ``generate_json`` and therefore receive strict
+    JSON-schema output. A small text-only compatibility path remains for older
+    injected test doubles; it treats their plain string as the narrative and
+    safely supplies no candidate URL.
     """
 
     if change_type not in NARRATIVE_CHANGE_TYPES:
@@ -408,8 +496,13 @@ def generate_narrative_summary(
         raise ValueError("narrative summary target_url must be non-empty")
     if not isinstance(page_type, str) or not page_type.strip():
         raise ValueError("narrative summary page_type must be non-empty")
-    if provider is None or not callable(getattr(provider, "generate", None)):
-        raise ValueError("narrative summary provider must implement generate")
+    if provider is None or not any(
+        callable(getattr(provider, method, None))
+        for method in ("generate", "generate_json")
+    ):
+        raise ValueError(
+            "narrative summary provider must implement generate or generate_json"
+        )
 
     prompt = (
         "Target URL: "
@@ -420,13 +513,168 @@ def generate_narrative_summary(
         f"{diff}\n"
         "</page-diff>"
     )
+    generate_json = getattr(provider, "generate_json", None)
+    if callable(generate_json):
+        payload = generate_json(
+            prompt,
+            instructions=NARRATIVE_SUMMARY_INSTRUCTIONS,
+            response_format=NARRATIVE_RESPONSE_FORMAT,
+        )
+        return _parse_narrative_result(payload)
+
+    # Compatibility for the pre-structured provider doubles used by older
+    # callers. This is still one provider call and cannot produce a URL unless
+    # a future double implements the structured method above.
     output = provider.generate(
         prompt,
         instructions=NARRATIVE_SUMMARY_INSTRUCTIONS,
+        response_format=NARRATIVE_RESPONSE_FORMAT,
     )
     if not isinstance(output, str) or not output.strip():
         raise ValueError("narrative summary provider returned empty output")
-    return output.strip()
+    try:
+        payload = json.loads(output)
+    except (TypeError, json.JSONDecodeError):
+        return NarrativeSummaryResult(output.strip(), None)
+    return _parse_narrative_result(payload)
+
+
+def resolve_blog_detected_url(
+    candidate: Any,
+    target_url: str,
+    *,
+    liveness_checker: DetectedURLLivenessChecker | None = None,
+) -> str:
+    """Return a validated blog URL, or the monitored target URL as fallback."""
+
+    fallback = _require_http_url(target_url, "target_url")
+    if not isinstance(candidate, str) or not candidate.strip():
+        return fallback
+    try:
+        resolved = _require_http_url(
+            urljoin(fallback, candidate.strip()),
+            "detected_url",
+        )
+    except ValueError:
+        return fallback
+    if not _same_domain(resolved, fallback):
+        logger.warning(
+            "rejecting detected URL from a different domain: %s (target %s)",
+            resolved,
+            fallback,
+        )
+        return fallback
+
+    checker = liveness_checker or _default_detected_url_liveness_checker
+    try:
+        result = checker(resolved)
+    except Exception as exc:
+        logger.warning("detected URL liveness check failed for %s: %s", resolved, exc)
+        return fallback
+    if not _is_usable_liveness_result(result):
+        logger.warning("detected URL failed liveness validation: %s", resolved)
+        return fallback
+    return resolved
+
+
+def resolve_product_detected_url(
+    *,
+    change_type: str,
+    detected_url: Any,
+    summary: str,
+    target_url: str,
+) -> str:
+    """Resolve a structured product path into the absolute last-known URL.
+
+    No network request is made here. In particular, a removed product's 404 is
+    the expected evidence and must not cause this URL to be replaced.
+    """
+
+    fallback_candidate = _product_url_from_summary(summary)
+    candidate = (
+        detected_url
+        if isinstance(detected_url, str) and detected_url.strip()
+        else fallback_candidate
+    )
+    if not isinstance(candidate, str) or not candidate.strip():
+        if change_type == "PRODUCT_REMOVED":
+            raise ChangeError("product removal has no last-known product URL")
+        # Legacy PRICING targets can derive PRICE_CHANGE without structured
+        # product-card data. Keep those links useful while structured product
+        # events always provide their exact extracted path above.
+        candidate = _require_http_url(target_url, "target_url")
+    return _require_http_url(
+        urljoin(_require_http_url(target_url, "target_url"), candidate.strip()),
+        "detected_url",
+    )
+
+
+def _parse_narrative_result(payload: Any) -> NarrativeSummaryResult:
+    if not isinstance(payload, Mapping):
+        raise ValueError("narrative summary provider returned a non-object")
+    narrative = payload.get("narrative_summary")
+    if not isinstance(narrative, str) or not narrative.strip():
+        raise ValueError("narrative summary provider returned empty narrative_summary")
+    detected_url = payload.get("detected_url")
+    if detected_url is not None and not isinstance(detected_url, str):
+        # Treat malformed optional output as an extraction failure while still
+        # preserving the useful narrative text.
+        detected_url = None
+    return NarrativeSummaryResult(
+        narrative.strip(), detected_url.strip() if detected_url else None
+    )
+
+
+def _default_detected_url_liveness_checker(url: str) -> Any:
+    # Keep this import local to avoid coupling module initialization to the
+    # content-processor import cycle.
+    from backend.flask.website_monitoring.service import fetch_page
+
+    return fetch_page(url)
+
+
+def _is_usable_liveness_result(result: Any) -> bool:
+    if isinstance(result, bool):
+        return result
+    if result is None:
+        return False
+    # fetch_page returns only after the existing status/content-type/visible
+    # text heuristic succeeds. Accept that successful result directly.
+    from backend.flask.website_monitoring.service import (
+        FetchResult,
+        HttpResponse,
+        _is_usable_http_response,
+    )
+
+    if isinstance(result, FetchResult):
+        return True
+    if isinstance(result, HttpResponse):
+        return _is_usable_http_response(result)
+    return bool(result)
+
+
+def _same_domain(candidate_url: str, target_url: str) -> bool:
+    candidate_host = (urlsplit(candidate_url).hostname or "").lower().removeprefix("www.")
+    target_host = (urlsplit(target_url).hostname or "").lower().removeprefix("www.")
+    return bool(candidate_host) and candidate_host == target_host
+
+
+def _require_http_url(value: Any, field: str) -> str:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"{field} must be a non-empty URL")
+    parsed = urlsplit(value.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        raise ValueError(f"{field} must be an absolute HTTP or HTTPS URL")
+    return value.strip()
+
+
+def _product_url_from_summary(summary: str) -> str | None:
+    if not isinstance(summary, str):
+        return None
+    # NEW_PRODUCT / PRODUCT_REMOVED end after the path. PRICE_CHANGE adds a
+    # colon and the old/new prices after it.
+    match = re.search(r"\bat\s+(\S+?)(?::\s+\S+\s+->|$)", summary)
+    return match.group(1) if match else None
 
 
 def _diff_text(content: str) -> str:

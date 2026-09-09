@@ -328,6 +328,7 @@ def diff_by_key(
             {
                 "change_type": "NEW_PRODUCT",
                 "summary": f"NEW_PRODUCT: {product['name']} ({product['price']}) at {key}",
+                "detected_url": key,
                 "key": key,
                 "name": product["name"],
                 "price": product["price"],
@@ -339,6 +340,7 @@ def diff_by_key(
             {
                 "change_type": "PRODUCT_REMOVED",
                 "summary": f"PRODUCT_REMOVED: {product['name']} ({product['price']}) at {key}",
+                "detected_url": key,
                 "key": key,
                 "name": product["name"],
                 "price": product["price"],
@@ -356,6 +358,7 @@ def diff_by_key(
                     f"PRICE_CHANGE: {new_product['name']} at {key}: "
                     f"{old_product['price']} -> {new_product['price']}"
                 ),
+                "detected_url": key,
                 "key": key,
                 "name": new_product["name"],
                 "price": new_product["price"],
