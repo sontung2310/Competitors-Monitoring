@@ -1,0 +1,20 @@
+:root{
+  /* Everything is a multiple of --spacing-unit. No half-steps. */
+  --spacing-unit:8px;
+  --space-1:8px;
+  --space-2:16px;
+  --space-3:24px;
+  --space-4:32px;
+  --space-5:40px;
+  --space-6:48px;
+  --space-8:64px;
+
+  /* Semantic aliases */
+  --card-padding:var(--space-3);
+  --card-gap:var(--space-2);
+  --section-gap:var(--space-4);
+  --page-padding:var(--space-4);
+  --control-padding-y:10px;    /* buttons: 10/20 reads correctly at 15px body */
+  --control-padding-x:var(--space-3);
+  --sidebar-width:240px;
+}

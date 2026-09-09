@@ -87,6 +87,14 @@ ITEM_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:solution|solutions)$"),
 )
 
+# A singular product URL with both a human slug and a SKU is an item/detail
+# page, not a Layer 2 section. Keep the broader item-root patterns above for
+# normalization and classification, but exclude this precise leaf shape from
+# discovery promotion. The aggregate ``/sale`` listing target is not matched.
+ITEM_TYPE_EXCLUSION_PATTERNS: tuple[re.Pattern[str], ...] = (
+    re.compile(r"^/product/[^/]+/[^/]+/?$", flags=re.IGNORECASE),
+)
+
 # Backwards-compatible segment constants for callers that used the original
 # normalization module, while the regex patterns above remain authoritative.
 INDEX_PATH_SEGMENTS = frozenset(
@@ -218,6 +226,14 @@ def is_structural_path(url: str, page_type: str | None = None) -> bool:
     return _index_match_position(segments) is not None or _matches_pattern(
         segments[0], ITEM_TYPE_PATTERNS
     )
+
+
+def is_item_type_excluded(url: str) -> bool:
+    """Return whether a URL is a known item/detail leaf excluded from discovery."""
+
+    canonical = canonicalize_raw_url(url)
+    path = urlsplit(canonical).path
+    return any(pattern.fullmatch(path) for pattern in ITEM_TYPE_EXCLUSION_PATTERNS)
 
 
 def is_same_site(base_url: str, candidate_url: str) -> bool:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+import re
 from copy import deepcopy
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -29,6 +30,12 @@ class _InsertResult:
 class _WriteResult:
     matched_count: int = 1
     deleted_count: int = 1
+
+
+@dataclass
+class _UpdateManyResult:
+    matched_count: int = 0
+    modified_count: int = 0
 
 
 class _Cursor(list):
@@ -76,6 +83,19 @@ class _FakeCollection:
                 return _WriteResult(matched_count=1)
         return _WriteResult(matched_count=0)
 
+    def update_many(self, query, update):
+        matched_count = 0
+        modified_count = 0
+        for document in self.documents:
+            if not _matches(document, query):
+                continue
+            matched_count += 1
+            values = deepcopy(update["$set"])
+            if any(document.get(key) != value for key, value in values.items()):
+                modified_count += 1
+                document.update(values)
+        return _UpdateManyResult(matched_count, modified_count)
+
     def delete_one(self, query):
         for index, document in enumerate(self.documents):
             if _matches(document, query):
@@ -93,7 +113,25 @@ class _FakeDatabase:
 
 
 def _matches(document, query):
-    return all(document.get(field) == value for field, value in query.items())
+    for field, value in query.items():
+        if field == "$or":
+            if not any(_matches(document, branch) for branch in value):
+                return False
+            continue
+        actual = document.get(field)
+        if isinstance(value, dict):
+            if "$ne" in value and actual == value["$ne"]:
+                return False
+            if "$in" in value and actual not in value["$in"]:
+                return False
+            if "$regex" in value and re.search(
+                value["$regex"], str(actual or ""), flags=re.IGNORECASE
+            ) is None:
+                return False
+            continue
+        if actual != value:
+            return False
+    return True
 
 
 class RepositoryTests(unittest.TestCase):
@@ -218,6 +256,69 @@ class RepositoryTests(unittest.TestCase):
         self.assertEqual(refreshed["discovery_status"], "SUGGESTED")
         self.assertEqual(refreshed["classification_method"], "RULE")
         self.assertEqual(refreshed["raw_url"], "https://example.com/pages/def456")
+
+    def test_bulk_discard_only_updates_inactive_discovery_item_rows(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+        old_discovery_row = self.targets.create(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/product/blue-shoe/sku-1",
+            url="https://example.com/product/blue-shoe/sku-1",
+            page_type="PRODUCTS",
+            discovery_source="SITEMAP",
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+            active=False,
+            check_interval_minutes=1440,
+            now=self.timestamp,
+        )
+        manual_row = self.targets.create(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/product/manual/sku-1",
+            url="https://example.com/product/manual/sku-1",
+            page_type="OTHER",
+            discovery_source="MANUAL",
+            discovery_status="SUGGESTED",
+            classification_method="MANUAL",
+            active=False,
+            check_interval_minutes=1440,
+            now=self.timestamp,
+        )
+        active_row = self.targets.create(
+            competitor_id=competitor["id"],
+            raw_url="https://example.com/product/active/sku-1",
+            url="https://example.com/product/active/sku-1",
+            page_type="PRODUCTS",
+            discovery_source="SITEMAP",
+            discovery_status="ACTIVE",
+            classification_method="RULE",
+            active=True,
+            check_interval_minutes=1440,
+            now=self.timestamp,
+        )
+
+        changed = self.targets.discard_discovered_candidates_by_url_patterns(
+            competitor["id"],
+            url_patterns=(r"/product/[^/]+/[^/]+/?$",),
+        )
+
+        self.assertEqual(changed, 1)
+        self.assertEqual(
+            self.targets.get(old_discovery_row["id"])["discovery_status"],
+            "DISCARDED",
+        )
+        self.assertEqual(
+            self.targets.get(manual_row["id"])["discovery_status"],
+            "SUGGESTED",
+        )
+        self.assertEqual(
+            self.targets.get(active_row["id"])["discovery_status"],
+            "ACTIVE",
+        )
 
     def test_candidate_review_service_uses_candidate_target_repository(self):
         competitor = self.competitors.create(

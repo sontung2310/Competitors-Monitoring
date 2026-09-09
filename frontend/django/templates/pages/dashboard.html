@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+{% load monitoring_tags %}
+
+{% block title %}{{ selected_company.name }} · CompetitorScope{% endblock %}
+
+{% block topbar_actions %}
+  <a class="button button-secondary button-small" href="#add-competitor">Add competitor</a>
+{% endblock %}
+
+{% block content %}
+  <div class="stat-grid">
+    {% for stat in stats %}{% include "partials/stat_tile.html" %}{% endfor %}
+  </div>
+
+  <section class="section-stack">
+    {% for card in cards %}
+      <article class="competitor-card">
+        <div class="competitor-card-heading">
+          <div>
+            <div class="eyebrow">Tracked competitor</div>
+            <h2>{{ card.competitor.name }}</h2>
+            <a class="website-link" href="{{ card.competitor.website_url }}" target="_blank" rel="noreferrer">{{ card.competitor.website_url }} <span aria-hidden="true">↗</span></a>
+          </div>
+          <a class="button button-primary" href="{% url 'competitor_detail' card.competitor.id %}?company_id={{ selected_company.id }}">Open competitor</a>
+        </div>
+        <div class="competitor-metrics">
+          <div><strong>{{ card.active_targets }}</strong><span>Active tracked pages</span></div>
+          <div><strong>{{ card.recent_changes }}</strong><span>Recent changes</span></div>
+        </div>
+      </article>
+    {% empty %}
+      <div class="empty-state"><div class="empty-icon" aria-hidden="true">◎</div><h2>No competitors in this company</h2><p>Add a competitor to begin monitoring its pages.</p></div>
+    {% endfor %}
+  </section>
+
+  <section class="panel">
+    <div class="panel-header"><h2>Recent updates</h2><a class="text-link" href="{% url 'changes_feed' %}?company_id={{ selected_company.id }}">View all <span aria-hidden="true">→</span></a></div>
+    <div class="panel-body">
+      {% for change in recent_changes %}
+        {% include "partials/change_row.html" %}
+      {% empty %}
+        <div class="empty-state compact"><h2>No changes recorded yet</h2><p>Monitoring runs will fill this feed as tracked pages change.</p></div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel add-competitor-panel" id="add-competitor">
+    <div class="panel-header"><h2>Add competitor</h2><span class="panel-meta">Website monitoring only</span></div>
+    <form class="form-grid" method="post" action="{% url 'create_competitor' %}">
+      {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}">
+      <label>Name<input name="name" type="text" required placeholder="Competitor name"></label>
+      <label>Website URL<input name="website_url" type="url" required placeholder="https://example.com"></label>
+      <div class="form-actions"><button class="button button-primary" type="submit">Add competitor</button></div>
+    </form>
+  </section>
+{% endblock %}

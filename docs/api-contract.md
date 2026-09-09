@@ -237,13 +237,19 @@ Read the newest change feed. It never creates or mutates records.
 - Social account endpoints remain deferred to Step 5.
 - Monitoring-run and scheduler control endpoints are not exposed in Step 2;
   Step 1 services remain callable internally until a later API requirement.
+  The PoC discovery-run status endpoint below is an exception used only to
+  observe the long-running discovery trigger.
 
 ## PoC trigger actions
 
 ### `POST /competitors/<id>/discover`
 
 Run the real Layer 1 discovery flow for the competitor and persist its normal
-candidate results. Optional query: `company_id=` for scoped access.
+candidate results. Optional queries: `company_id=` for scoped access and
+`run_id=` for a caller-supplied discovery lifecycle identifier. When `run_id`
+is supplied, the backend persists `RUNNING` before source collection and
+transitions that record to `SUCCESS` or `FAILED` when the synchronous work
+finishes.
 
 - Response `200`:
 
@@ -253,9 +259,34 @@ candidate results. Optional query: `company_id=` for scoped access.
   "source_breakdown"}}
   ```
 
-This is synchronous for the PoC and can take several seconds because it makes
-real HTTP crawl requests and may call the LLM classifier. The frontend should
-show a loading state.
+This remains synchronous inside Flask and can take several seconds—or up to
+approximately 12 minutes for JD Sports AU—because it makes real HTTP crawl
+requests and may call the LLM classifier. The frontend request may time out
+while Flask continues running; when a `run_id` was supplied, poll the status
+endpoint below rather than inferring completion from candidate-row counts.
+
+### `GET /discovery-runs/<run_id>`
+
+Read the persisted status of an HTTP-triggered discovery run. Optional query:
+`company_id=`; when supplied, the run's competitor must belong to that
+company.
+
+- Response `200`:
+
+  ```json
+  {
+    "id", "run_id", "competitor_id", "company_id",
+    "status": "RUNNING|SUCCESS|FAILED",
+    "started_at", "finished_at", "candidate_count",
+    "summary", "error_message", "created_at", "updated_at"
+  }
+  ```
+
+- Response `404`: standard error envelope
+
+`SUCCESS` is authoritative even when `candidate_count` is unchanged from the
+previous discovery run. `FAILED` exposes the backend's error message for the
+frontend error state.
 
 ### `POST /monitoring-targets/<id>/simulate`
 

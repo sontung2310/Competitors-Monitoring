@@ -1,0 +1,34 @@
+<!-- @dsCard group="Components" viewport="700x300" name="Core — Button, Card, Input, Select" subtitle="Primary/secondary/quiet buttons, panels, fields and the company dropdown" -->
+<!DOCTYPE html><html><head><meta charset="utf-8">
+<link rel="stylesheet" href="../../styles.css">
+<style>body{margin:0;font-family:var(--font-family);background:var(--color-bg);color:var(--color-text);padding:20px}.row{display:flex;flex-wrap:wrap;align-items:center;gap:12px}.col{display:flex;flex-direction:column;gap:12px}.cap{font:var(--type-meta);color:var(--text-meta);letter-spacing:.06em;text-transform:uppercase;font-weight:600}</style></head><body><div id="root"></div>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+<script src="../../_ds_bundle.js"></script>
+<script type="text/babel">
+const { Button, Card, CardHeader, Input, Select, Icon } = window.CompetitorScopeDesignSystem_312ddb;
+function Demo(){
+  const [co,setCo]=React.useState('me');
+  return (<div className="col" style={{gap:20}}>
+    <div className="row">
+      <Button>Activate</Button>
+      <Button variant="secondary" icon="refresh-cw">Run Discovery</Button>
+      <Button variant="quiet" size="sm">Discard</Button>
+      <Button loading>Simulating…</Button>
+      <Button disabled>Activate</Button>
+      <Button size="sm" icon="plus">Add manually</Button>
+    </div>
+    <div className="row" style={{alignItems:'stretch',gap:16}}>
+      <Card style={{flex:'1 1 260px'}}><CardHeader title="Tracked pages" meta="3 active targets" actions={<Button size="sm" variant="quiet">View</Button>}/>
+        <div style={{font:'var(--type-body)',color:'var(--text-meta)'}}>Static cards stay flat. Clickable cards take a shadow on hover only.</div></Card>
+      <div className="col" style={{flex:'1 1 260px'}}>
+        <Input label="Page URL" placeholder="https://competitor.com/pricing" icon="link"/>
+        <Input label="Page URL" defaultValue="https://lyfemarketing.com/nope" icon="link" error="this page doesn't appear to exist"/>
+        <Select label="Company" value={co} onChange={setCo} options={[{value:'me',label:'Marketing Eye'},{value:'taf',label:'The Athletes Foot'}]}/>
+      </div>
+    </div>
+  </div>);
+}
+ReactDOM.createRoot(document.getElementById('root')).render(<Demo/>);
+</script></body></html>

@@ -1,0 +1,8 @@
+:root{
+  /* Restrained: opacity and background-color crossfades. No bounce, no scale-in. */
+  --duration-fast:120ms; /* @kind other */
+  --duration-base:180ms; /* @kind other */
+  --ease-standard:cubic-bezier(.4,0,.2,1); /* @kind other */
+  --transition-control:background-color var(--duration-fast) var(--ease-standard),border-color var(--duration-fast) var(--ease-standard),color var(--duration-fast) var(--ease-standard);
+  --transition-surface:box-shadow var(--duration-base) var(--ease-standard);
+}

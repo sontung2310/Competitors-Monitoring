@@ -1,0 +1,6 @@
+/* CompetitorScope — webfonts.
+   Source docs specify: --font-family: 'Inter', -apple-system, 'Segoe UI', Roboto, sans-serif
+   (docs/design-guidelines.md, Part 1 Typography). No font binaries were provided in the
+   attached sources, so Inter is loaded from the Google Fonts CDN. Replace with self-hosted
+   binaries + local @font-face src if the team ships them. */
+@import url("https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap");

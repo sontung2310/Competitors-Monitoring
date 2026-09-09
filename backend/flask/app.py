@@ -20,6 +20,7 @@ from backend.flask.competitors.routes import competitors_blueprint
 from backend.flask.competitors.service import CompetitorService
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.discovery.routes import discovery_blueprint
+from backend.flask.discovery.repository import DiscoveryRunRepository
 from backend.flask.discovery.service import DiscoveryService
 from backend.flask.errors import APIError, error_from_exception
 from backend.flask.snapshot.repository import SnapshotRepository
@@ -98,6 +99,7 @@ def _build_services(
     snapshot_repository = SnapshotRepository.from_database(database)
     change_repository = ChangeRepository.from_database(database)
     run_repository = MonitoringRunRepository.from_database(database)
+    discovery_run_repository = DiscoveryRunRepository.from_database(database)
 
     # Index creation belongs to repositories; the factory only invokes their
     # public setup operation before exposing them to business services.
@@ -108,6 +110,7 @@ def _build_services(
         snapshot_repository,
         change_repository,
         run_repository,
+        discovery_run_repository,
     ):
         repository.ensure_indexes()
 
@@ -124,6 +127,7 @@ def _build_services(
         target_repository,
         snapshot_repository=snapshot_repository,
         change_repository=change_repository,
+        run_repository=discovery_run_repository,
     )
     change_service = ChangeService(
         change_repository,

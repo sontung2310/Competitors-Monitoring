@@ -1,0 +1,80 @@
+{% extends "base.html" %}
+{% load monitoring_tags %}
+
+{% block title %}{{ competitor.name }} · CompetitorScope{% endblock %}
+
+{% block topbar_actions %}
+  <form method="post" action="{% url 'run_discovery' competitor.id %}" data-loading="discovery" data-loading-text="Running discovery…">
+    {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}">
+    <button class="button button-secondary button-small" type="submit"><span class="button-spinner" aria-hidden="true"></span><span class="button-label">Run Discovery</span></button>
+  </form>
+{% endblock %}
+
+{% block content %}
+  {% if discovery_pending %}
+    <div class="notice notice-pending" role="status" data-auto-refresh="{{ discovery_poll_url }}" data-refresh-delay="15000">
+      <div><strong>Discovery is still working</strong><span>This can take a few minutes for larger sites. The page will refresh automatically.</span></div>
+      <span class="notice-summary">{{ candidate_total }} candidate records available so far.</span>
+    </div>
+  {% elif discovery_complete %}
+    <div class="notice notice-success" role="status">
+      <div><strong>Discovery finished</strong><span>New candidate records are now available from the live API.</span></div>
+      <span class="notice-summary">{{ candidate_total }} candidate records available.</span>
+    </div>
+  {% elif discovery_result %}
+    <div class="notice notice-success">
+      <div><strong>Discovery complete</strong><span>{{ discovery_result.candidates|length }} candidate records returned.</span></div>
+      {% if discovery_result.summary %}<span class="notice-summary">{{ discovery_result.summary.raw_count }} raw · {{ discovery_result.summary.normalized_count }} normalized · {{ discovery_result.summary.suggested_count }} suggested · {{ discovery_result.summary.discarded_count }} discarded</span>{% endif %}
+    </div>
+  {% endif %}
+
+  <section class="panel management-panel">
+    <div class="panel-header"><h2>Competitor settings</h2><span class="panel-meta">Company-scoped record</span></div>
+    <form class="form-grid" method="post" action="{% url 'update_competitor' competitor.id %}">
+      {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}">
+      <label>Name<input name="name" type="text" required value="{{ competitor_form_name }}"></label>
+      <label>Website URL<input name="website_url" type="url" required value="{{ competitor_form_website }}"></label>
+      <div class="form-actions"><button class="button button-secondary button-small" type="submit">Save changes</button></div>
+    </form>
+  </section>
+
+  <section class="panel">
+    <div class="panel-header panel-header-wrap">
+      <div><h2>Discovery review</h2><p class="panel-subtitle">Review candidates before they become Layer 2 monitoring targets.</p></div>
+      <a class="button button-secondary button-small" href="#manual-target">Add Layer 2 page</a>
+    </div>
+    <nav class="segmented-tabs" aria-label="Candidate status">
+      <a class="{% if status == 'SUGGESTED' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&status=SUGGESTED">Suggested <span>{{ suggested_count }}</span></a>
+      <a class="{% if status == 'ACTIVE' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&status=ACTIVE">Active <span>{{ active_count }}</span></a>
+      <a class="{% if status == 'DISCARDED' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&status=DISCARDED">Discarded <span>{{ discarded_count }}</span></a>
+    </nav>
+    {% if total_rows > rows|length %}<p class="panel-footnote">Showing the first {{ rows|length }} of {{ total_rows }} records returned by the API.</p>{% endif %}
+    <div class="panel-body candidate-list">
+      {% for record in rows %}
+        {% include "partials/candidate_row.html" %}
+      {% empty %}
+        <div class="empty-state compact">
+          <div class="empty-icon" aria-hidden="true">⌁</div>
+          {% if status == 'ACTIVE' %}<h2>No pages tracked yet</h2><p>Activate a suggested candidate to start monitoring.</p>
+          {% else %}<h2>No candidates here</h2><p>Run discovery to find some.</p>{% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  </section>
+
+  <section class="panel" id="manual-target">
+    <div class="panel-header"><div><h2>Add Layer 2 page</h2><p class="panel-subtitle">The URL is liveness-checked before it is saved.</p></div></div>
+    <form class="form-grid manual-target-form" method="post" action="{% url 'add_manual_target' competitor.id %}">
+      {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}">
+      <label>Page URL<input name="url" type="url" required value="{{ manual_url }}" placeholder="https://example.com/pricing"></label>
+      <label>Page type <span class="optional">optional</span><select name="page_type"><option value="">Detect automatically</option><option value="BLOG" {% if manual_page_type == 'BLOG' %}selected{% endif %}>BLOG</option><option value="SERVICES" {% if manual_page_type == 'SERVICES' %}selected{% endif %}>SERVICES</option><option value="PRICING" {% if manual_page_type == 'PRICING' %}selected{% endif %}>PRICING</option><option value="PRODUCT_LISTING" {% if manual_page_type == 'PRODUCT_LISTING' %}selected{% endif %}>PRODUCT_LISTING</option><option value="ABOUT" {% if manual_page_type == 'ABOUT' %}selected{% endif %}>ABOUT</option><option value="CAREERS" {% if manual_page_type == 'CAREERS' %}selected{% endif %}>CAREERS</option><option value="CONTACT" {% if manual_page_type == 'CONTACT' %}selected{% endif %}>CONTACT</option><option value="WORK" {% if manual_page_type == 'WORK' %}selected{% endif %}>WORK</option><option value="OTHER" {% if manual_page_type == 'OTHER' %}selected{% endif %}>OTHER</option></select></label>
+      <div class="form-actions"><button class="button button-primary" type="submit">Add page</button></div>
+    </form>
+    {% if manual_error %}<div class="inline-error" role="alert"><strong>Page was not added</strong><span>{{ manual_error }}</span></div>{% endif %}
+  </section>
+
+  <section class="panel danger-panel">
+    <div><h2>Remove competitor</h2><p class="panel-subtitle">This removes the company-scoped competitor record.</p></div>
+    <form method="post" action="{% url 'delete_competitor' competitor.id %}" data-confirm="Remove this competitor and its UI entry?">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-danger button-small" type="submit">Remove competitor</button></form>
+  </section>
+{% endblock %}

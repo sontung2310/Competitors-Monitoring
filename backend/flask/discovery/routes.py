@@ -86,9 +86,14 @@ def discover_competitor(competitor_id: str):
 
     company_id = request.args.get("company_id")
     kwargs = {"company_id": company_id} if company_id is not None else {}
+    run_id = request.args.get("run_id")
     service("competitors").get_competitor(competitor_id, **kwargs)
-    discovered = service("discovery").discover_website(competitor_id, **kwargs)
-    summary = getattr(service("discovery"), "last_summary", None)
+    discovery = service("discovery")
+    discovery_kwargs = dict(kwargs)
+    if run_id is not None:
+        discovery_kwargs["run_id"] = run_id
+    discovered = discovery.discover_website(competitor_id, **discovery_kwargs)
+    summary = getattr(discovery, "last_summary", None)
     summary_payload = None
     if summary is not None:
         summary_payload = {
@@ -114,3 +119,12 @@ def discover_competitor(competitor_id: str):
             "summary": summary_payload,
         }
     )
+
+
+@discovery_blueprint.get("/discovery-runs/<run_id>")
+def get_discovery_run(run_id: str):
+    """Return the persisted lifecycle of one HTTP-triggered discovery run."""
+
+    company_id = request.args.get("company_id")
+    kwargs = {"company_id": company_id} if company_id is not None else {}
+    return json_response(service("discovery").get_discovery_run(run_id, **kwargs))
