@@ -1,4 +1,4 @@
-"""Unit coverage for deterministic change/event creation."""
+"""Unit coverage for change/event creation and narrative enrichment."""
 
 from __future__ import annotations
 
@@ -84,7 +84,32 @@ class _TargetRepository:
         self.get_calls.append(target_id)
         if target_id != self.target_id:
             return None
-        return {"id": str(target_id), "page_type": self.page_type}
+        return {
+            "id": str(target_id),
+            "url": "https://example.com/blog",
+            "page_type": self.page_type,
+        }
+
+
+class _NarrativeProvider:
+    def __init__(self, output="A new article was added to the monitored page."):
+        self.output = output
+        self.calls = []
+
+    def generate(self, prompt, *, instructions, response_format=None):
+        self.calls.append(
+            {
+                "prompt": prompt,
+                "instructions": instructions,
+                "response_format": response_format,
+            }
+        )
+        return self.output
+
+
+class _FailingNarrativeProvider:
+    def generate(self, prompt, *, instructions, response_format=None):
+        raise TimeoutError("forced narrative timeout")
 
 
 class ChangeCreationTests(unittest.TestCase):
@@ -97,7 +122,12 @@ class ChangeCreationTests(unittest.TestCase):
             else "000000000000000000000001"
         )
         self.target_repository = _TargetRepository(self.target_id, "BLOG")
-        self.service = ChangeService(self.repository, self.target_repository)
+        self.narrative_provider = _NarrativeProvider()
+        self.service = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=lambda: self.narrative_provider,
+        )
         self.detected_at = datetime(
             2026,
             9,
@@ -168,6 +198,55 @@ class ChangeCreationTests(unittest.TestCase):
             r"^NEW_BLOG: 1 line\(s\) added, 1 line\(s\) removed",
         )
         self.assertIn("characters added", change["summary"])
+        self.assertEqual(
+            change["narrative_summary"],
+            "A new article was added to the monitored page.",
+        )
+        self.assertIn("https://example.com/blog", self.narrative_provider.calls[0]["prompt"])
+        self.assertIn("<main>Old blog announcement</main>", self.narrative_provider.calls[0]["prompt"])
+
+    def test_product_change_does_not_call_narrative_provider(self):
+        self.target_repository.page_type = "PRODUCT_LISTING"
+        previous = self._snapshot(
+            "000000000000000000000012",
+            '[{"key":"/product/old","name":"Old","price":"10.00"}]',
+        )
+        current = self._snapshot(
+            "000000000000000000000013",
+            '[{"key":"/product/new","name":"New","price":"12.00"}]',
+        )
+
+        change = self.service.create_change(
+            self.target_id,
+            previous,
+            current,
+            change_type="NEW_PRODUCT",
+            summary="NEW_PRODUCT: New (12.00) at /product/new",
+        )
+
+        self.assertIsNone(change["narrative_summary"])
+        self.assertEqual(self.narrative_provider.calls, [])
+
+    def test_narrative_failure_keeps_change_and_mechanical_summary(self):
+        service = ChangeService(
+            self.repository,
+            self.target_repository,
+            narrative_provider_factory=_FailingNarrativeProvider,
+        )
+        previous = self._snapshot(
+            "000000000000000000000014",
+            "<main>Old page copy</main>",
+        )
+        current = self._snapshot(
+            "000000000000000000000015",
+            "<main>New page copy</main>",
+        )
+
+        change = service.create_change(self.target_id, previous, current)
+
+        self.assertIsNone(change["narrative_summary"])
+        self.assertRegex(change["summary"], r"^NEW_BLOG: 1 line\(s\) added")
+        self.assertEqual(len(self.repository.list_for_target(self.target_id)), 1)
 
     def test_pricing_change_maps_to_price_change(self):
         self.target_repository.page_type = "PRICING"
@@ -254,6 +333,7 @@ class ChangeCreationTests(unittest.TestCase):
             self.repository,
             self.target_repository,
             snapshot_content_loader=lambda snapshot: contents[snapshot["id"]],
+            narrative_provider_factory=lambda: self.narrative_provider,
         )
 
         change = service.create_change(self.target_id, previous, current)

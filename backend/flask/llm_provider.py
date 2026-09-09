@@ -1,9 +1,9 @@
 """Reusable, environment-configured LLM provider boundary.
 
 This module owns provider SDK construction and response validation for offline
-fixture generation. It deliberately has no database or monitoring imports, so
-discovery's future provider wiring can reuse it without putting an LLM in the
-live monitoring path.
+fixture generation and runtime enrichment. It deliberately has no database or
+monitoring imports, so discovery and monitoring consumers can share the same
+provider boundary without coupling LLM plumbing to either data path.
 """
 
 from __future__ import annotations

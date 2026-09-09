@@ -266,12 +266,13 @@ class SimulationPersistenceTests(unittest.TestCase):
         snapshots = _SnapshotRepository()
         snapshot_service = _SnapshotService()
         changes = _ChangeService()
+        provider = _Provider()
         service = SimulationPersistenceService(
             _TargetRepository(),
             snapshots,
             snapshot_service,
             changes,
-            provider_factory=_Provider,
+            provider_factory=lambda: provider,
             fetcher=lambda url: FetchResult(
                 "<html><main><h1>Real baseline</h1></main></html>",
                 "HTTP",
@@ -284,6 +285,7 @@ class SimulationPersistenceTests(unittest.TestCase):
         self.assertEqual(snapshots.calls, [False])
         self.assertTrue(snapshot_service.calls[0][2]["is_simulated"])
         self.assertTrue(changes.calls[0][1]["is_simulated"])
+        self.assertIs(changes.calls[0][1]["narrative_provider"], provider)
         self.assertEqual(result["previous_snapshot"]["id"], "r" * 24)
         self.assertTrue(result["snapshot"]["is_simulated"])
         self.assertTrue(result["change"]["is_simulated"])

@@ -70,6 +70,7 @@ class FakeAPIClient:
                 "monitoring_target_id": TARGET["id"],
                 "change_type": "NEW_BLOG",
                 "summary": "NEW_BLOG: a simulated article was added.",
+                "narrative_summary": "Lyfe Marketing published a new article in its blog feed.",
                 "detected_at": "2026-09-08T01:02:03Z",
                 "status": "NEW",
                 "is_simulated": True,
@@ -170,7 +171,10 @@ class DjangoFrontendViewTests(SimpleTestCase):
 
         response = self.client.get("/changes/?company_id=company-marketing-eye")
         self.assertContains(response, "🧪 SIMULATED")
+        self.assertContains(response, "Lyfe Marketing published a new article in its blog feed.")
         self.assertContains(response, "NEW_BLOG: a simulated article was added.")
+        self.assertContains(response, "change-narrative")
+        self.assertContains(response, "change-mechanical")
 
     def test_manual_target_error_uses_exact_backend_message(self):
         self.client_data.manual_error = True

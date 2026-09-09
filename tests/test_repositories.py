@@ -120,6 +120,8 @@ def _matches(document, query):
             continue
         actual = document.get(field)
         if isinstance(value, dict):
+            if "$exists" in value and ((field in document) != value["$exists"]):
+                return False
             if "$ne" in value and actual == value["$ne"]:
                 return False
             if "$in" in value and actual not in value["$in"]:
@@ -467,6 +469,42 @@ class RepositoryTests(unittest.TestCase):
                 page_type="BLOG",
                 check_interval_minutes=0,
             )
+
+    def test_change_repository_backfill_updates_only_nullable_narratives(self):
+        repository = ChangeRepository.from_database(self.database)
+        change = repository.create(
+            monitoring_target_id="1" * 24,
+            previous_snapshot_id="2" * 24,
+            current_snapshot_id="3" * 24,
+            detected_at=self.timestamp,
+            change_type="NEW_BLOG",
+            summary="NEW_BLOG: one line changed.",
+            status="NEW",
+            now=self.timestamp,
+        )
+
+        self.assertIsNone(change["narrative_summary"])
+        self.assertEqual(
+            [row["id"] for row in repository.list_needing_narrative_summary()],
+            [change["id"]],
+        )
+        updated = repository.update_narrative_summary(
+            change["id"],
+            "A new article was added to the blog.",
+            now=self.timestamp,
+        )
+        self.assertEqual(
+            updated["narrative_summary"],
+            "A new article was added to the blog.",
+        )
+        self.assertEqual(repository.list_needing_narrative_summary(), [])
+        self.assertIsNone(
+            repository.update_narrative_summary(
+                change["id"],
+                "This second update must not overwrite the first.",
+                now=self.timestamp,
+            )
+        )
 
     def test_mongo_settings_require_uri_and_support_database_aliases(self):
         with self.assertRaises(MongoConfigurationError):

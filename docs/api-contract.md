@@ -226,8 +226,8 @@ Read the newest change feed. It never creates or mutates records.
   ```json
   [{
     "id", "monitoring_target_id", "previous_snapshot_id",
-    "current_snapshot_id", "change_type", "summary", "detected_at",
-    "status", "is_simulated", "created_at", "updated_at"
+    "current_snapshot_id", "change_type", "summary", "narrative_summary",
+    "detected_at", "status", "is_simulated", "created_at", "updated_at"
   }]
   ```
 
@@ -239,7 +239,14 @@ Read the newest change feed. It never creates or mutates records.
 
 - Optional query: `company_id=` for scoped access.
 - Response `200`: full change record, including
-  `previous_snapshot_id`, `current_snapshot_id`, and `is_simulated`.
+  `previous_snapshot_id`, `current_snapshot_id`, `narrative_summary`, and
+  `is_simulated`.
+
+`narrative_summary` is nullable and is generated synchronously only for
+`NEW_BLOG` and `PAGE_UPDATE` changes. It is `null` (or omitted on older
+records) when the optional LLM call is unavailable. The mechanical `summary`
+is always retained and remains the fallback display text. Product change types
+do not request this narrative.
 - Response `404`: standard error envelope
 
 ## Deferred API areas

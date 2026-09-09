@@ -23,6 +23,7 @@ from backend.flask.discovery.routes import discovery_blueprint
 from backend.flask.discovery.repository import DiscoveryRunRepository
 from backend.flask.discovery.service import DiscoveryService
 from backend.flask.errors import APIError, error_from_exception
+from backend.flask.llm_provider import OpenAIProvider
 from backend.flask.snapshot.repository import SnapshotRepository
 from backend.flask.snapshot.service import SnapshotService
 from backend.flask.snapshot.storage import SnapshotStorage
@@ -49,6 +50,7 @@ def create_app(
     storage_root: str | None = None,
     services: Mapping[str, Any] | None = None,
     testing: bool = False,
+    llm_provider_factory: Any = OpenAIProvider.from_env,
 ) -> Flask:
     """Build a configured Flask app.
 
@@ -71,6 +73,7 @@ def create_app(
             database,
             user_id=app.config["API_USER_ID"],
             storage_root=storage_root,
+            llm_provider_factory=llm_provider_factory,
         )
     app.extensions["api_services"] = dict(services)
     if database is not None:
@@ -92,6 +95,7 @@ def _build_services(
     *,
     user_id: str,
     storage_root: str | None,
+    llm_provider_factory: Any,
 ) -> dict[str, Any]:
     competitor_repository = CompetitorRepository.from_database(database)
     company_repository = CompanyRepository.from_database(database)
@@ -133,6 +137,7 @@ def _build_services(
         change_repository,
         target_repository,
         competitor_repository=competitor_repository,
+        narrative_provider_factory=llm_provider_factory,
     )
     target_service = MonitoringTargetService(
         target_repository,
@@ -142,10 +147,13 @@ def _build_services(
     monitoring_service = MonitoringRunService.from_database(
         database,
         storage_root=storage_root,
+        narrative_provider_factory=llm_provider_factory,
     )
     simulation_service = SimulationPersistenceService.from_database(
         database,
         storage_root=storage_root,
+        provider_factory=llm_provider_factory,
+        narrative_provider_factory=llm_provider_factory,
     )
     return {
         "companies": company_service,

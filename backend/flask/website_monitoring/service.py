@@ -32,6 +32,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from urllib.request import Request, urlopen
 
 from backend.flask.database.base_repository import utc_now
+from backend.flask.llm_provider import OpenAIProvider
 
 from .content_processing import (
     ContentProcessor,
@@ -536,6 +537,7 @@ class MonitoringRunService:
         clock: Callable[[], datetime] = utc_now,
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
         content_processors: Mapping[str, ContentProcessor] | None = None,
+        narrative_provider_factory: Callable[[], Any] | None = None,
     ) -> "MonitoringRunService":
         """Build the complete repository-backed monitoring service."""
 
@@ -559,6 +561,11 @@ class MonitoringRunService:
             ChangeRepository.from_database(database),
             target_repository,
             snapshot_content_loader=snapshot_content_loader,
+            narrative_provider_factory=(
+                narrative_provider_factory
+                if narrative_provider_factory is not None
+                else OpenAIProvider.from_env
+            ),
         )
         return cls(
             target_repository,
