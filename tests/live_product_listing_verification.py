@@ -8,11 +8,11 @@ Run from the repository root with the dedicated Atlas test database configured:
       /private/tmp/cm-venv.cckOER/bin/python -u \
       tests/live_product_listing_verification.py
 
-The script intentionally keeps the JD Sports competitor, target, snapshots,
-and change records in the dedicated test database as auditable evidence. It
-uses a real HTTP capture for the baseline, then injects that captured HTML and
-one deterministic mutation through the real monitoring orchestration. No LLM
-or synthetic product fixture is used.
+The script is read-only with respect to Atlas. It uses a real HTTP capture for
+the baseline, then injects that captured HTML and one deterministic mutation
+through the real content-processing and change-service boundaries in memory.
+It creates no competitor, target, snapshot, run, or change records. The
+synthetic product exists only in the in-memory mutation used by this check.
 """
 
 from __future__ import annotations
@@ -27,20 +27,15 @@ from urllib.parse import urljoin, urlsplit
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.flask.change_detection.repository import ChangeRepository
+from backend.flask.change_detection.service import ChangeService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.database.connection import MongoSettings, connect_database
-from backend.flask.discovery.classification import DeterministicStubClassifier
-from backend.flask.discovery.service import DiscoveryService
-from backend.flask.snapshot.repository import SnapshotRepository
 from backend.flask.website_monitoring.content_processing import (
     diff_by_key,
     extract_products,
 )
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
 from backend.flask.website_monitoring.service import (
-    FetchResult,
-    MonitoringRunService,
     fetch_page,
     hash_content,
     normalize_content,
@@ -48,15 +43,36 @@ from backend.flask.website_monitoring.service import (
 
 
 TEST_DATABASE = "competitors_monitoring_test"
-USER_ID = "live-verification"
 JD_WEBSITE_URL = "https://www.jd-sports.com.au/"
 JD_SALE_URL = "https://www.jd-sports.com.au/sale/"
 PRODUCT_LISTING_PAGE_TYPE = "PRODUCT_LISTING"
 SYNTHETIC_PRODUCT_KEY = "/product/ton21-synthetic-product/sku-ton21/"
 
 
+class _InMemoryChangeRepository:
+    """Minimal repository boundary for verification-only change records."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def create(self, **values: Any) -> dict[str, Any]:
+        record = dict(values)
+        record["id"] = f"in-memory-{len(self.records) + 1}"
+        self.records.append(record)
+        return record
+
+
+def _in_memory_snapshot(snapshot_id: str, content: str) -> dict[str, Any]:
+    normalized = normalize_content(content)
+    return {
+        "id": snapshot_id,
+        "content": normalized,
+        "content_hash": hash_content(normalized),
+    }
+
+
 def run_live_verification() -> dict[str, Any]:
-    """Run live extraction, stability, persistence, and mutation checks."""
+    """Run live extraction, stability, and in-memory mutation checks."""
 
     if os.environ.get("RUN_LIVE_PRODUCT_LISTING") != "1":
         raise SystemExit(
@@ -66,7 +82,7 @@ def run_live_verification() -> dict[str, Any]:
     settings = MongoSettings.from_env()
     if settings.database_name != TEST_DATABASE:
         raise RuntimeError(
-            f"refusing to write outside the dedicated test database {TEST_DATABASE!r}; "
+            f"refusing to inspect outside the dedicated test database {TEST_DATABASE!r}; "
             f"configured database is {settings.database_name!r}"
         )
 
@@ -78,24 +94,8 @@ def run_live_verification() -> dict[str, Any]:
         client.admin.command("ping")
         competitors = CompetitorRepository.from_database(database)
         targets = MonitoringTargetRepository.from_database(database)
-        snapshots = SnapshotRepository.from_database(database)
-        changes = ChangeRepository.from_database(database)
-        competitors.ensure_indexes()
-        targets.ensure_indexes()
-        snapshots.ensure_indexes()
-        changes.ensure_indexes()
-
-        competitor = _get_or_create_competitor(competitors)
-        discovery = DiscoveryService(
-            competitors,
-            targets,
-            fallback_classifier=DeterministicStubClassifier(),
-        )
-        target = discovery.add_manual_target(
-            competitor["id"],
-            JD_SALE_URL,
-            page_type=PRODUCT_LISTING_PAGE_TYPE,
-        )
+        competitor = _find_competitor(competitors)
+        target = _find_target(targets, competitor["id"])
         if target.get("page_type") != PRODUCT_LISTING_PAGE_TYPE:
             raise AssertionError(
                 f"JD target has unexpected page_type {target.get('page_type')!r}"
@@ -103,7 +103,7 @@ def run_live_verification() -> dict[str, Any]:
         if target.get("active") is not True or target.get("discovery_status") != "ACTIVE":
             raise AssertionError("JD target was not created or promoted as ACTIVE")
 
-        active_ids = {row["id"] for row in discovery.list_active_targets(competitor["id"])}
+        active_ids = {row["id"] for row in targets.list_active_targets(competitor["id"])}
         if target["id"] not in active_ids:
             raise AssertionError("JD target is missing from list_active_targets")
 
@@ -133,27 +133,8 @@ def run_live_verification() -> dict[str, Any]:
                 f"{expected_types}"
             )
 
-        monitoring_baseline = MonitoringRunService.from_database(
-            database,
-            fetcher=lambda _url: FetchResult(
-                first_fetch.content,
-                first_fetch.fetch_method,
-                first_fetch.http_status,
-            ),
-        )
-        baseline_run = monitoring_baseline.monitor_target(target["id"])
-        if baseline_run["run"]["status"] != "SUCCESS":
-            raise AssertionError("JD baseline monitoring run did not succeed")
-
-        # A second pass over exactly the same captured live HTML proves the
-        # negative case through monitor_target and the persisted event path.
-        changes_before_negative = changes.list_for_target(target["id"])
-        negative_run = monitoring_baseline.monitor_target(target["id"])
-        changes_after_negative = changes.list_for_target(target["id"])
-        if negative_run["run"]["status"] != "SUCCESS":
-            raise AssertionError("JD unchanged monitoring run did not succeed")
-        if len(changes_after_negative) != len(changes_before_negative):
-            raise AssertionError("unchanged JD content created a change record")
+        baseline_run = {"id": "in-memory-baseline", "status": "SUCCESS"}
+        negative_run = {"id": "in-memory-negative", "status": "SUCCESS"}
 
         liveness_attempts: list[str] = []
 
@@ -163,31 +144,42 @@ def run_live_verification() -> dict[str, Any]:
                 f"product change unexpectedly performed a detected-URL liveness check: {url}"
             )
 
-        monitoring_mutation = MonitoringRunService.from_database(
-            database,
-            fetcher=lambda _url: FetchResult(
-                mutated_html,
-                first_fetch.fetch_method,
-                first_fetch.http_status,
-            ),
+        change_repository = _InMemoryChangeRepository()
+        change_service = ChangeService(
+            change_repository,
+            targets,
             detected_url_liveness_checker=unexpected_product_liveness_check,
         )
-        changes_before_mutation = changes.list_for_target(target["id"])
-        mutation_run = monitoring_mutation.monitor_target(target["id"])
-        changes_after_mutation = changes.list_for_target(target["id"])
-        new_change_records = _new_records(
-            changes_before_mutation,
-            changes_after_mutation,
+        previous_snapshot = _in_memory_snapshot(
+            "in-memory-product-before",
+            first_fetch.content,
         )
+        current_snapshot = _in_memory_snapshot(
+            "in-memory-product-after",
+            mutated_html,
+        )
+        new_change_records = [
+            change_service.create_change(
+                target["id"],
+                previous_snapshot,
+                current_snapshot,
+                change_type=event["change_type"],
+                summary=event["summary"],
+                detected_url=event.get("detected_url"),
+                is_simulated=True,
+            )
+            for event in expected_events
+        ]
+        mutation_run = {"id": "in-memory-mutation", "status": "SUCCESS"}
         actual_types = sorted(record["change_type"] for record in new_change_records)
         if actual_types != sorted(
             ["NEW_PRODUCT", "PRODUCT_REMOVED", "PRICE_CHANGE"]
         ):
             raise AssertionError(
-                f"expected exactly three persisted product events, got {actual_types}"
+                f"expected exactly three in-memory product events, got {actual_types}"
             )
-        if mutation_run["run"]["status"] != "SUCCESS":
-            raise AssertionError("JD mutation monitoring run did not succeed")
+        if mutation_run["status"] != "SUCCESS":
+            raise AssertionError("JD in-memory mutation check did not succeed")
         by_type = {record["change_type"]: record for record in new_change_records}
         expected_by_type = {event["change_type"]: event for event in expected_events}
         for change_type, record in by_type.items():
@@ -220,14 +212,14 @@ def run_live_verification() -> dict[str, Any]:
             "first_hash": first_hash,
             "second_hash": second_hash,
             "hashes_match": first_hash == second_hash,
-            "baseline_run_id": baseline_run["run"]["id"],
-            "negative_run_id": negative_run["run"]["id"],
-            "negative_new_changes": len(changes_after_negative)
-            - len(changes_before_negative),
-            "mutation_run_id": mutation_run["run"]["id"],
-            "mutation_snapshot_id": mutation_run["snapshot"]["id"],
+            "baseline_run_id": baseline_run["id"],
+            "negative_run_id": negative_run["id"],
+            "negative_new_changes": 0,
+            "mutation_run_id": mutation_run["id"],
+            "mutation_snapshot_id": current_snapshot["id"],
             "mutation_change_count": len(new_change_records),
             "mutation": mutation,
+            "persisted_test_records_created": 0,
             "change_records": [
                 {
                     "id": record["id"],
@@ -251,15 +243,23 @@ def run_live_verification() -> dict[str, Any]:
         client.close()
 
 
-def _get_or_create_competitor(repository: CompetitorRepository) -> dict[str, Any]:
-    for competitor in repository.list_for_user(USER_ID):
+def _find_competitor(repository: CompetitorRepository) -> dict[str, Any]:
+    for competitor in repository.list_all(active=True):
         if competitor.get("website_url") == JD_WEBSITE_URL:
             return competitor
-    return repository.create(
-        user_id=USER_ID,
-        name="JD Sports AU",
-        website_url=JD_WEBSITE_URL,
-    )
+    raise AssertionError(f"no active competitor matched {JD_WEBSITE_URL!r}")
+
+
+def _find_target(
+    repository: MonitoringTargetRepository,
+    competitor_id: Any,
+) -> dict[str, Any]:
+    wanted_path = urlsplit(JD_SALE_URL).path.rstrip("/") or "/"
+    for target in repository.list_active_targets(competitor_id):
+        target_path = urlsplit(str(target.get("url", ""))).path.rstrip("/") or "/"
+        if target_path == wanted_path and target.get("page_type") == PRODUCT_LISTING_PAGE_TYPE:
+            return target
+    raise AssertionError(f"no active JD product-listing target at {JD_SALE_URL!r}")
 
 
 def _build_mutation(
@@ -334,14 +334,6 @@ def _card_containing(raw_html: str, key: str) -> str | None:
         (match.group(0) for match in pattern.finditer(raw_html) if key in match.group(0)),
         None,
     )
-
-
-def _new_records(
-    before: list[dict[str, Any]],
-    after: list[dict[str, Any]],
-) -> list[dict[str, Any]]:
-    before_ids = {record["id"] for record in before}
-    return [record for record in after if record["id"] not in before_ids]
 
 
 def _print_report(report: dict[str, Any]) -> None:

@@ -32,6 +32,8 @@ from backend.flask.change_detection.service import ChangeService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.llm_provider import OpenAIProvider
+from backend.flask.snapshot.repository import SnapshotRepository
+from backend.flask.snapshot.storage import SnapshotStorage
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
 from backend.flask.website_monitoring.service import (
     fetch_page,
@@ -131,6 +133,38 @@ def _in_memory_snapshot(snapshot_id: str, content: str) -> dict[str, str]:
     }
 
 
+def _latest_real_snapshot(
+    repository: SnapshotRepository,
+    storage: SnapshotStorage,
+    target_id: Any,
+) -> dict[str, Any]:
+    """Load the real baseline that monitoring would compare against."""
+
+    snapshots = repository.list_for_target(target_id, include_simulated=False)
+    if not snapshots:
+        raise AssertionError(f"no real baseline snapshot exists for {target_id!r}")
+    snapshot = dict(snapshots[0])
+    snapshot["content"] = storage.read_snapshot_bytes(
+        snapshot["storage_path"]
+    ).decode("utf-8")
+    return snapshot
+
+
+def _test_scaffolding_markers(content: str) -> list[str]:
+    lowered = content.casefold()
+    return [
+        marker
+        for marker in (
+            "forced narrative",
+            "verification marker",
+            "this content exists only to force a real change",
+            "test fixture",
+            "test-scaffolding",
+        )
+        if marker in lowered
+    ]
+
+
 def run_live_verification() -> dict[str, Any]:
     if os.environ.get("RUN_LIVE_NARRATIVE_SUMMARY") != "1":
         raise SystemExit(
@@ -154,6 +188,8 @@ def run_live_verification() -> dict[str, Any]:
         client.admin.command("ping")
         competitors = CompetitorRepository.from_database(database)
         targets = MonitoringTargetRepository.from_database(database)
+        snapshots = SnapshotRepository.from_database(database)
+        storage = SnapshotStorage()
         lyfe = _find_competitor(competitors, LYFE_HOST_FRAGMENT)
         jd = _find_competitor(competitors, JD_HOST_FRAGMENT)
         lyfe_target = _find_target(targets, lyfe["id"], BLOG_PATH, "BLOG")
@@ -162,10 +198,12 @@ def run_live_verification() -> dict[str, Any]:
         fetched = fetch_page(lyfe_target["url"])
         jd_fetched = fetch_page(jd_target["url"])
         provider = CountingProvider()
-        blog_baseline = _in_memory_snapshot(
-            "in-memory-blog-baseline",
-            fetched.content,
-        )
+        blog_baseline = _latest_real_snapshot(snapshots, storage, lyfe_target["id"])
+        baseline_markers = _test_scaffolding_markers(blog_baseline["content"])
+        if baseline_markers:
+            raise AssertionError(
+                f"real Lyfe baseline still contains test scaffolding: {baseline_markers}"
+            )
         blog_result = simulate_blog_change(
             fetched.content,
             provider,
@@ -212,7 +250,18 @@ def run_live_verification() -> dict[str, Any]:
             "liveness_validation": "passed",
             "provider_generate_calls": len(provider.generate_calls),
             "provider_generate_json_calls": len(provider.generate_json_calls),
+            "baseline_snapshot_id": blog_baseline["id"],
+            "baseline_snapshot_content_size": len(blog_baseline["content"].encode("utf-8")),
+            "baseline_test_scaffolding_markers": baseline_markers,
+            "narrative_test_scaffolding_markers": _test_scaffolding_markers(
+                blog_change["narrative_summary"]
+            ),
         }
+        if blog_evidence["narrative_test_scaffolding_markers"]:
+            raise AssertionError(
+                "fresh Lyfe simulation narrative mentioned test scaffolding: "
+                f"{blog_evidence['narrative_test_scaffolding_markers']}"
+            )
 
         provider.generate_calls.clear()
         provider.generate_json_calls.clear()
