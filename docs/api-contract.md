@@ -4,6 +4,10 @@ Source of truth for every request the frontend makes to the backend. Update this
 file as each endpoint is finalized and freeze it before the Step 4 integration
 pass.
 
+**Frozen baseline:** this contract is frozen as of the Step 4 integration-pass
+checkpoint on 2026-09-09. Any future API change must be deliberate, reviewed,
+and documented here; frontend/backend behavior must not drift silently.
+
 Base URL (development): `http://localhost:5000/api`
 
 The current PoC has no authentication boundary. The demo UI supplies a
@@ -103,7 +107,8 @@ collection. A candidate is persisted with `active=false` until activation.
   [{
     "id", "competitor_id", "raw_url", "url", "page_type",
     "discovery_status", "classification_method", "active",
-    "check_interval_minutes", "created_at", "updated_at"
+    "check_interval_minutes", "last_checked_at", "last_changed_at",
+    "created_at", "updated_at"
   }]
   ```
 
@@ -220,10 +225,15 @@ Read the newest change feed. It never creates or mutates records.
 
   ```json
   [{
-    "id", "monitoring_target_id", "change_type", "summary",
-    "detected_at", "status", "is_simulated"
+    "id", "monitoring_target_id", "previous_snapshot_id",
+    "current_snapshot_id", "change_type", "summary", "detected_at",
+    "status", "is_simulated", "created_at", "updated_at"
   }]
   ```
+
+  For backwards compatibility, older real change records may omit
+  `is_simulated`; an omitted field means `false`. Simulated records and
+  simulation responses always include `is_simulated: true`.
 
 ### `GET /changes/<id>`
 
@@ -309,3 +319,14 @@ persists a new snapshot and one or more change records with
 `is_simulated: true`. It does not update the target's real monitoring
 baseline. The next genuine `monitor_target` comparison explicitly excludes
 simulated snapshots and uses the newest non-simulated snapshot.
+
+## Step 4 contract audit checkpoint (2026-09-09)
+
+The registered Flask routes and the Django API client were audited together
+against this frozen document. Every actual frontend call uses the documented
+method, path, query/body fields, and success/error handling. Every registered
+backend endpoint is represented above, including the PoC discovery-run status
+and simulation endpoints. One documentation gap was found and corrected: real
+legacy change rows may omit `is_simulated`, while simulated rows include it as
+`true`; the frontend treats an omitted flag as false. No backend or frontend
+code change was required for this audit.

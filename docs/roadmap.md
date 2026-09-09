@@ -67,22 +67,50 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
 
 ## Step 3: Frontend (Django) — Website Monitoring Only
 
-- [ ] 3.1 API client layer: single module wrapping all Flask backend calls (no scattered fetch calls in views/templates)
-- [ ] 3.2 Main dashboard: recent updates feed (competitor, change summary, timestamp)
-- [ ] 3.3 Competitor management page: add/remove competitor, manage website URL (no social fields yet)
-- [ ] 3.4 Layer 1 UX: show SUGGESTED candidates for review (with a "show discarded" toggle), let user activate/edit/discard — every action writes through the API, not directly to the DB
-- [ ] 3.5 Layer 2 page list per competitor: activate/deactivate/remove
-- [ ] 3.6 Manual "Add Layer 2 Page" form
-- [ ] 3.7 Read API contract from /docs/api-contract.md rather than assuming backend shapes
+- [x] 3.1 API client layer: single module wrapping all Flask backend calls (no scattered fetch calls in views/templates)
+- [x] 3.2 Main dashboard: recent updates feed (competitor, change summary, timestamp)
+- [x] 3.3 Competitor management page: add/remove competitor, manage website URL (no social fields yet)
+- [x] 3.4 Layer 1 UX: show SUGGESTED candidates for review (with a "show discarded" toggle), let user activate/edit/discard — every action writes through the API, not directly to the DB
+- [x] 3.5 Layer 2 page list per competitor: activate/deactivate/remove
+- [x] 3.6 Manual "Add Layer 2 Page" form
+- [x] 3.7 Read API contract from /docs/api-contract.md rather than assuming backend shapes
+
+### Step 3 reconciliation (Step 4 checkpoint, 2026-09-09)
+
+All seven original Step 3 items are genuinely covered by the merged Django PoC
+frontend: `monitoring/api_client/client.py` is the single Flask boundary;
+dashboard, competitor management, candidate review, target management, and
+manual-target templates are wired to it; and the implementation/audit used
+`docs/api-contract.md` as the request/response source of truth. No Step 3 item
+remains missing. The PoC scope does not add social fields, consistent with the
+Step 3 requirement to defer social monitoring.
 
 ## Step 4: Backend/Frontend Integration Pass (2 agents) — Website Monitoring Only
 
-- [ ] 4.1 Freeze /docs/api-contract.md as the shared source of truth before starting this step
-- [ ] 4.2 Backend agent: verify every endpoint matches the frozen contract exactly
-- [ ] 4.3 Frontend agent: verify every API client call matches the frozen contract exactly
-- [ ] 4.4 End-to-end pass: add competitor → Layer 1 discovery → activate Layer 2 target → monitoring run → change detected → dashboard shows it
-- [ ] 4.5 Fix contract mismatches found during integration (update api-contract.md, not just the code)
-- [ ] 4.6 Reliability check: failed monitoring run doesn't break dashboard, doesn't overwrite last snapshot
+- [x] 4.1 Freeze /docs/api-contract.md as the shared source of truth before starting this step
+- [x] 4.2 Backend agent: verify every endpoint matches the frozen contract exactly
+- [x] 4.3 Frontend agent: verify every API client call matches the frozen contract exactly
+- [x] 4.4 End-to-end pass: add competitor → Layer 1 discovery → activate Layer 2 target → monitoring run → change detected → dashboard shows it
+- [x] 4.5 Fix contract mismatches found during integration (update api-contract.md, not just the code)
+- [x] 4.6 Reliability check: failed monitoring run doesn't break dashboard, doesn't overwrite last snapshot
+
+### Step 4 integration-pass evidence (TON-29, 2026-09-09)
+
+- 4.1 is frozen in `docs/api-contract.md`, with an explicit no-silent-drift
+  checkpoint note.
+- 4.2/4.3 found no method/path/request/status mismatches. The only finding was
+  a response-documentation gap: older real change rows can omit
+  `is_simulated`; the contract now records that omission as false.
+- 4.4 was exercised as one continuous live PoC walkthrough for Marketing Eye →
+  Lyfe Marketing and The Athletes Foot → JD Sports AU, including the JD
+  `PRODUCT_LISTING` price simulation and company-scope switch.
+- 4.5 required a contract documentation correction only; no runtime code fix
+  was required.
+- 4.6 used an injected fetch failure on Lyfe's real `/blog` target. The run was
+  persisted as `FAILED`, no snapshot or change was created, and the prior real
+  snapshot remained byte-for-byte unchanged. The dashboard and changes feed
+  rendered normally; the UI does not currently surface failed monitoring runs,
+  which remains a known PoC limitation.
 
 ## PoC-specific backend slice (TON-27)
 
