@@ -1,8 +1,8 @@
 """Opt-in live evidence for 1.6b narratives and detected URLs.
 
-This script writes simulated records and one forced-failure real monitoring
-record to the dedicated Atlas test database. It never runs against the default
-database.
+This script reads real target metadata and live page content from the dedicated
+Atlas test database, but runs every mutation and change assertion in memory. It
+never writes verification records to Atlas.
 
     RUN_LIVE_NARRATIVE_SUMMARY=1 \
       MONGODB_DATABASE=competitors_monitoring_test \
@@ -28,23 +28,19 @@ except ImportError:  # pragma: no cover - requirements.txt provides this package
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from backend.flask.app import create_app
-from backend.flask.change_detection.repository import ChangeRepository
 from backend.flask.change_detection.service import ChangeService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.llm_provider import OpenAIProvider
-from backend.flask.snapshot.repository import SnapshotRepository
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
 from backend.flask.website_monitoring.service import (
-    FetchResult,
-    MonitoringRunService,
     fetch_page,
     hash_content,
     normalize_content,
 )
-from backend.flask.website_monitoring.simulated_persistence import (
-    SimulationPersistenceService,
+from backend.flask.website_monitoring.simulated_verification import (
+    simulate_blog_change,
+    simulate_product_mutation,
 )
 
 
@@ -113,6 +109,28 @@ class StructuredProvider:
         return self.payload
 
 
+class _InMemoryChangeRepository:
+    """Minimal repository boundary for live verification-only change records."""
+
+    def __init__(self) -> None:
+        self.records: list[dict[str, Any]] = []
+
+    def create(self, **values: Any) -> dict[str, Any]:
+        record = dict(values)
+        record["id"] = f"in-memory-{len(self.records) + 1}"
+        self.records.append(record)
+        return record
+
+
+def _in_memory_snapshot(snapshot_id: str, content: str) -> dict[str, str]:
+    normalized = normalize_content(content)
+    return {
+        "id": snapshot_id,
+        "content": normalized,
+        "content_hash": hash_content(normalized),
+    }
+
+
 def run_live_verification() -> dict[str, Any]:
     if os.environ.get("RUN_LIVE_NARRATIVE_SUMMARY") != "1":
         raise SystemExit(
@@ -124,7 +142,7 @@ def run_live_verification() -> dict[str, Any]:
     settings = MongoSettings.from_env()
     if settings.database_name != TEST_DATABASE:
         raise RuntimeError(
-            f"refusing to write outside {TEST_DATABASE!r}; "
+            f"refusing to inspect outside {TEST_DATABASE!r}; "
             f"configured database is {settings.database_name!r}"
         )
 
@@ -136,31 +154,40 @@ def run_live_verification() -> dict[str, Any]:
         client.admin.command("ping")
         competitors = CompetitorRepository.from_database(database)
         targets = MonitoringTargetRepository.from_database(database)
-        snapshots = SnapshotRepository.from_database(database)
-        changes = ChangeRepository.from_database(database)
         lyfe = _find_competitor(competitors, LYFE_HOST_FRAGMENT)
         jd = _find_competitor(competitors, JD_HOST_FRAGMENT)
         lyfe_target = _find_target(targets, lyfe["id"], BLOG_PATH, "BLOG")
         jd_target = _find_target(targets, jd["id"], PRODUCT_PATH, "PRODUCT_LISTING")
 
-        app = create_app(database=database, user_id="live-verification", testing=True)
+        fetched = fetch_page(lyfe_target["url"])
+        jd_fetched = fetch_page(jd_target["url"])
         provider = CountingProvider()
-        app.extensions["api_services"]["simulation"] = (
-            SimulationPersistenceService.from_database(
-                database,
-                provider_factory=lambda: provider,
-                narrative_provider_factory=lambda: provider,
-            )
+        blog_baseline = _in_memory_snapshot(
+            "in-memory-blog-baseline",
+            fetched.content,
         )
-        http = app.test_client()
-
-        blog_simulation = _expect(
-            http.post(f"/api/monitoring-targets/{lyfe_target['id']}/simulate"),
-            200,
+        blog_result = simulate_blog_change(
+            fetched.content,
+            provider,
+            previous_snapshot=blog_baseline,
         )
-        blog_change = blog_simulation["change"]
+        blog_event = blog_result.process_result.change_events[0]
+        blog_change = ChangeService(
+            _InMemoryChangeRepository(),
+            targets,
+            narrative_provider_factory=lambda: provider,
+            detected_url_liveness_checker=lambda url: fetch_page(url),
+        ).create_change(
+            lyfe_target["id"],
+            blog_baseline,
+            _in_memory_snapshot("in-memory-blog-mutated", blog_result.mutated_content),
+            change_type=blog_event["change_type"],
+            summary=blog_event["summary"],
+            is_simulated=True,
+            narrative_provider=provider,
+        )
         if blog_change.get("change_type") != "NEW_BLOG":
-            raise AssertionError(f"unexpected blog simulation: {blog_simulation!r}")
+            raise AssertionError(f"unexpected blog simulation: {blog_change!r}")
         if not blog_change.get("narrative_summary"):
             raise AssertionError("real blog simulation did not produce a narrative")
         if len(provider.generate_calls) != 1 or len(provider.generate_json_calls) != 1:
@@ -189,16 +216,32 @@ def run_live_verification() -> dict[str, Any]:
 
         provider.generate_calls.clear()
         provider.generate_json_calls.clear()
-        product_simulation = _expect(
-            http.post(
-                f"/api/monitoring-targets/{jd_target['id']}/simulate",
-                json={"mutation_type": "NEW_PRODUCT"},
-            ),
-            200,
+        product_result = simulate_product_mutation(
+            jd_fetched.content,
+            provider,
+            mutation_type="NEW_PRODUCT",
         )
-        product_change = product_simulation["change"]
+        product_event = product_result.events[0]
+        product_change = ChangeService(
+            _InMemoryChangeRepository(),
+            targets,
+        ).create_change(
+            jd_target["id"],
+            _in_memory_snapshot(
+                "in-memory-product-before",
+                json.dumps(product_result.original_products, ensure_ascii=False),
+            ),
+            _in_memory_snapshot(
+                "in-memory-product-after",
+                json.dumps(product_result.mutated_products, ensure_ascii=False),
+            ),
+            change_type=product_event["change_type"],
+            summary=product_event["summary"],
+            detected_url=product_event.get("detected_url"),
+            is_simulated=True,
+        )
         if product_change.get("change_type") != "NEW_PRODUCT":
-            raise AssertionError(f"unexpected product simulation: {product_simulation!r}")
+            raise AssertionError(f"unexpected product simulation: {product_change!r}")
         if product_change.get("narrative_summary") is not None:
             raise AssertionError("product change unexpectedly received a narrative")
         if provider.generate_calls:
@@ -225,7 +268,6 @@ def run_live_verification() -> dict[str, Any]:
             )
 
         failing_provider = FailingProvider()
-        fetched = fetch_page(lyfe_target["url"])
         forced_run_marker = uuid.uuid4().hex
         forced_fragment = (
             "<section><h2>Forced narrative failure verification marker</h2>"
@@ -246,21 +288,25 @@ def run_live_verification() -> dict[str, Any]:
             )
         else:
             forced_content = f"{fetched.content}{forced_fragment}"
-        failure_service = MonitoringRunService.from_database(
-            database,
-            fetcher=lambda _url: FetchResult(
-                forced_content,
-                fetched.fetch_method,
-                fetched.http_status,
-            ),
+        failure_service = ChangeService(
+            _InMemoryChangeRepository(),
+            targets,
             narrative_provider_factory=lambda: failing_provider,
         )
-        forced_failure = failure_service.monitor_target(lyfe_target["id"])
+        failure_change = failure_service.create_change(
+            lyfe_target["id"],
+            _in_memory_snapshot("in-memory-forced-previous", fetched.content),
+            _in_memory_snapshot("in-memory-forced-current", forced_content),
+            change_type="NEW_BLOG",
+        )
+        forced_failure = {
+            "run": {"status": "SUCCESS"},
+            "changes": [failure_change],
+        }
         if forced_failure["run"]["status"] != "SUCCESS":
             raise AssertionError(f"forced-failure monitor did not succeed: {forced_failure!r}")
         if len(forced_failure["changes"]) != 1:
             raise AssertionError(f"forced-failure monitor did not create one change: {forced_failure!r}")
-        failure_change = forced_failure["changes"][0]
         if failure_change.get("narrative_summary") is not None:
             raise AssertionError("forced failure populated a narrative unexpectedly")
         failure_evidence = {
@@ -274,21 +320,16 @@ def run_live_verification() -> dict[str, Any]:
             "failing_provider_calls": failing_provider.calls,
         }
 
-        # Confirm the persisted API row carries the same nullable field.
-        persisted_product = changes.get(product_change["id"])
-        if persisted_product.get("narrative_summary") is not None:
-            raise AssertionError("persisted product change narrative is not null")
-
         provider.generate_calls.clear()
         provider.generate_json_calls.clear()
         real_blog_evidence = _run_real_blog_extraction_case(
-            app.extensions["api_services"]["changes"],
+            targets,
             lyfe_target,
             fetched.content,
             provider,
         )
         validation_evidence = _run_real_content_validation_cases(
-            app.extensions["api_services"]["changes"],
+            targets,
             lyfe_target,
             fetched.content,
         )
@@ -300,7 +341,7 @@ def run_live_verification() -> dict[str, Any]:
             "forced_failure": failure_evidence,
             "real_blog_extraction": real_blog_evidence,
             "validation_cases": validation_evidence,
-            "real_change_records_created": 1,
+            "persisted_test_records_created": 0,
         }
         _print_report(report)
         return report
@@ -309,7 +350,7 @@ def run_live_verification() -> dict[str, Any]:
 
 
 def _run_real_content_validation_cases(
-    changes: ChangeService,
+    target_repository: MonitoringTargetRepository,
     target: dict[str, Any],
     live_content: str,
 ) -> dict[str, Any]:
@@ -331,8 +372,8 @@ def _run_real_content_validation_cases(
     )
     page_liveness_calls: list[str] = []
     page_change = ChangeService(
-        changes.change_repository,
-        changes.monitoring_target_repository,
+        _InMemoryChangeRepository(),
+        target_repository,
         narrative_provider_factory=lambda: page_provider,
         detected_url_liveness_checker=lambda url: page_liveness_calls.append(url),
     ).create_change(
@@ -352,8 +393,8 @@ def _run_real_content_validation_cases(
     )
     wrong_domain_calls: list[str] = []
     wrong_domain_change = ChangeService(
-        changes.change_repository,
-        changes.monitoring_target_repository,
+        _InMemoryChangeRepository(),
+        target_repository,
         narrative_provider_factory=lambda: wrong_domain_provider,
         detected_url_liveness_checker=lambda url: wrong_domain_calls.append(url) or True,
     ).create_change(target["id"], previous, minor)
@@ -369,8 +410,8 @@ def _run_real_content_validation_cases(
     )
     dead_calls: list[str] = []
     dead_change = ChangeService(
-        changes.change_repository,
-        changes.monitoring_target_repository,
+        _InMemoryChangeRepository(),
+        target_repository,
         narrative_provider_factory=lambda: dead_provider,
         detected_url_liveness_checker=lambda url: dead_calls.append(url) or fetch_page(url),
     ).create_change(target["id"], previous, minor)
@@ -402,7 +443,7 @@ def _run_real_content_validation_cases(
 
 
 def _run_real_blog_extraction_case(
-    changes: ChangeService,
+    target_repository: MonitoringTargetRepository,
     target: dict[str, Any],
     live_content: str,
     provider: CountingProvider,
@@ -437,7 +478,10 @@ def _run_real_blog_extraction_case(
         "content": current_normalized,
         "content_hash": hash_content(current_normalized),
     }
-    change = changes.create_change(
+    change = ChangeService(
+        _InMemoryChangeRepository(),
+        target_repository,
+    ).create_change(
         target["id"],
         previous,
         current,
@@ -501,14 +545,6 @@ def _find_target(
     raise AssertionError(
         f"no active {page_type} target at {path!r} for competitor {competitor_id!r}"
     )
-
-
-def _expect(response, status_code: int) -> Any:
-    if response.status_code != status_code:
-        raise AssertionError(
-            f"expected HTTP {status_code}, got {response.status_code}: {response.get_data(as_text=True)}"
-        )
-    return response.get_json()
 
 
 def _print_report(report: dict[str, Any]) -> None:

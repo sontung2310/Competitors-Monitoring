@@ -178,6 +178,7 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, "change-mechanical")
         self.assertContains(response, 'href="https://www.lyfemarketing.com/blog/new-article"')
         self.assertContains(response, "Detected page")
+        self.assertContains(response, "Tracked page:")
 
     def test_removed_product_link_has_last_known_warning_treatment(self):
         self.client_data.changes.append(
@@ -198,6 +199,15 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, "Last known URL — may no longer be available")
         self.assertContains(response, 'href="https://www.lyfemarketing.com/product/gone"')
         self.assertContains(response, "change-detected-link-removed")
+
+    def test_identical_detected_and_tracked_urls_render_one_tracked_link(self):
+        self.client_data.changes[0]["detected_url"] = TARGET["url"]
+        response = self.client.get("/changes/?company_id=company-marketing-eye")
+
+        self.assertContains(response, "Tracked page:")
+        self.assertNotContains(response, "Detected page")
+        self.assertContains(response, 'href="https://www.lyfemarketing.com/blog"')
+        self.assertEqual(response.content.decode().count("Tracked page:"), 1)
 
     def test_manual_target_error_uses_exact_backend_message(self):
         self.client_data.manual_error = True

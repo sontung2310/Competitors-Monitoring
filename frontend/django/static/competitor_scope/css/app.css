@@ -135,6 +135,8 @@ button, a { -webkit-tap-highlight-color: transparent; }
 .change-mechanical { margin-top: 4px; color: var(--color-text-muted); font-size: 13px; }
 .change-target, .change-time, .price-detail { margin-top: 4px; color: var(--color-text-muted); font-size: 13px; }
 .change-target { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.change-target-link { display: flex; gap: 4px; min-width: 0; }
+.change-target-link a { min-width: 0; overflow: hidden; color: inherit; text-overflow: ellipsis; white-space: nowrap; }
 .change-detected-link { display: flex; flex-direction: column; align-items: flex-start; gap: 3px; margin-top: 10px; min-width: 0; }
 .change-detected-link a { color: var(--color-primary); font-size: 13px; font-weight: 600; line-height: 1.35; text-decoration: none; overflow-wrap: anywhere; }
 .change-detected-link a:hover { text-decoration: underline; }
