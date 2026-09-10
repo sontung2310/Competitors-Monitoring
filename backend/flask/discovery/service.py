@@ -25,6 +25,7 @@ from .classification import (
     OpenAIClassifierConfigurationError,
     classify_by_rules,
     classify_candidates,
+    resolve_classifier_batch_size,
 )
 from .normalization import (
     ITEM_TYPE_EXCLUSION_PATTERNS,
@@ -35,6 +36,7 @@ from .normalization import (
     is_same_site,
     is_system_path,
     is_structural_path,
+    extract_meta_description,
     normalize_url,
 )
 from .sources import (
@@ -138,6 +140,7 @@ class _NormalizedCandidate:
     url: str
     source: str
     title: str | None = None
+    meta_description: str | None = None
     force_discarded: bool = False
     priority: int = 3
 
@@ -182,6 +185,7 @@ class DiscoveryService:
         liveness_attempts: int = DEFAULT_LIVENESS_ATTEMPTS,
         liveness_backoff_seconds: float = DEFAULT_LIVENESS_BACKOFF_SECONDS,
         liveness_sleep: Optional[Callable[[float], None]] = None,
+        classifier_batch_size: int | None = None,
         run_repository: Optional[DiscoveryRunTracker] = None,
     ) -> None:
         if (
@@ -199,6 +203,7 @@ class DiscoveryService:
         self.competitor_repository = competitor_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.fallback_classifier = fallback_classifier or _default_classifier()
+        self.classifier_batch_size = resolve_classifier_batch_size(classifier_batch_size)
         # This is intentionally injected at the service boundary so tests can
         # avoid network access while production uses the Step 1.4 fetch
         # heuristic, including browser fallback.
@@ -674,11 +679,22 @@ class DiscoveryService:
             website_url=website_url,
         )
 
+        fetched_meta_descriptions: dict[str, str | None] = {}
+
+        def liveness_checker(url: str) -> FetchResult | bool:
+            result = self.liveness_checker(url)
+            if isinstance(result, FetchResult):
+                fetched_meta_descriptions[url] = extract_meta_description(result.content)
+            return result
+
         normalized = [
-            candidate
+            replace(
+                candidate,
+                meta_description=fetched_meta_descriptions.get(candidate.url),
+            )
             for candidate in _apply_liveness_gate(
                 normalized,
-                self.liveness_checker,
+                liveness_checker,
                 attempts=self.liveness_attempts,
                 backoff_seconds=self.liveness_backoff_seconds,
                 sleep=self.liveness_sleep,
@@ -690,12 +706,17 @@ class DiscoveryService:
                 raw_url=candidate.raw_url,
                 url=candidate.url,
                 title=candidate.title,
+                meta_description=candidate.meta_description,
                 sources=(candidate.source,),
                 force_discarded=candidate.force_discarded,
             )
             for candidate in normalized
         )
-        classifications = classify_candidates(classification_inputs, self.fallback_classifier)
+        classifications = classify_candidates(
+            classification_inputs,
+            self.fallback_classifier,
+            batch_size=self.classifier_batch_size,
+        )
 
         persisted: list[dict[str, Any]] = []
         for candidate, classification in zip(normalized, classifications):

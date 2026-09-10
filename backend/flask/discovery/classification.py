@@ -36,6 +36,7 @@ class CandidateForClassification:
     title: str | None = None
     sources: tuple[str, ...] = ()
     force_discarded: bool = False
+    meta_description: str | None = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,8 @@ class CandidateClassifier(Protocol):
 
 DEFAULT_CLASSIFIER_MODEL = "gpt-4o"
 CLASSIFIER_MODEL_ENV_VAR = "DISCOVERY_CLASSIFIER_MODEL"
+CLASSIFIER_BATCH_SIZE_ENV_VAR = "DISCOVERY_CLASSIFIER_BATCH_SIZE"
+DEFAULT_CLASSIFIER_BATCH_SIZE = 25
 OPENAI_API_KEY_ENV_VAR = "OPENAI_KEY"
 _ALLOWED_PAGE_TYPES = (
     "BLOG",
@@ -111,8 +114,9 @@ _OPENAI_RESPONSE_FORMAT = {
 
 _OPENAI_INSTRUCTIONS = """You classify unresolved Layer 1 website candidates for a production competitor-monitoring system.
 
-Use only the candidate URL, page title, and discovery source as evidence. Apply
-the index-vs-item distinction strictly. Mark a candidate SUGGESTED only when it
+Use only the candidate URL, page title, meta description, and discovery source
+as evidence. The meta description is optional and may be missing. Apply the
+index-vs-item distinction strictly. Mark a candidate SUGGESTED only when it
 represents a stable blog, news, press, pricing, product-listing, or durable
 service page that a production monitor should track over time. A durable
 service landing page may be SUGGESTED even when it is a flat slug and is not
@@ -221,6 +225,7 @@ class OpenAIClassifier:
                 "raw_url": candidate.raw_url,
                 "url": candidate.url,
                 "title": candidate.title,
+                "meta_description": candidate.meta_description,
                 "sources": list(candidate.sources),
             }
             for candidate in candidates
@@ -357,8 +362,12 @@ def classify_by_rules(
 def classify_candidates(
     candidates: Sequence[CandidateForClassification],
     fallback_classifier: CandidateClassifier,
+    *,
+    batch_size: int = DEFAULT_CLASSIFIER_BATCH_SIZE,
 ) -> tuple[ClassificationResult, ...]:
-    """Apply rules first and batch all unresolved candidates to the fallback."""
+    """Apply rules first and classify unresolved candidates in bounded batches."""
+
+    batch_size = resolve_classifier_batch_size(batch_size)
 
     rule_results: dict[str, ClassificationResult] = {}
     unresolved: list[CandidateForClassification] = []
@@ -377,21 +386,49 @@ def classify_candidates(
         else:
             rule_results[candidate.url] = result
 
-    fallback_results: Sequence[ClassificationResult] = ()
+    fallback_results: list[ClassificationResult] = []
     if unresolved:
-        try:
-            fallback_results = fallback_classifier.classify(tuple(unresolved))
-            _validate_fallback_results(unresolved, fallback_results)
-        except Exception as exc:
-            logger.warning(
-                "candidate fallback classification failed; retaining unresolved "
-                "candidates as discarded: %s",
-                exc,
-            )
-            fallback_results = DeterministicStubClassifier().classify(unresolved)
+        for batch_number, start in enumerate(range(0, len(unresolved), batch_size), 1):
+            batch = tuple(unresolved[start : start + batch_size])
+            try:
+                batch_results = fallback_classifier.classify(batch)
+                _validate_fallback_results(batch, batch_results)
+            except Exception as exc:
+                logger.warning(
+                    "candidate fallback classification batch failed; retaining "
+                    "batch as discarded batch=%d size=%d: %s",
+                    batch_number,
+                    len(batch),
+                    exc,
+                )
+                batch_results = DeterministicStubClassifier().classify(batch)
+            fallback_results.extend(batch_results)
     _validate_fallback_results(unresolved, fallback_results)
     all_results = {**rule_results, **{result.url: result for result in fallback_results}}
     return tuple(all_results[candidate.url] for candidate in candidates)
+
+
+def resolve_classifier_batch_size(
+    batch_size: int | None = None,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> int:
+    """Return a positive classifier batch size from an explicit value or env."""
+
+    if batch_size is None:
+        values = os.environ if environ is None else environ
+        raw_value = values.get(CLASSIFIER_BATCH_SIZE_ENV_VAR)
+        if raw_value is None or not raw_value.strip():
+            return DEFAULT_CLASSIFIER_BATCH_SIZE
+        try:
+            batch_size = int(raw_value)
+        except (TypeError, ValueError) as exc:
+            raise ClassificationError(
+                f"{CLASSIFIER_BATCH_SIZE_ENV_VAR} must be a positive integer"
+            ) from exc
+    if isinstance(batch_size, bool) or not isinstance(batch_size, int) or batch_size < 1:
+        raise ClassificationError("classifier batch_size must be a positive integer")
+    return batch_size
 
 
 def _validate_fallback_results(
