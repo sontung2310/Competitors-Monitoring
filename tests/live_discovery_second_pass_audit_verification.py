@@ -36,8 +36,10 @@ from backend.flask.discovery.sources import DiscoveredURL
 from backend.flask.website_monitoring.service import FetchResult
 
 
-SITE_ID = "lyfemarketing.com"
-SITE_URL = "https://www.lyfemarketing.com/"
+SITES = (
+    ("lyfemarketing.com", "https://www.lyfemarketing.com/"),
+    ("jd-sports.com.au", "https://www.jd-sports.com.au/"),
+)
 
 
 class _MemoryCompetitorRepository:
@@ -146,14 +148,14 @@ class _FailingAudit:
         raise RuntimeError("forced audit outage")
 
 
-def _run_real_site() -> dict[str, object]:
+def _run_real_site(site_id: str, site_url: str) -> dict[str, object]:
     try:
         classifier = OpenAIClassifier.from_env()
         auditor = _RecordingAudit(OpenAIDiscoveryAudit.from_env())
     except Exception as exc:
         raise SystemExit(f"OpenAI provider configuration failed: {exc}") from exc
 
-    competitors = _MemoryCompetitorRepository(SITE_ID, SITE_URL)
+    competitors = _MemoryCompetitorRepository(site_id, site_url)
     targets = _MemoryTargetRepository()
     service = DiscoveryService(
         competitors,
@@ -161,18 +163,25 @@ def _run_real_site() -> dict[str, object]:
         fallback_classifier=classifier,
         audit_classifier=auditor,
     )
-    results = service.discover_website(SITE_ID, user_id="live-second-pass-audit")
+    results = service.discover_website(site_id, user_id="live-second-pass-audit")
     if len(auditor.calls) != 1:
         raise AssertionError(f"expected one audit call, got {len(auditor.calls)}")
     audit_input = auditor.calls[0]
-    flagged_urls = [flag.url for flag in auditor.result.flagged_redundant]
-    flagged_rows = [row["url"] for row in results if row["url"] in flagged_urls]
-    if any(
-        row["discovery_status"] != "DISCARDED" for row in results if row["url"] in flagged_urls
-    ):
-        raise AssertionError("an audit-flagged suggestion was not discarded")
+    rows_by_url = {row["url"]: row for row in results}
+    redundancy_decisions = [
+        {
+            "url": flag.url,
+            "reason": flag.reason,
+            "outcome": (
+                rows_by_url[flag.url]["discovery_status"]
+                if flag.url in rows_by_url
+                else "IGNORED_UNKNOWN"
+            ),
+        }
+        for flag in auditor.result.flagged_redundant
+    ]
     report = {
-        "site": SITE_ID,
+        "site": site_id,
         "homepage": {
             "title": audit_input["homepage_title"],
             "meta_description": audit_input["homepage_meta_description"],
@@ -180,8 +189,7 @@ def _run_real_site() -> dict[str, object]:
         "first_pass_suggested_count": len(audit_input["candidates"]),
         "audit_call_count": len(auditor.calls),
         "audit_input_sample": [candidate.__dict__ for candidate in audit_input["candidates"][:10]],
-        "flagged_redundant": [flag.__dict__ for flag in auditor.result.flagged_redundant],
-        "flagged_redundant_rows_after_audit": flagged_rows,
+        "flagged_redundant": redundancy_decisions,
         "flagged_missing_categories": [
             flag.__dict__ for flag in auditor.result.flagged_missing_categories
         ],
@@ -194,7 +202,20 @@ def _run_real_site() -> dict[str, object]:
         "final_discarded_count": sum(
             row["discovery_status"] == "DISCARDED" for row in results
         ),
+        "remaining_suggested_urls": [
+            row["url"]
+            for row in results
+            if row["discovery_status"] == "SUGGESTED"
+        ],
     }
+    if site_id == "lyfemarketing.com" and any(
+        flag.page_type == "PRODUCTS"
+        for flag in auditor.result.flagged_missing_categories
+    ):
+        raise AssertionError(
+            "Lyfe is a service agency; PRODUCTS was still flagged despite the "
+            "positive-evidence plausibility rule"
+        )
     return report
 
 
@@ -211,8 +232,8 @@ def _build_forced_service(audit) -> DiscoveryService:
         robots_source=_StaticRobots(),
         sitemap_source=_StaticSource(
             (
-                DiscoveredURL("https://example.com/consulting", "SITEMAP"),
-                DiscoveredURL("https://example.com/strategy", "SITEMAP"),
+                DiscoveredURL("https://example.com/services", "SITEMAP"),
+                DiscoveredURL("https://example.com/men/services", "SITEMAP"),
             )
         ),
         link_source=_StaticSource(),
@@ -226,7 +247,7 @@ def _run_forced_checks() -> dict[str, object]:
             DiscoveryAuditResult(
                 flagged_redundant=(
                     RedundancyFlag(
-                        "https://example.com/strategy",
+                        "https://example.com/men/services",
                         "Duplicate service section.",
                     ),
                 ),
@@ -238,9 +259,9 @@ def _run_forced_checks() -> dict[str, object]:
         "forced", user_id="live-second-pass-audit"
     )
     statuses = {row["url"]: row["discovery_status"] for row in redundancy_rows}
-    if statuses["https://example.com/strategy"] != "DISCARDED":
+    if statuses["https://example.com/men/services"] != "DISCARDED":
         raise AssertionError(f"forced redundancy was not discarded: {statuses}")
-    if statuses["https://example.com/consulting"] != "SUGGESTED":
+    if statuses["https://example.com/services"] != "SUGGESTED":
         raise AssertionError(f"unflagged suggestion changed: {statuses}")
 
     failure_service = _build_forced_service(_FailingAudit())
@@ -265,7 +286,18 @@ def run_live_verification() -> None:
         raise SystemExit(
             "Set RUN_LIVE_DISCOVERY_SECOND_PASS_AUDIT=1 to run live verification"
         )
-    print(json.dumps({"real_site": _run_real_site(), "forced_checks": _run_forced_checks()}, indent=2))
+    print(
+        json.dumps(
+            {
+                "real_sites": [
+                    _run_real_site(site_id, site_url)
+                    for site_id, site_url in SITES
+                ],
+                "forced_checks": _run_forced_checks(),
+            },
+            indent=2,
+        )
+    )
 
 
 if __name__ == "__main__":

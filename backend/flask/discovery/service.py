@@ -882,10 +882,27 @@ class DiscoveryService:
             if flag.url in seen_urls:
                 continue
             seen_urls.add(flag.url)
+            if not _is_high_confidence_redundancy(flag.reason):
+                logger.warning(
+                    "discovery audit ignored low-confidence redundancy "
+                    "competitor=%s url=%s reason=%s",
+                    competitor_id,
+                    flag.url,
+                    flag.reason,
+                )
+                continue
             row = rows_by_url.get(flag.url)
             if row is None:
                 logger.warning(
                     "discovery audit ignored unknown/non-suggested URL competitor=%s url=%s",
+                    competitor_id,
+                    flag.url,
+                )
+                continue
+            if not _has_structural_redundancy(flag.url, rows_by_url):
+                logger.warning(
+                    "discovery audit ignored structurally unproven redundancy "
+                    "competitor=%s url=%s",
                     competitor_id,
                     flag.url,
                 )
@@ -1071,6 +1088,60 @@ def _is_active_target(candidate: Mapping[str, Any]) -> bool:
         candidate.get("active") is True
         and candidate.get("discovery_status") == "ACTIVE"
     )
+
+
+_REDUNDANCY_HEDGE_TERMS = (
+    "likely",
+    "possibly",
+    "could be",
+    "might be",
+    "may be",
+    "appears to",
+    "unless",
+)
+
+
+def _is_high_confidence_redundancy(reason: str) -> bool:
+    """Reject speculative model flags before they can narrow production data."""
+
+    normalized = reason.casefold()
+    return not any(term in normalized for term in _REDUNDANCY_HEDGE_TERMS)
+
+
+def _has_structural_redundancy(
+    url: str,
+    rows_by_url: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Require an obvious URL relationship before auto-discarding a row.
+
+    A flat, descriptive page such as ``/pittsburgh-seo-company`` is not
+    automatically redundant with ``/services`` just because both were typed
+    SERVICES. Nested section/filter variants such as ``/men/sale`` versus
+    ``/sale`` are structurally comparable and can be narrowed when the audit
+    also supplies a high-confidence reason.
+    """
+
+    candidate = urlsplit(url)
+    candidate_path = [part for part in candidate.path.split("/") if part]
+    for other_url in rows_by_url:
+        if other_url == url:
+            continue
+        other = urlsplit(other_url)
+        if candidate.netloc != other.netloc:
+            continue
+        if candidate.path == other.path and candidate.query != other.query:
+            return True
+        other_path = [part for part in other.path.split("/") if part]
+        if not candidate_path or not other_path or len(candidate_path) == len(other_path):
+            continue
+        shorter, longer = (
+            (candidate_path, other_path)
+            if len(candidate_path) < len(other_path)
+            else (other_path, candidate_path)
+        )
+        if longer[: len(shorter)] == shorter or longer[-len(shorter) :] == shorter:
+            return True
+    return False
 
 
 def _candidate_url_for_competitor(url: str, competitor_url: str) -> str:

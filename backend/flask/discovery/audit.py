@@ -122,16 +122,37 @@ _OPENAI_INSTRUCTIONS = """You perform one holistic second-pass audit of a produc
 competitor's already-classified SUGGESTED discovery list.
 
 Review the complete list together, using each candidate's URL, page type, title,
-and meta description plus the competitor homepage metadata for business context.
-Flag only narrow or redundant SUGGESTED entries that should be discarded because
-another entry in the supplied list covers the same section. Also flag core page
-types that appear surprisingly absent given the homepage context. The fixed core
-types are BLOG, NEWS, PRICING, PRODUCTS, SERVICES, and PRESS.
+and meta description plus the competitor homepage title/meta description for
+business context. The fixed core types are BLOG, NEWS, PRICING, PRODUCTS,
+SERVICES, and PRESS.
+
+For flagged_redundant, flag only a narrow or duplicate SUGGESTED entry that is
+actually covered by another entry in the supplied list. Give the specific
+overlap in the reason and use high-confidence language. Do not discard a page
+merely because it is a specialized service, location, or product variant. A
+broader SERVICES or PRODUCTS page does not make a distinct child page redundant
+by itself; leave that child SUGGESTED unless the supplied metadata clearly shows
+it is only a filtered/parameter variant or an actual duplicate. If unsure, do
+not flag it. Reasons based on "likely", "possibly", "could", or similar
+speculation are not actionable.
+
+For flagged_missing_categories, use a high-confidence plausibility test, not a
+mechanical presence check. A missing category is flaggable only when BOTH are
+true: (1) the homepage metadata or the supplied candidate metadata contains
+positive evidence that this business explicitly references or strongly implies
+that category, and (2) no supplied SUGGESTED candidate represents it. Quote or
+describe that positive evidence in the reason. The absence of a category by
+itself is never evidence and must produce no flag. In particular, a service,
+consulting, or agency business should not be flagged for missing PRODUCTS unless
+the evidence says it sells products, an ecommerce catalog, or a retail range;
+the same business may reasonably have no NEWS, PRICING, or PRESS page. A retailer
+may plausibly have PRODUCTS, but still do not flag BLOG, NEWS, PRICING, or PRESS
+without positive evidence. When business shape is ambiguous, omit the flag.
 
 This pass is strictly narrowing and cannot add anything. Never invent a URL,
 flag a URL that is not in the supplied SUGGESTED list, or promote a discarded
 candidate. Missing-category flags are informational only. Return both arrays,
-even when either array is empty, with concise reasons."""
+even when either array is empty, and prefer an empty array over speculative noise."""
 
 
 class NoopDiscoveryAudit:

@@ -439,9 +439,16 @@ class DiscoveryTests(unittest.TestCase):
         )
 
         request = json.loads(provider.calls[0]["prompt"])
+        instructions = provider.calls[0]["instructions"]
         self.assertEqual(request["core_page_types"], list(CORE_PAGE_TYPES))
         self.assertEqual(request["suggested_candidates"][0]["meta_description"], "Service summary")
         self.assertEqual(request["homepage"]["title"], "Example homepage")
+        self.assertIn("positive evidence", instructions)
+        self.assertIn("absence of a category", instructions.lower())
+        self.assertIn("never evidence", instructions.lower())
+        self.assertIn("consulting, or agency business", instructions)
+        self.assertIn("speculation", instructions)
+        self.assertIn("prefer an empty array over speculative noise", instructions)
         self.assertEqual(result.flagged_redundant[0].url, "https://example.com/services/one")
         self.assertEqual(result.flagged_missing_categories[0].page_type, "BLOG")
 
@@ -466,7 +473,7 @@ class DiscoveryTests(unittest.TestCase):
             DiscoveryAuditResult(
                 flagged_redundant=(
                     RedundancyFlag(
-                        "https://example.com/strategy",
+                        "https://example.com/men/services",
                         "Duplicate of the first services entry.",
                     ),
                     RedundancyFlag(
@@ -493,8 +500,8 @@ class DiscoveryTests(unittest.TestCase):
             robots_source=_Robots(),
             sitemap_source=_Source(
                 (
-                    DiscoveredURL("https://example.com/consulting", "SITEMAP"),
-                    DiscoveredURL("https://example.com/strategy", "SITEMAP"),
+                    DiscoveredURL("https://example.com/services", "SITEMAP"),
+                    DiscoveredURL("https://example.com/men/services", "SITEMAP"),
                 )
             ),
             link_source=_Source(
@@ -516,8 +523,8 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(
             [candidate.url for candidate in audit.calls[0]["candidates"]],
             [
-                "https://example.com/consulting",
-                "https://example.com/strategy",
+                "https://example.com/services",
+                "https://example.com/men/services",
             ],
         )
         self.assertEqual(
@@ -564,6 +571,86 @@ class DiscoveryTests(unittest.TestCase):
         self.assertIsNotNone(service.last_audit_error)
         self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
         self.assertNotIn("discovery_gap_flags", competitor)
+
+    def test_second_pass_audit_ignores_speculative_redundancy_flags(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/consulting",
+                        "This is likely covered by the broader services page.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/consulting", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
+
+    def test_second_pass_audit_requires_structural_overlap_for_flat_service_pages(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/pittsburgh-seo-company",
+                        "Duplicate of the general services page.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL("https://example.com/services", "SITEMAP"),
+                    DiscoveredURL(
+                        "https://example.com/pittsburgh-seo-company", "SITEMAP"
+                    ),
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(
+            [row["discovery_status"] for row in persisted],
+            ["SUGGESTED", "SUGGESTED"],
+        )
 
     def test_classifier_batch_size_can_be_configured(self):
         self.assertEqual(resolve_classifier_batch_size(environ={}), 25)
