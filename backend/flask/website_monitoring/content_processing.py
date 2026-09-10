@@ -369,7 +369,7 @@ def diff_by_key(
 
 
 class ProductListingProcessor:
-    """Process ``PRODUCT_LISTING`` pages as a canonical keyed product list."""
+    """Process ``PRODUCTS``/``PRODUCT_LISTING`` pages as keyed product lists."""
 
     def process(
         self,
@@ -498,7 +498,7 @@ def resolve_content_processor(
     processor = configured.get(normalized_page_type)
     if processor is not None:
         return processor
-    if normalized_page_type == "PRODUCT_LISTING":
+    if normalized_page_type in {"PRODUCTS", "PRODUCT_LISTING"}:
         return ProductListingProcessor()
     return TextBlobProcessor(page_type=normalized_page_type)
 

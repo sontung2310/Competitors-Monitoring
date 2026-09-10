@@ -67,26 +67,12 @@ DEFAULT_CLASSIFIER_MODEL = "gpt-4o"
 CLASSIFIER_MODEL_ENV_VAR = "DISCOVERY_CLASSIFIER_MODEL"
 OPENAI_API_KEY_ENV_VAR = "OPENAI_KEY"
 _ALLOWED_PAGE_TYPES = (
-    "PRICING",
     "BLOG",
     "NEWS",
+    "PRICING",
     "PRODUCTS",
-    "PRESS",
-    "CAREERS",
-    "TEAM",
-    "CEO",
-    "ABOUT",
     "SERVICES",
-    "CASE_STUDIES",
-    "SUCCESS_STORIES",
-    "TESTIMONIALS",
-    "REVIEWS",
-    "INDUSTRIES",
-    "CONTACT",
-    "WORK",
-    "RESULTS",
-    "PORTFOLIO",
-    "PACKAGES",
+    "PRESS",
     "OTHER",
 )
 _ALLOWED_DISCOVERY_STATUSES = ("SUGGESTED", "DISCARDED")
@@ -123,27 +109,25 @@ _OPENAI_RESPONSE_FORMAT = {
     },
 }
 
-_OPENAI_INSTRUCTIONS = """You classify unresolved Layer 1 website candidates for a competitor-monitoring system.
+_OPENAI_INSTRUCTIONS = """You classify unresolved Layer 1 website candidates for a production competitor-monitoring system.
 
 Use only the candidate URL, page title, and discovery source as evidence. Apply
 the index-vs-item distinction strictly. Mark a candidate SUGGESTED only when it
-represents a stable section, index, listing, overview, or durable service or
-industry offering that a competitor-monitoring user would reasonably review and
-track over time. A durable offering landing page may be SUGGESTED even when it
-is a flat slug and is not literally under /services or /industries; examples
-include a core paid-media service or an industry vertical. Do not suggest the
-homepage root URL (path "/") as a separate candidate.
+represents a stable blog, news, press, pricing, product-listing, or durable
+service page that a production monitor should track over time. A durable
+service landing page may be SUGGESTED even when it is a flat slug and is not
+literally under /services. Do not suggest the homepage root URL (path "/") as
+a separate candidate.
 
-Mark a candidate DISCARDED when it is an individual article, blog/news/press
-post, case study, testimonial, review, team member, job or role, product or
-package item, campaign, or other one-off content item. A flat descriptive slug
-is not an index merely because its words resemble a page type: for example, a
-slug ending in "review" is not a reviews index, and a slug beginning with
-"career" is not a careers index. When the URL does not identify a known
-section/index/listing or durable offering and the evidence is ambiguous, choose
-DISCARDED rather than guessing. Choose the most useful coarse page type for
-each candidate, but do not let the page type alone justify SUGGESTED. Return
-one classification for every candidate and do not invent URLs."""
+Mark a candidate DISCARDED with page_type OTHER when it is an individual item,
+one-off content, campaign, person, job, or any page that is not one of the six
+production types. A flat descriptive slug is not an index merely because its
+words resemble a page category. When the URL does not identify a known
+section/index/listing or durable service and the evidence is ambiguous, choose
+OTHER and DISCARDED rather than guessing. Choose only one of BLOG, NEWS,
+PRICING, PRODUCTS, SERVICES, PRESS, or OTHER; never invent another page type.
+The page type alone does not justify SUGGESTED. Return one classification for
+every candidate and do not invent URLs."""
 
 logger = logging.getLogger(__name__)
 
@@ -356,8 +340,6 @@ def classify_by_rules(
         item_page_types = {
             "product": "PRODUCTS",
             "products": "PRODUCTS",
-            "package": "PACKAGES",
-            "packages": "PACKAGES",
             "solution": "PRODUCTS",
             "solutions": "PRODUCTS",
         }
