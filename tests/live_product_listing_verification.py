@@ -173,7 +173,6 @@ def run_live_verification() -> dict[str, Any]:
                 change_type=event["change_type"],
                 summary=event["summary"],
                 detected_url=event.get("detected_url"),
-                is_simulated=True,
             )
             for event in expected_events
         ]

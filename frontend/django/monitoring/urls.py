@@ -49,10 +49,5 @@ urlpatterns = [
         views.delete_target,
         name="delete_target",
     ),
-    path(
-        "competitors/<str:competitor_id>/simulate/<str:target_id>/",
-        views.simulate_target,
-        name="simulate_target",
-    ),
     path("changes/", views.changes_feed, name="changes_feed"),
 ]

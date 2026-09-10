@@ -4,11 +4,7 @@
 {% block title %}Changes · CompetitorScope{% endblock %}
 
 {% block content %}
-  <nav class="segmented-tabs feed-tabs" aria-label="Change scope">
-    <a class="{% if scope == 'ALL' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&scope=ALL">All changes <span>{{ all_change_count }}</span></a>
-    <a class="{% if scope == 'REAL' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&scope=REAL">Detected <span>{{ real_change_count }}</span></a>
-    <a class="{% if scope == 'SIMULATED' %}is-active{% endif %}" href="?company_id={{ selected_company.id }}&scope=SIMULATED">Simulated <span>{{ simulated_change_count }}</span></a>
-  </nav>
+  <div class="feed-summary">All detected changes <span>{{ all_change_count }}</span></div>
   <section class="panel">
     <div class="panel-header"><div><h2>Changes feed</h2><p class="panel-subtitle">Chronological updates for {{ selected_company.name }}.</p></div><span class="panel-meta">{{ changes|length }} shown</span></div>
     <div class="panel-body">

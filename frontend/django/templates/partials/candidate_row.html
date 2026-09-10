@@ -14,16 +14,6 @@
       <form method="post" action="{% url 'activate_candidate' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><input type="hidden" name="status" value="SUGGESTED"><button class="button button-primary button-small" type="submit">Activate</button></form>
       <form method="post" action="{% url 'discard_candidate' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Discard</button></form>
     {% elif record.discovery_status == 'ACTIVE' and record.active is True %}
-      <form class="simulate-form row-simulate-form" method="post" action="{% url 'simulate_target' competitor.id record.id %}" data-loading="simulate" data-loading-text="Simulating…">
-        {% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}">
-        {% if record.page_type == 'PRODUCT_LISTING' %}
-          <label class="sr-only" for="mutation-{{ record.id }}">Simulation case</label>
-          <select class="inline-select" id="mutation-{{ record.id }}" name="mutation_type">
-            <option value="NEW_PRODUCT">NEW_PRODUCT</option><option value="PRICE_CHANGE">PRICE_CHANGE</option><option value="PRODUCT_REMOVED">PRODUCT_REMOVED</option>
-          </select>
-        {% endif %}
-        <button class="button button-primary button-small" type="submit"><span aria-hidden="true">🎭</span> <span class="button-label">Simulate a Change</span></button>
-      </form>
       <form method="post" action="{% url 'deactivate_target' competitor.id record.id %}">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Deactivate</button></form>
       <form method="post" action="{% url 'delete_target' competitor.id record.id %}" data-confirm="Remove this target?">{% csrf_token %}<input type="hidden" name="company_id" value="{{ selected_company.id }}"><button class="button button-quiet button-small" type="submit">Remove</button></form>
     {% elif record.discovery_status == 'DISCARDED' %}
