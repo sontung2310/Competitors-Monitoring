@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from html.parser import HTMLParser
 from typing import Literal
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
@@ -77,6 +78,41 @@ ITEM_PATH_SEGMENTS = frozenset(
         "solutions",
     }
 )
+
+MAX_META_DESCRIPTION_LENGTH = 500
+
+
+class _MetaDescriptionParser(HTMLParser):
+    """Extract the first standard ``name=description`` meta tag."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.description: str | None = None
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.description is not None or tag.lower() != "meta":
+            return
+        attributes = {
+            key.lower(): value.strip()
+            for key, value in attrs
+            if value is not None
+        }
+        if attributes.get("name", "").lower() != "description":
+            return
+        content = " ".join(attributes.get("content", "").split())
+        if content:
+            self.description = content[:MAX_META_DESCRIPTION_LENGTH].rstrip()
+
+
+def extract_meta_description(raw_html: str) -> str | None:
+    """Extract a bounded, normalized page meta description from HTML."""
+
+    if not isinstance(raw_html, str):
+        raise TypeError("raw_html must be a string")
+    parser = _MetaDescriptionParser()
+    parser.feed(raw_html)
+    parser.close()
+    return parser.description
 
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})
