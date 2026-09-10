@@ -12,6 +12,9 @@ from scripts.check_unmerged_branches import (
 def test_roadmap_key_is_taken_from_feature_branch_number() -> None:
     assert roadmap_item_key("feature/1.13-diff-granularity-fix") == "1.13"
     assert roadmap_item_key("feature/1.14-simulated-change-verification") == "1.14"
+    assert roadmap_item_key("feature/p1-page-type-consolidation") == "P.1"
+    assert roadmap_item_key("feature/P.0-branch-setup") == "P.0"
+    assert roadmap_item_key("feature/P.1.5-classifier-batching") == "P.1.5"
     assert roadmap_item_key("chore/unmerged-branch-check") is None
 
 
@@ -23,6 +26,17 @@ def test_roadmap_item_checked_distinguishes_checked_unchecked_and_unknown() -> N
     assert roadmap_item_checked(roadmap, "1.13") is True
     assert roadmap_item_checked(roadmap, "1.14") is False
     assert roadmap_item_checked(roadmap, "1.15") is None
+
+
+def test_roadmap_item_checked_rolls_up_production_sub_items() -> None:
+    roadmap = """
+- [x] P.1.1 Classifier
+- [x] P.1.2 Prompt
+- [ ] P.1.3 Mapping
+"""
+    assert roadmap_item_checked(roadmap, "P.1") is False
+    assert roadmap_item_checked(roadmap.replace("[ ] P.1.3", "[x] P.1.3"), "P.1") is True
+    assert roadmap_item_checked(roadmap, "P.2") is None
 
 
 def test_classification_does_not_flag_patch_equivalent_squash_history() -> None:
