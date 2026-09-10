@@ -17,6 +17,14 @@ from backend.flask.website_monitoring.service import (
 )
 from backend.flask.website_monitoring.intervals import default_check_interval_minutes
 
+from .audit import (
+    DiscoveryAuditClassifier,
+    DiscoveryAuditConfigurationError,
+    DiscoveryAuditResult,
+    NoopDiscoveryAudit,
+    OpenAIDiscoveryAudit,
+    SuggestedCandidateForAudit,
+)
 from .classification import (
     CandidateClassifier,
     CandidateForClassification,
@@ -176,6 +184,7 @@ class DiscoveryService:
         monitoring_target_repository: MonitoringTargetRepository,
         *,
         fallback_classifier: CandidateClassifier | None = None,
+        audit_classifier: DiscoveryAuditClassifier | None = None,
         robots_source: Optional[RobotsSource] = None,
         sitemap_source: Optional[SitemapCollector] = None,
         link_source: Optional[WebsiteSource] = None,
@@ -203,6 +212,11 @@ class DiscoveryService:
         self.competitor_repository = competitor_repository
         self.monitoring_target_repository = monitoring_target_repository
         self.fallback_classifier = fallback_classifier or _default_classifier()
+        # Direct service consumers default to a safe no-op. The Flask
+        # application factory explicitly wires the configured OpenAI auditor;
+        # this keeps unit/in-process callers from making accidental provider
+        # calls merely by constructing the service.
+        self.audit_classifier = audit_classifier or NoopDiscoveryAudit()
         self.classifier_batch_size = resolve_classifier_batch_size(classifier_batch_size)
         # This is intentionally injected at the service boundary so tests can
         # avoid network access while production uses the Step 1.4 fetch
@@ -212,6 +226,8 @@ class DiscoveryService:
         self.liveness_backoff_seconds = liveness_backoff_seconds
         self.liveness_sleep = liveness_sleep or time.sleep
         self.last_summary: DiscoverySummary | None = None
+        self.last_audit_result: DiscoveryAuditResult | None = None
+        self.last_audit_error: str | None = None
         if any(source is None for source in (robots_source, sitemap_source, link_source)):
             fetcher = HttpFetcher()
         else:
@@ -665,6 +681,9 @@ class DiscoveryService:
             declared_sitemaps,
         )
         source_candidates["LINKS"] = self._safe_source_discovery(self.link_source, website_url)
+        homepage_metadata = getattr(self.link_source, "last_homepage_metadata", {})
+        if not isinstance(homepage_metadata, Mapping):
+            homepage_metadata = {}
 
         normalized_by_source = {
             source: _normalize_and_dedupe(candidates, website_url=website_url)
@@ -719,26 +738,54 @@ class DiscoveryService:
         )
 
         persisted: list[dict[str, Any]] = []
+        audit_candidates: list[SuggestedCandidateForAudit] = []
+        audit_rows_by_url: dict[str, dict[str, Any]] = {}
         for candidate, classification in zip(normalized, classifications):
-            persisted.append(
-                self.monitoring_target_repository.upsert_discovered_candidate(
-                    competitor_id=competitor_id,
-                    raw_url=candidate.raw_url,
-                    url=candidate.url,
-                    page_type=classification.page_type,
-                    discovery_source=candidate.source,
-                    discovery_status=classification.discovery_status,
-                    classification_method=classification.classification_method,
-                )
+            persisted_candidate = self.monitoring_target_repository.upsert_discovered_candidate(
+                competitor_id=competitor_id,
+                raw_url=candidate.raw_url,
+                url=candidate.url,
+                page_type=classification.page_type,
+                discovery_source=candidate.source,
+                discovery_status=classification.discovery_status,
+                classification_method=classification.classification_method,
             )
+            persisted.append(persisted_candidate)
+            if (
+                classification.discovery_status == "SUGGESTED"
+                and not _is_activated(persisted_candidate)
+            ):
+                audit_candidates.append(
+                    SuggestedCandidateForAudit(
+                        url=candidate.url,
+                        page_type=classification.page_type,
+                        title=candidate.title,
+                        meta_description=candidate.meta_description,
+                    )
+                )
+                audit_rows_by_url.setdefault(candidate.url, persisted_candidate)
         self._reconcile_excluded_candidates(competitor_id)
+        audited_updates = self._run_second_pass_audit(
+            competitor_id,
+            audit_candidates,
+            audit_rows_by_url,
+            homepage_title=homepage_metadata.get("title"),
+            homepage_meta_description=homepage_metadata.get("meta_description"),
+            user_id=user_id,
+            company_id=company_id,
+        )
+        for index, candidate in enumerate(persisted):
+            updated = audited_updates.get(candidate.get("id"))
+            if updated is not None:
+                persisted[index] = updated
+
         suggested_count = sum(
-            classification.discovery_status == "SUGGESTED"
-            for classification in classifications
+            candidate.get("discovery_status") == "SUGGESTED"
+            for candidate in persisted
         )
         discarded_count = sum(
-            classification.discovery_status == "DISCARDED"
-            for classification in classifications
+            candidate.get("discovery_status") == "DISCARDED"
+            for candidate in persisted
         )
         source_breakdown: dict[str, SourceDiscoverySummary] = {
             "ROBOTS": SourceDiscoverySummary(
@@ -785,6 +832,134 @@ class DiscoveryService:
             },
         )
         return persisted
+
+    def _run_second_pass_audit(
+        self,
+        competitor_id: Any,
+        candidates: Sequence[SuggestedCandidateForAudit],
+        rows_by_url: Mapping[str, Mapping[str, Any]],
+        *,
+        homepage_title: str | None,
+        homepage_meta_description: str | None,
+        user_id: str | None,
+        company_id: Any,
+    ) -> dict[Any, dict[str, Any]]:
+        """Audit pass-one suggestions and apply only safe narrowing actions.
+
+        ``rows_by_url`` is built exclusively from pass-one rows whose status is
+        SUGGESTED and which are not activated. The method has no promotion or
+        creation operation: a provider can only identify one of those rows for
+        the existing ``discard_candidate`` transition.
+        """
+
+        self.last_audit_result = None
+        self.last_audit_error = None
+        if isinstance(self.audit_classifier, NoopDiscoveryAudit):
+            self.last_audit_error = "audit provider is not configured"
+            return {}
+        try:
+            result = self.audit_classifier.audit(
+                candidates,
+                homepage_title=homepage_title,
+                homepage_meta_description=homepage_meta_description,
+            )
+            if not isinstance(result, DiscoveryAuditResult):
+                raise TypeError("audit classifier returned an invalid result")
+        except Exception as exc:
+            self.last_audit_error = str(exc)
+            logger.warning(
+                "discovery second-pass audit failed competitor=%s; preserving "
+                "first-pass results: %s",
+                competitor_id,
+                exc,
+            )
+            return {}
+
+        self.last_audit_result = result
+        updated_rows: dict[Any, dict[str, Any]] = {}
+        seen_urls: set[str] = set()
+        for flag in result.flagged_redundant:
+            if flag.url in seen_urls:
+                continue
+            seen_urls.add(flag.url)
+            if not _is_high_confidence_redundancy(flag.reason):
+                logger.warning(
+                    "discovery audit ignored low-confidence redundancy "
+                    "competitor=%s url=%s reason=%s",
+                    competitor_id,
+                    flag.url,
+                    flag.reason,
+                )
+                continue
+            row = rows_by_url.get(flag.url)
+            if row is None:
+                logger.warning(
+                    "discovery audit ignored unknown/non-suggested URL competitor=%s url=%s",
+                    competitor_id,
+                    flag.url,
+                )
+                continue
+            if not _has_structural_redundancy(flag.url, rows_by_url):
+                logger.warning(
+                    "discovery audit ignored structurally unproven redundancy "
+                    "competitor=%s url=%s",
+                    competitor_id,
+                    flag.url,
+                )
+                continue
+            try:
+                updated_rows[row["id"]] = self.discard_candidate(
+                    row["id"],
+                    company_id=company_id,
+                )
+            except Exception as exc:
+                logger.warning(
+                    "discovery audit could not discard flagged candidate=%s: %s",
+                    row.get("id"),
+                    exc,
+                )
+
+        gap_flags = [
+            {"page_type": flag.page_type, "reason": flag.reason}
+            for flag in result.flagged_missing_categories
+        ]
+        self._persist_discovery_gap_flags(
+            competitor_id,
+            gap_flags,
+            user_id=user_id,
+            company_id=company_id,
+        )
+        return updated_rows
+
+    def _persist_discovery_gap_flags(
+        self,
+        competitor_id: Any,
+        flags: Sequence[Mapping[str, str]],
+        *,
+        user_id: str | None,
+        company_id: Any,
+    ) -> None:
+        """Persist successful audit gap findings without blocking discovery."""
+
+        scope: dict[str, Any] = {}
+        if company_id is not None:
+            scope["company_id"] = company_id
+        elif user_id is not None:
+            scope["user_id"] = user_id
+        try:
+            updated = self.competitor_repository.update(
+                competitor_id,
+                {"discovery_gap_flags": [dict(flag) for flag in flags]},
+                **scope,
+            )
+            if updated is None:
+                raise DiscoveryError("competitor record was not found")
+        except Exception as exc:
+            logger.warning(
+                "could not persist discovery gap flags competitor=%s: %s",
+                competitor_id,
+                exc,
+            )
 
     def _reconcile_excluded_candidates(self, competitor_id: Any) -> None:
         """Repair old discovery rows that now match an item/detail exclusion.
@@ -860,6 +1035,25 @@ def _default_classifier() -> CandidateClassifier:
         return DeterministicStubClassifier()
 
 
+def _default_discovery_audit() -> DiscoveryAuditClassifier:
+    """Use the configured holistic audit without making startup fatal."""
+
+    try:
+        return OpenAIDiscoveryAudit.from_env()
+    except DiscoveryAuditConfigurationError as exc:
+        logger.warning(
+            "OpenAI discovery audit is unavailable; using a no-op audit: %s",
+            exc,
+        )
+        return NoopDiscoveryAudit()
+
+
+def configured_discovery_audit() -> DiscoveryAuditClassifier:
+    """Return the production-configured auditor or its safe no-op fallback."""
+
+    return _default_discovery_audit()
+
+
 def _discovery_summary_payload(summary: DiscoverySummary | None) -> dict[str, Any] | None:
     """Convert the in-process summary into a compact persisted API shape."""
 
@@ -894,6 +1088,60 @@ def _is_active_target(candidate: Mapping[str, Any]) -> bool:
         candidate.get("active") is True
         and candidate.get("discovery_status") == "ACTIVE"
     )
+
+
+_REDUNDANCY_HEDGE_TERMS = (
+    "likely",
+    "possibly",
+    "could be",
+    "might be",
+    "may be",
+    "appears to",
+    "unless",
+)
+
+
+def _is_high_confidence_redundancy(reason: str) -> bool:
+    """Reject speculative model flags before they can narrow production data."""
+
+    normalized = reason.casefold()
+    return not any(term in normalized for term in _REDUNDANCY_HEDGE_TERMS)
+
+
+def _has_structural_redundancy(
+    url: str,
+    rows_by_url: Mapping[str, Mapping[str, Any]],
+) -> bool:
+    """Require an obvious URL relationship before auto-discarding a row.
+
+    A flat, descriptive page such as ``/pittsburgh-seo-company`` is not
+    automatically redundant with ``/services`` just because both were typed
+    SERVICES. Nested section/filter variants such as ``/men/sale`` versus
+    ``/sale`` are structurally comparable and can be narrowed when the audit
+    also supplies a high-confidence reason.
+    """
+
+    candidate = urlsplit(url)
+    candidate_path = [part for part in candidate.path.split("/") if part]
+    for other_url in rows_by_url:
+        if other_url == url:
+            continue
+        other = urlsplit(other_url)
+        if candidate.netloc != other.netloc:
+            continue
+        if candidate.path == other.path and candidate.query != other.query:
+            return True
+        other_path = [part for part in other.path.split("/") if part]
+        if not candidate_path or not other_path or len(candidate_path) == len(other_path):
+            continue
+        shorter, longer = (
+            (candidate_path, other_path)
+            if len(candidate_path) < len(other_path)
+            else (other_path, candidate_path)
+        )
+        if longer[: len(shorter)] == shorter or longer[-len(shorter) :] == shorter:
+            return True
+    return False
 
 
 def _candidate_url_for_competitor(url: str, competitor_url: str) -> str:

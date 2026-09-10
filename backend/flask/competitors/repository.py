@@ -17,7 +17,13 @@ class CompetitorRepository(BaseMongoRepository):
     """Persistence operations for the ``competitors`` collection."""
 
     collection_name = "competitors"
-    _UPDATE_FIELDS = {"name", "website_url", "active", "company_id"}
+    _UPDATE_FIELDS = {
+        "name",
+        "website_url",
+        "active",
+        "company_id",
+        "discovery_gap_flags",
+    }
 
     def ensure_indexes(self) -> None:
         """Create indexes needed for tenant-scoped lookups and deduplication."""
@@ -79,6 +85,7 @@ class CompetitorRepository(BaseMongoRepository):
             "name": name,
             "website_url": website_url,
             "active": active,
+            "discovery_gap_flags": [],
             "created_at": timestamp,
             "updated_at": timestamp,
         }
@@ -226,6 +233,8 @@ class CompetitorRepository(BaseMongoRepository):
             raise ValueError("active must be a boolean")
         if "company_id" in values and values["company_id"] is not None:
             values["company_id"] = _relationship_id(values["company_id"], "company_id")
+        if "discovery_gap_flags" in values:
+            _validate_discovery_gap_flags(values["discovery_gap_flags"])
 
         query: dict[str, Any] = {"_id": to_object_id(competitor_id)}
         if company_id is not None:
@@ -272,6 +281,23 @@ def _require_text(value: Any, field: str) -> None:
 def _require_bool(value: Any, field: str) -> None:
     if not isinstance(value, bool):
         raise ValueError(f"{field} must be a boolean")
+
+
+def _validate_discovery_gap_flags(value: Any) -> None:
+    """Validate the small queryable shape written by the discovery audit."""
+
+    if not isinstance(value, list):
+        raise ValueError("discovery_gap_flags must be a list")
+    for flag in value:
+        if not isinstance(flag, Mapping):
+            raise ValueError("each discovery gap flag must be an object")
+        if not all(
+            isinstance(flag.get(field), str) and flag[field].strip()
+            for field in ("page_type", "reason")
+        ):
+            raise ValueError(
+                "each discovery gap flag requires non-empty page_type and reason"
+            )
 
 
 def _relationship_id(value: Any, field: str) -> Any:
