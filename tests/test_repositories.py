@@ -188,6 +188,39 @@ class RepositoryTests(unittest.TestCase):
         self.assertTrue(self.competitors.delete(created["id"], user_id="company-a"))
         self.assertIsNone(self.competitors.get(created["id"], user_id="company-a"))
 
+    def test_competitor_persists_queryable_discovery_gap_flags(self):
+        competitor = self.competitors.create(
+            user_id="company-a",
+            name="Example",
+            website_url="https://example.com",
+            now=self.timestamp,
+        )
+
+        updated = self.competitors.update(
+            competitor["id"],
+            user_id="company-a",
+            discovery_gap_flags=[
+                {"page_type": "BLOG", "reason": "Homepage references a blog."}
+            ],
+        )
+
+        self.assertEqual(
+            updated["discovery_gap_flags"],
+            [{"page_type": "BLOG", "reason": "Homepage references a blog."}],
+        )
+        self.assertEqual(
+            self.competitors.get(competitor["id"], user_id="company-a")[
+                "discovery_gap_flags"
+            ],
+            updated["discovery_gap_flags"],
+        )
+        with self.assertRaisesRegex(ValueError, "discovery_gap_flags"):
+            self.competitors.update(
+                competitor["id"],
+                user_id="company-a",
+                discovery_gap_flags={"page_type": "BLOG"},
+            )
+
     def test_monitoring_target_preserves_discovery_metadata(self):
         competitor = self.competitors.create(
             user_id="company-a",

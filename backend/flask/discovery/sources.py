@@ -22,6 +22,8 @@ from .normalization import (
     is_html_candidate_url,
     is_same_site,
     is_structural_path,
+    extract_meta_description,
+    extract_page_title,
     normalize_url,
 )
 
@@ -300,9 +302,14 @@ class InternalLinkSource:
     def __init__(self, fetcher: Fetcher):
         self.fetcher = fetcher
         self.last_stats = SourceStats("LINKS", 0, 0)
+        self.last_homepage_metadata: dict[str, str | None] = {
+            "title": None,
+            "meta_description": None,
+        }
 
     def discover(self, website_url: str) -> tuple[DiscoveredURL, ...]:
         homepage = _root_resource_url(website_url, "")
+        self.last_homepage_metadata = {"title": None, "meta_description": None}
         try:
             response = self.fetcher.fetch(homepage)
         except DiscoveryFetchError:
@@ -311,6 +318,11 @@ class InternalLinkSource:
         if response.status >= 400:
             self.last_stats = SourceStats("LINKS", 0, 0)
             return ()
+
+        self.last_homepage_metadata = {
+            "title": extract_page_title(response.text),
+            "meta_description": extract_meta_description(response.text),
+        }
 
         parser = _LinkParser()
         parser.feed(response.text)

@@ -21,7 +21,7 @@ from backend.flask.competitors.service import CompetitorService
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.discovery.routes import discovery_blueprint
 from backend.flask.discovery.repository import DiscoveryRunRepository
-from backend.flask.discovery.service import DiscoveryService
+from backend.flask.discovery.service import DiscoveryService, configured_discovery_audit
 from backend.flask.errors import APIError, error_from_exception
 from backend.flask.llm_provider import OpenAIProvider
 from backend.flask.snapshot.repository import SnapshotRepository
@@ -129,6 +129,7 @@ def _build_services(
     discovery_service = DiscoveryService(
         competitor_repository,
         target_repository,
+        audit_classifier=configured_discovery_audit(),
         snapshot_repository=snapshot_repository,
         change_repository=change_repository,
         run_repository=discovery_run_repository,
