@@ -190,6 +190,28 @@ def _normalise_bases(base: str | Sequence[str]) -> tuple[str, ...]:
     return bases
 
 
+def _roadmap_texts(
+    repo_root: Path,
+    bases: Sequence[str],
+    roadmap_path: Path | None,
+) -> dict[str, str]:
+    """Read each default roadmap from the base branch it describes."""
+
+    if roadmap_path is not None:
+        return {"custom": roadmap_path.read_text(encoding="utf-8")}
+
+    dev_base = "main" if "main" in bases else bases[0]
+    production_base = "production" if "production" in bases else bases[0]
+    return {
+        "dev": _run_git(repo_root, "show", f"{dev_base}:docs/roadmap.md"),
+        "production": _run_git(
+            repo_root,
+            "show",
+            f"{production_base}:docs/production-roadmap.md",
+        ),
+    }
+
+
 def _select_base_comparison(
     comparisons: Sequence[_BaseComparison],
     roadmap_key: str | None,
@@ -219,15 +241,7 @@ def audit_branches(
     """
 
     bases = _normalise_bases(base)
-    if roadmap_path is not None:
-        roadmap_texts = {"custom": roadmap_path.read_text(encoding="utf-8")}
-    else:
-        roadmap_texts = {
-            "dev": (repo_root / "docs" / "roadmap.md").read_text(encoding="utf-8"),
-            "production": (repo_root / "docs" / "production-roadmap.md").read_text(
-                encoding="utf-8"
-            ),
-        }
+    roadmap_texts = _roadmap_texts(repo_root, bases, roadmap_path)
     base_tree_hashes = {
         base_name: set(
             _run_git(repo_root, "log", "--format=%T", base_name).splitlines()
