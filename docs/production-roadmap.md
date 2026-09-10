@@ -18,6 +18,8 @@ separate, focused tasks on the `production` branch.
 - [x] P.1.1 Update the rule-based classifier patterns to recognize and suggest only `BLOG`, `NEWS`, `PRICING`, `PRODUCTS`, `SERVICES`, and `PRESS`; collapse all other page types into `OTHER` and discard them.
 - [x] P.1.2 Update the LLM fallback classifier prompt and instructions to use the same six-type schema and `OTHER` discard behavior.
 - [x] P.1.3 Confirm the `change_type` mapping: `BLOG` → `NEW_BLOG`, `PRICING` → `PRICE_CHANGE`, `PRODUCTS` → existing `ProductListingProcessor` events, and `NEWS`/`SERVICES`/`PRESS` → generic `PAGE_UPDATE`.
+- [x] P.1.4 Add the already-fetched page meta description to the production classifier input and prompt context.
+- [x] P.1.5 Use bounded, configurable (`DISCOVERY_CLASSIFIER_BATCH_SIZE`) classifier batches with per-batch failure isolation and deterministic `OTHER`/discarded fallback.
 
 ## P.2 Remove simulation from production
 

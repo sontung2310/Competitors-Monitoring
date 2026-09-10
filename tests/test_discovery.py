@@ -15,9 +15,11 @@ from backend.flask.discovery.classification import (
     OpenAIClassifierConfigurationError,
     classify_by_rules,
     classify_candidates,
+    resolve_classifier_batch_size,
 )
 from backend.flask.discovery.normalization import (
     discovery_scope,
+    extract_meta_description,
     is_html_candidate_url,
     is_item_type_excluded,
     is_system_path,
@@ -293,6 +295,26 @@ class _FailingClassifier:
         raise RuntimeError("forced classifier outage")
 
 
+class _FailOneBatchClassifier:
+    def __init__(self, failing_batch=2):
+        self.failing_batch = failing_batch
+        self.batches = []
+
+    def classify(self, candidates):
+        self.batches.append(tuple(candidates))
+        if len(self.batches) == self.failing_batch:
+            raise RuntimeError("forced one-batch outage")
+        return tuple(
+            ClassificationResult(
+                url=candidate.url,
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+                classification_method="LLM",
+            )
+            for candidate in candidates
+        )
+
+
 @dataclass
 class _StaticFetcher:
     responses: dict[str, FetchResponse]
@@ -302,6 +324,63 @@ class _StaticFetcher:
 
 
 class DiscoveryTests(unittest.TestCase):
+    def test_extract_meta_description_normalizes_and_bounds_content(self):
+        description = extract_meta_description(
+            '<html><head><meta CONTENT="  A  useful\n summary  " '
+            'NAME="description"><meta name="description" content="ignored"></head></html>'
+        )
+        self.assertEqual(description, "A useful summary")
+
+        long_description = "x" * 600
+        self.assertEqual(
+            len(extract_meta_description(f'<meta name="description" content="{long_description}">')),
+            500,
+        )
+        self.assertIsNone(extract_meta_description("<html><head></head></html>"))
+
+    def test_classifier_batch_size_can_be_configured(self):
+        self.assertEqual(resolve_classifier_batch_size(environ={}), 25)
+        self.assertEqual(
+            resolve_classifier_batch_size(environ={"DISCOVERY_CLASSIFIER_BATCH_SIZE": "7"}),
+            7,
+        )
+        with self.assertRaisesRegex(ValueError, "positive integer"):
+            resolve_classifier_batch_size(environ={"DISCOVERY_CLASSIFIER_BATCH_SIZE": "0"})
+
+    def test_classification_uses_bounded_batches(self):
+        candidates = tuple(
+            CandidateForClassification(f"raw-{index}", f"https://example.com/opaque-{index}")
+            for index in range(5)
+        )
+        classifier = _RecordingClassifier()
+
+        results = classify_candidates(candidates, classifier, batch_size=2)
+
+        self.assertEqual([len(batch) for batch in classifier.batches], [2, 2, 1])
+        self.assertEqual(len(results), 5)
+        self.assertTrue(all(result.page_type == "OTHER" for result in results))
+
+    def test_classification_isolates_one_failed_batch(self):
+        candidates = tuple(
+            CandidateForClassification(f"raw-{index}", f"https://example.com/opaque-{index}")
+            for index in range(5)
+        )
+        classifier = _FailOneBatchClassifier(failing_batch=2)
+
+        results = classify_candidates(candidates, classifier, batch_size=2)
+
+        self.assertEqual([len(batch) for batch in classifier.batches], [2, 2, 1])
+        self.assertEqual(
+            [(result.page_type, result.discovery_status) for result in results],
+            [
+                ("SERVICES", "SUGGESTED"),
+                ("SERVICES", "SUGGESTED"),
+                ("OTHER", "DISCARDED"),
+                ("OTHER", "DISCARDED"),
+                ("SERVICES", "SUGGESTED"),
+            ],
+        )
+
     def test_page_type_aware_normalization(self):
         self.assertEqual(
             normalize_url("https://example.com/blog/new-launch"),
@@ -714,6 +793,7 @@ class DiscoveryTests(unittest.TestCase):
                 "https://example.com/opaque",
                 "https://example.com/opaque",
                 title="Opaque page",
+                meta_description="A concise description of the opaque page.",
                 sources=("SITEMAP",),
             ),
         )
@@ -744,6 +824,12 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(
             json.loads(client.responses.calls[0]["input"])["candidates"][0]["url"],
             "https://example.com/opaque",
+        )
+        self.assertEqual(
+            json.loads(client.responses.calls[0]["input"])["candidates"][0][
+                "meta_description"
+            ],
+            "A concise description of the opaque page.",
         )
         self.assertEqual(
             client.responses.calls[0]["text"]["format"]["type"],
@@ -808,6 +894,7 @@ class DiscoveryTests(unittest.TestCase):
 
         instructions = " ".join(provider.calls[0]["instructions"].split())
         self.assertIn("index-vs-item distinction strictly", instructions)
+        self.assertIn("meta description", instructions)
         self.assertIn("individual item", instructions)
         self.assertIn("flat descriptive slug is not an index merely", instructions)
         self.assertIn("durable service page", instructions)
@@ -906,6 +993,44 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(results[0].page_type, "OTHER")
         self.assertEqual(results[0].discovery_status, "DISCARDED")
         self.assertEqual(results[0].classification_method, "LLM")
+
+    def test_discovery_continues_after_one_failed_classifier_batch(self):
+        target_repository = _FakeTargetRepository()
+        classifier = _FailOneBatchClassifier(failing_batch=2)
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            target_repository,
+            fallback_classifier=classifier,
+            classifier_batch_size=2,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                tuple(
+                    DiscoveredURL(f"https://example.com/opaque-{index}", "SITEMAP")
+                    for index in range(5)
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: FetchResult("<html></html>", "HTTP", 200),
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(persisted), 5)
+        self.assertEqual([len(batch) for batch in classifier.batches], [2, 2, 1])
+        self.assertEqual(
+            [row["page_type"] for row in persisted],
+            ["SERVICES", "SERVICES", "OTHER", "OTHER", "SERVICES"],
+        )
+        self.assertEqual(
+            [row["discovery_status"] for row in persisted],
+            ["SUGGESTED", "SUGGESTED", "DISCARDED", "DISCARDED", "SUGGESTED"],
+        )
 
     def test_discovery_service_collects_dedupes_classifies_and_persists(self):
         competitor = {
