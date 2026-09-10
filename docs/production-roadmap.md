@@ -20,6 +20,7 @@ separate, focused tasks on the `production` branch.
 - [x] P.1.3 Confirm the `change_type` mapping: `BLOG` → `NEW_BLOG`, `PRICING` → `PRICE_CHANGE`, `PRODUCTS` → existing `ProductListingProcessor` events, and `NEWS`/`SERVICES`/`PRESS` → generic `PAGE_UPDATE`.
 - [x] P.1.4 Add the already-fetched page meta description to the production classifier input and prompt context.
 - [x] P.1.5 Use bounded, configurable (`DISCOVERY_CLASSIFIER_BATCH_SIZE`) classifier batches with per-batch failure isolation and deterministic `OTHER`/discarded fallback.
+- [x] P.1.6 Add one holistic, per-competitor second-pass audit over the full SUGGESTED list: discard only flagged redundant suggestions, persist informational missing-category flags, and degrade gracefully when the audit call fails.
 
 ## P.2 Remove simulation from production
 

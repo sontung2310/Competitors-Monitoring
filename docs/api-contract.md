@@ -63,7 +63,7 @@ therefore excluded from a company-scoped response.
 - Response `200`:
 
   ```json
-  [{"id", "company_id", "name", "website_url", "active", "created_at", "updated_at"}]
+  [{"id", "company_id", "name", "website_url", "active", "discovery_gap_flags", "created_at", "updated_at"}]
   ```
 
 ### `POST /competitors`
@@ -78,7 +78,9 @@ Create a competitor. Website-only competitor records are supported for now.
 
 - Optional query: `company_id=`; when supplied, the competitor must belong to
   that company.
-- Response `200`: competitor object
+- Response `200`: competitor object. The optional `discovery_gap_flags` array
+  contains the latest successful production discovery audit's informational
+  missing-category flags; it is empty when that audit found no gaps.
 - Response `404`: standard error envelope
 
 ### `PATCH /competitors/<id>`

@@ -80,6 +80,7 @@ ITEM_PATH_SEGMENTS = frozenset(
 )
 
 MAX_META_DESCRIPTION_LENGTH = 500
+MAX_PAGE_TITLE_LENGTH = 500
 
 
 class _MetaDescriptionParser(HTMLParser):
@@ -104,6 +105,32 @@ class _MetaDescriptionParser(HTMLParser):
             self.description = content[:MAX_META_DESCRIPTION_LENGTH].rstrip()
 
 
+class _PageTitleParser(HTMLParser):
+    """Extract the first bounded document title from already-fetched HTML."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.title: str | None = None
+        self._in_title = False
+        self._parts: list[str] = []
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if self.title is None and tag.lower() == "title":
+            self._in_title = True
+
+    def handle_data(self, data: str) -> None:
+        if self._in_title:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag.lower() != "title" or not self._in_title:
+            return
+        value = " ".join("".join(self._parts).split())
+        if value:
+            self.title = value[:MAX_PAGE_TITLE_LENGTH].rstrip()
+        self._in_title = False
+
+
 def extract_meta_description(raw_html: str) -> str | None:
     """Extract a bounded, normalized page meta description from HTML."""
 
@@ -113,6 +140,17 @@ def extract_meta_description(raw_html: str) -> str | None:
     parser.feed(raw_html)
     parser.close()
     return parser.description
+
+
+def extract_page_title(raw_html: str) -> str | None:
+    """Extract a bounded, normalized document title from HTML."""
+
+    if not isinstance(raw_html, str):
+        raise TypeError("raw_html must be a string")
+    parser = _PageTitleParser()
+    parser.feed(raw_html)
+    parser.close()
+    return parser.title
 
 TRACKING_QUERY_PREFIXES = ("utm_",)
 TRACKING_QUERY_KEYS = frozenset({"fbclid", "gclid", "mc_cid", "mc_eid"})

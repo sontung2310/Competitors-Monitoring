@@ -10,6 +10,12 @@ from .classification import (
     classify_candidates,
     classify_by_rules,
 )
+from .audit import (
+    CORE_PAGE_TYPES,
+    DiscoveryAuditResult,
+    OpenAIDiscoveryAudit,
+    SuggestedCandidateForAudit,
+)
 from .service import (
     DiscoveryConflictError,
     DiscoveryError,
@@ -30,4 +36,8 @@ __all__ = [
     "OpenAIClassifierConfigurationError",
     "classify_by_rules",
     "classify_candidates",
+    "CORE_PAGE_TYPES",
+    "DiscoveryAuditResult",
+    "OpenAIDiscoveryAudit",
+    "SuggestedCandidateForAudit",
 ]

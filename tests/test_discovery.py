@@ -17,9 +17,18 @@ from backend.flask.discovery.classification import (
     classify_candidates,
     resolve_classifier_batch_size,
 )
+from backend.flask.discovery.audit import (
+    CORE_PAGE_TYPES,
+    DiscoveryAuditResult,
+    MissingCategoryFlag,
+    OpenAIDiscoveryAudit,
+    RedundancyFlag,
+    SuggestedCandidateForAudit,
+)
 from backend.flask.discovery.normalization import (
     discovery_scope,
     extract_meta_description,
+    extract_page_title,
     is_html_candidate_url,
     is_item_type_excluded,
     is_system_path,
@@ -55,6 +64,17 @@ class _FakeCompetitorRepository:
             return self.competitor
         return None
 
+    def update(self, competitor_id, updates=None, *, user_id=None, company_id=None, **fields):
+        values = {**(updates or {}), **fields}
+        if competitor_id != self.competitor["id"]:
+            return None
+        if user_id is not None and self.competitor.get("user_id") != user_id:
+            return None
+        if company_id is not None and self.competitor.get("company_id") != company_id:
+            return None
+        self.competitor.update(values)
+        return dict(self.competitor)
+
 
 class _FakeTargetRepository:
     def __init__(self, candidates=()):
@@ -75,6 +95,15 @@ class _FakeTargetRepository:
                 or candidate.get("discovery_status") == discovery_status
             )
         ]
+
+    def get(self, candidate_id, *, competitor_id=None):
+        for candidate in self.saved:
+            if candidate["id"] == candidate_id and (
+                competitor_id is None
+                or candidate.get("competitor_id") == competitor_id
+            ):
+                return dict(candidate)
+        return None
 
     def update(self, candidate_id, updates=None, *, competitor_id=None, **fields):
         values = {**(updates or {}), **fields}
@@ -223,8 +252,12 @@ class _HistoryRepository:
 
 
 class _Source:
-    def __init__(self, candidates=()):
+    def __init__(self, candidates=(), homepage_metadata=None):
         self.candidates = tuple(candidates)
+        self.last_homepage_metadata = dict(
+            homepage_metadata
+            or {"title": None, "meta_description": None}
+        )
 
     def discover(self, website_url, declared_sitemaps=()):
         return self.candidates
@@ -315,6 +348,31 @@ class _FailOneBatchClassifier:
         )
 
 
+class _RecordingAudit:
+    def __init__(self, result=None):
+        self.result = result or DiscoveryAuditResult()
+        self.calls = []
+
+    def audit(self, candidates, *, homepage_title, homepage_meta_description):
+        self.calls.append(
+            {
+                "candidates": tuple(candidates),
+                "homepage_title": homepage_title,
+                "homepage_meta_description": homepage_meta_description,
+            }
+        )
+        return self.result
+
+
+class _FailingAudit:
+    def __init__(self):
+        self.calls = 0
+
+    def audit(self, candidates, *, homepage_title, homepage_meta_description):
+        self.calls += 1
+        raise RuntimeError("forced audit outage")
+
+
 @dataclass
 class _StaticFetcher:
     responses: dict[str, FetchResponse]
@@ -337,6 +395,262 @@ class DiscoveryTests(unittest.TestCase):
             500,
         )
         self.assertIsNone(extract_meta_description("<html><head></head></html>"))
+
+    def test_extract_page_title_normalizes_and_bounds_content(self):
+        self.assertEqual(
+            extract_page_title("<title>  A\n useful   homepage </title>"),
+            "A useful homepage",
+        )
+        self.assertEqual(
+            len(extract_page_title(f"<title>{'x' * 600}</title>")),
+            500,
+        )
+
+    def test_openai_audit_sends_only_lightweight_metadata_and_core_types(self):
+        provider = _RecordingLLMProvider(
+            {
+                "flagged_redundant": [
+                    {
+                        "url": "https://example.com/services/one",
+                        "reason": "The second services entry duplicates this section.",
+                    }
+                ],
+                "flagged_missing_categories": [
+                    {
+                        "page_type": "BLOG",
+                        "reason": "Homepage navigation references a blog, but no blog was suggested.",
+                    }
+                ],
+            }
+        )
+        auditor = OpenAIDiscoveryAudit(provider=provider)
+
+        result = auditor.audit(
+            (
+                SuggestedCandidateForAudit(
+                    "https://example.com/services/one",
+                    "SERVICES",
+                    "One service",
+                    "Service summary",
+                ),
+            ),
+            homepage_title="Example homepage",
+            homepage_meta_description="Example business summary",
+        )
+
+        request = json.loads(provider.calls[0]["prompt"])
+        instructions = provider.calls[0]["instructions"]
+        self.assertEqual(request["core_page_types"], list(CORE_PAGE_TYPES))
+        self.assertEqual(request["suggested_candidates"][0]["meta_description"], "Service summary")
+        self.assertEqual(request["homepage"]["title"], "Example homepage")
+        self.assertIn("positive evidence", instructions)
+        self.assertIn("absence of a category", instructions.lower())
+        self.assertIn("never evidence", instructions.lower())
+        self.assertIn("consulting, or agency business", instructions)
+        self.assertIn("speculation", instructions)
+        self.assertIn("prefer an empty array over speculative noise", instructions)
+        self.assertEqual(result.flagged_redundant[0].url, "https://example.com/services/one")
+        self.assertEqual(result.flagged_missing_categories[0].page_type, "BLOG")
+
+    def test_second_pass_audit_discards_only_existing_suggestions_and_persists_gaps(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        target_repository = _FakeTargetRepository(
+            (
+                {
+                    "id": "old-discarded",
+                    "competitor_id": "competitor-1",
+                    "url": "https://example.com/old-discarded",
+                    "discovery_status": "DISCARDED",
+                    "active": False,
+                },
+            )
+        )
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/men/services",
+                        "Duplicate of the first services entry.",
+                    ),
+                    RedundancyFlag(
+                        "https://example.com/old-discarded",
+                        "Not part of this run and must be ignored.",
+                    ),
+                ),
+                flagged_missing_categories=(
+                    MissingCategoryFlag(
+                        "BLOG",
+                        "The homepage references a blog but no blog was suggested.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL("https://example.com/services", "SITEMAP"),
+                    DiscoveredURL("https://example.com/men/services", "SITEMAP"),
+                )
+            ),
+            link_source=_Source(
+                homepage_metadata={
+                    "title": "Example homepage",
+                    "meta_description": "A services-led business",
+                }
+            ),
+            liveness_checker=lambda url: FetchResult(
+                '<meta name="description" content="Service summary">',
+                "HTTP",
+                200,
+            ),
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(audit.calls), 1)
+        self.assertEqual(
+            [candidate.url for candidate in audit.calls[0]["candidates"]],
+            [
+                "https://example.com/services",
+                "https://example.com/men/services",
+            ],
+        )
+        self.assertEqual(
+            [row["discovery_status"] for row in persisted],
+            ["SUGGESTED", "DISCARDED"],
+        )
+        self.assertEqual(target_repository.get("old-discarded")["discovery_status"], "DISCARDED")
+        self.assertEqual(
+            competitor["discovery_gap_flags"],
+            [
+                {
+                    "page_type": "BLOG",
+                    "reason": "The homepage references a blog but no blog was suggested.",
+                }
+            ],
+        )
+
+    def test_second_pass_audit_failure_preserves_first_pass_results(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _FailingAudit()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/services", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(audit.calls, 1)
+        self.assertIsNotNone(service.last_audit_error)
+        self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
+        self.assertNotIn("discovery_gap_flags", competitor)
+
+    def test_second_pass_audit_ignores_speculative_redundancy_flags(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/consulting",
+                        "This is likely covered by the broader services page.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/consulting", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(persisted[0]["discovery_status"], "SUGGESTED")
+
+    def test_second_pass_audit_requires_structural_overlap_for_flat_service_pages(self):
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/pittsburgh-seo-company",
+                        "Duplicate of the general services page.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="SERVICES",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL("https://example.com/services", "SITEMAP"),
+                    DiscoveredURL(
+                        "https://example.com/pittsburgh-seo-company", "SITEMAP"
+                    ),
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(
+            [row["discovery_status"] for row in persisted],
+            ["SUGGESTED", "SUGGESTED"],
+        )
 
     def test_classifier_batch_size_can_be_configured(self):
         self.assertEqual(resolve_classifier_batch_size(environ={}), 25)
