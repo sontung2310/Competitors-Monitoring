@@ -6,11 +6,11 @@ accidental call cannot create a false change record. Eligible blog and generic
 page changes may also receive an optional LLM narrative; its failure never
 prevents the mechanical change record from being persisted.
 
-Only BLOG and PRICING receive special event types because those are the page
-types with explicit, justified mappings in the current specification and
-discovery data. PRODUCTS and the other supported page types do not provide
-enough evidence for NEW_PRODUCT, NEW_PROMOTION, NEW_CAMPAIGN, or NEW_AWARD,
-so they safely use PAGE_UPDATE until a relevant page type is defined.
+BLOG and PRICING receive special whole-page event types here. Production
+PRODUCTS targets are routed through ``ProductListingProcessor``, which emits
+the structured NEW_PRODUCT, PRODUCT_REMOVED, and PRICE_CHANGE events; this
+module's direct ``derive_change_type("PRODUCTS")`` fallback remains
+PAGE_UPDATE. NEWS, SERVICES, and PRESS use the generic PAGE_UPDATE mapping.
 
 The default change status is ``NEW``. It means the change was detected and has
 not yet been reviewed by a future presentation layer. A later frontend can add
