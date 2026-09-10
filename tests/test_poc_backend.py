@@ -9,10 +9,6 @@ from backend.flask.companies.repository import CompanyRepository
 from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.discovery.repository import DiscoveryRunRepository
-from backend.flask.website_monitoring.service import FetchResult, hash_content
-from backend.flask.website_monitoring.simulated_persistence import (
-    SimulationPersistenceService,
-)
 
 try:
     from bson import ObjectId
@@ -192,104 +188,6 @@ class CompanyAndScopingTests(unittest.TestCase):
         refreshed = competitors.get(assigned["id"], company_id="c" * 24)
         self.assertIsNotNone(refreshed)
         self.assertEqual(refreshed["company_id"], "c" * 24)
-
-
-class _TargetRepository:
-    def __init__(self):
-        self.target = {
-            "id": "t" * 24,
-            "competitor_id": "c" * 24,
-            "url": "https://example.com/blog",
-            "page_type": "BLOG",
-            "active": True,
-            "discovery_status": "ACTIVE",
-        }
-
-    def get(self, target_id):
-        return self.target if target_id == self.target["id"] else None
-
-
-class _SnapshotRepository:
-    def __init__(self):
-        self.real = {
-            "id": "r" * 24,
-            "content": "<html><main><h1>Real baseline</h1></main></html>",
-            "content_hash": hash_content("<html><main><h1>Real baseline</h1></main></html>"),
-            "is_simulated": False,
-        }
-        self.calls = []
-
-    def list_for_target(self, target_id, *, include_simulated=True):
-        self.calls.append(include_simulated)
-        return [self.real]
-
-
-class _SnapshotService:
-    def __init__(self):
-        self.calls = []
-
-    def create_snapshot(self, target_id, content, **kwargs):
-        self.calls.append((target_id, content, kwargs))
-        return {
-            "id": "s" * 24,
-            "monitoring_target_id": target_id,
-            "content": content,
-            "content_hash": hash_content(content),
-            "is_simulated": kwargs["is_simulated"],
-        }
-
-
-class _ChangeService:
-    def __init__(self):
-        self.calls = []
-
-    def create_change(self, *args, **kwargs):
-        self.calls.append((args, kwargs))
-        return {
-            "id": "h" * 24,
-            "monitoring_target_id": args[0],
-            "current_snapshot_id": kwargs["current_snapshot"]["id"]
-            if "current_snapshot" in kwargs else "s" * 24,
-            "change_type": kwargs["change_type"],
-            "summary": kwargs["summary"],
-            "is_simulated": kwargs["is_simulated"],
-        }
-
-
-class _Provider:
-    def generate(self, prompt, *, instructions, response_format=None):
-        return "<article><h2>A simulated article</h2><p>New copy.</p></article>"
-
-
-class SimulationPersistenceTests(unittest.TestCase):
-    def test_blog_simulation_writes_tagged_records_after_real_history_lookup(self):
-        snapshots = _SnapshotRepository()
-        snapshot_service = _SnapshotService()
-        changes = _ChangeService()
-        provider = _Provider()
-        service = SimulationPersistenceService(
-            _TargetRepository(),
-            snapshots,
-            snapshot_service,
-            changes,
-            provider_factory=lambda: provider,
-            fetcher=lambda url: FetchResult(
-                "<html><main><h1>Real baseline</h1></main></html>",
-                "HTTP",
-                200,
-            ),
-        )
-
-        result = service.simulate_and_persist_change("t" * 24)
-
-        self.assertEqual(snapshots.calls, [False])
-        self.assertTrue(snapshot_service.calls[0][2]["is_simulated"])
-        self.assertTrue(changes.calls[0][1]["is_simulated"])
-        self.assertIs(changes.calls[0][1]["narrative_provider"], provider)
-        self.assertEqual(result["previous_snapshot"]["id"], "r" * 24)
-        self.assertTrue(result["snapshot"]["is_simulated"])
-        self.assertTrue(result["change"]["is_simulated"])
-
 
 if __name__ == "__main__":
     unittest.main()

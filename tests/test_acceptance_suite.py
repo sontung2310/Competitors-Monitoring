@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from tests.live_acceptance_suite import run_case_with_retries
+from tests.acceptance_helpers import run_case_with_retries
 
 
 def test_case_retry_returns_second_attempt_and_structured_event() -> None:

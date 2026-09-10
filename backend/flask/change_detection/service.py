@@ -162,7 +162,6 @@ class ChangeService:
         detected_at: Optional[datetime] = None,
         change_type: Optional[str] = None,
         summary: Optional[str] = None,
-        is_simulated: bool = False,
         narrative_provider: Any | None = None,
         detected_url: str | None = None,
     ) -> dict[str, Any]:
@@ -213,8 +212,6 @@ class ChangeService:
             if not isinstance(summary, str) or not summary.strip():
                 raise ChangeError("summary override must be a non-empty string")
             resolved_summary = summary.strip()
-        if not isinstance(is_simulated, bool):
-            raise ChangeError("is_simulated must be a boolean")
         target_url = _target_url(target)
         narrative_summary = None
         resolved_detected_url = None
@@ -272,7 +269,6 @@ class ChangeService:
             narrative_summary=narrative_summary,
             detected_url=resolved_detected_url,
             status=DEFAULT_CHANGE_STATUS,
-            is_simulated=is_simulated,
         )
 
     def _load_content(
@@ -392,7 +388,6 @@ def create_change(
     detected_at: Optional[datetime] = None,
     change_type: Optional[str] = None,
     summary: Optional[str] = None,
-    is_simulated: bool = False,
     narrative_provider: Any | None = None,
     detected_url: str | None = None,
     narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
@@ -413,7 +408,6 @@ def create_change(
         detected_at=detected_at,
         change_type=change_type,
         summary=summary,
-        is_simulated=is_simulated,
         narrative_provider=narrative_provider,
         detected_url=detected_url,
     )

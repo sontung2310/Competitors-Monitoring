@@ -78,39 +78,3 @@ def remove_target(target_id: str):
     kwargs = {"company_id": request.args["company_id"]} if "company_id" in request.args else {}
     service("targets").remove_target(target_id, **kwargs)
     return empty_response()
-
-
-@monitoring_blueprint.post("/monitoring-targets/<target_id>/simulate")
-def simulate_target(target_id: str):
-    """Run the explicitly tagged, persistence-enabled PoC simulation."""
-
-    payload = request.get_json(silent=True)
-    if payload is None:
-        payload = {}
-    if not isinstance(payload, dict):
-        raise RequestValidationError("request body must be a JSON object")
-    unknown = set(payload) - {"mutation_type", "company_id"}
-    if unknown:
-        raise RequestValidationError(f"unsupported simulation fields: {sorted(unknown)}")
-    mutation_type = payload.get("mutation_type")
-    if mutation_type is not None and (
-        not isinstance(mutation_type, str) or not mutation_type.strip()
-    ):
-        raise RequestValidationError("mutation_type must be a non-empty string when supplied")
-    company_id = (
-        required_text(payload, "company_id")
-        if "company_id" in payload
-        else request.args.get("company_id")
-    )
-    if company_id is not None:
-        if not isinstance(company_id, str) or not company_id.strip():
-            raise RequestValidationError("company_id must be a non-empty string")
-        company_id = company_id.strip()
-    kwargs = {"company_id": company_id} if company_id is not None else {}
-    return json_response(
-        service("simulation").simulate_and_persist_change(
-            target_id,
-            mutation_type=mutation_type,
-            **kwargs,
-        )
-    )

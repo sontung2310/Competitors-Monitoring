@@ -7,7 +7,7 @@
         <span class="nav-icon" aria-hidden="true">⌂</span><span>Dashboard</span>
       </a>
       {% if nav_competitor_count %}
-        <a class="nav-item {% if topbar_breadcrumb == 'Competitors' or topbar_title == 'Simulate a Change' %}is-active{% endif %}" href="{% url 'competitor_detail' competitors.0.id %}?company_id={{ selected_company.id }}">
+        <a class="nav-item {% if topbar_breadcrumb == 'Competitors' %}is-active{% endif %}" href="{% url 'competitor_detail' competitors.0.id %}?company_id={{ selected_company.id }}">
           <span class="nav-icon" aria-hidden="true">◎</span><span>Competitors</span><span class="nav-count">{{ nav_competitor_count }}</span>
         </a>
       {% else %}
