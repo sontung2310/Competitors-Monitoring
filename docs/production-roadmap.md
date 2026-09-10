@@ -24,8 +24,8 @@ separate, focused tasks on the `production` branch.
 
 ## P.2 Remove simulation from production
 
-- [ ] P.2.1 Exclude `POST /api/monitoring-targets/<id>/simulate` from the `production` branch.
-- [ ] P.2.2 Remove or exclude simulation-only code paths from the `production` branch while preserving the real monitoring and change-detection paths.
+- [x] P.2.1 Exclude `POST /api/monitoring-targets/<id>/simulate` from the `production` branch.
+- [x] P.2.2 Remove or exclude simulation-only code paths from the `production` branch while preserving the real monitoring and change-detection paths.
 
 ## P.3 SQS ingestion
 
