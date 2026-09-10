@@ -29,46 +29,12 @@ INDEX_TYPE_VARIANTS: dict[str, frozenset[str]] = {
     ),
     "NEWS": frozenset({"news", "news-posts", "updates"}),
     "PRESS": frozenset({"press", "press-release", "press-releases"}),
-    "CASE_STUDIES": frozenset(
-        {"case-study", "case-studies", "case-study-archive", "casestudy"}
-    ),
-    "TESTIMONIALS": frozenset(
-        {"testimonial", "testimonials", "client-testimonials"}
-    ),
-    "REVIEWS": frozenset(
-        {
-            "review",
-            "reviews",
-            "reviews-page",
-            "client-reviews",
-            "marketing-reviews",
-            "lyfe-marketing-reviews",
-        }
-    ),
-    "SUCCESS_STORIES": frozenset(
-        {"success-story", "success-stories", "small-business-success-stories"}
-    ),
-    "ABOUT": frozenset({"about", "about-us", "about-lyfe-marketing"}),
-    "CAREERS": frozenset(
-        {
-            "career",
-            "careers",
-            "career-opportunities",
-            "jobs",
-            "join-us",
-        }
-    ),
-    "TEAM": frozenset({"leadership", "people", "team", "team-members"}),
-    "CONTACT": frozenset({"contact", "contact-us"}),
-    "INDUSTRIES": frozenset({"industry", "industries"}),
-    "WORK": frozenset({"work", "showcase"}),
-    "PORTFOLIO": frozenset(
-        {"portfolio", "portfolio-posts", "website-portfolio"}
-    ),
-    "RESULTS": frozenset({"result", "results"}),
-    "RESOURCES": frozenset({"resource", "resources"}),
+    # Production uses one coarse PRODUCTS type for stable product-listing
+    # pages. Product/item roots are handled separately below so that
+    # /product/<slug> remains an item candidate rather than collapsing to the
+    # /product index.
+    "PRODUCTS": frozenset({"sale"}),
     "SERVICES": frozenset({"main-services", "service", "services"}),
-    "CALCULATOR": frozenset({"calculator", "roi-cal-page"}),
     "PRICING": frozenset({"pricing", "plans"}),
 }
 
@@ -77,13 +43,12 @@ INDEX_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
     for variants in INDEX_TYPE_VARIANTS.values()
 )
 
-INDEX_PATH_ALIASES = {"service": "services", "result": "results"}
+INDEX_PATH_ALIASES = {"service": "services"}
 
 # A path under one of these roots describes an independently meaningful item.
 # It is deliberately an allowlist: arbitrary deep paths do not become targets.
 ITEM_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"^(?:item|items|product|products)$"),
-    re.compile(r"^(?:package|packages)$"),
     re.compile(r"^(?:solution|solutions)$"),
 )
 
@@ -108,8 +73,6 @@ ITEM_PATH_SEGMENTS = frozenset(
         "items",
         "product",
         "products",
-        "package",
-        "packages",
         "solution",
         "solutions",
     }

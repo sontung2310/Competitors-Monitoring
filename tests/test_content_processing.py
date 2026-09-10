@@ -63,6 +63,11 @@ class TextBlobProcessorTests(unittest.TestCase):
 
         self.assertIsInstance(processor, ProductListingProcessor)
 
+    def test_production_products_page_type_resolves_to_structured_processor(self):
+        processor = resolve_content_processor("PRODUCTS")
+
+        self.assertIsInstance(processor, ProductListingProcessor)
+
     def test_extract_products_uses_url_name_and_current_sale_price(self):
         content = """
         <ul>

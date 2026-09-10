@@ -321,7 +321,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(
             normalize_url("https://example.com/case-study-archive/customer-story"),
-            "https://example.com/case-study-archive",
+            "https://example.com/case-study-archive/customer-story",
         )
         self.assertEqual(
             normalize_url(
@@ -335,7 +335,7 @@ class DiscoveryTests(unittest.TestCase):
         )
         self.assertEqual(
             normalize_url("https://example.com/result/customer"),
-            "https://example.com/results",
+            "https://example.com/result/customer",
         )
         self.assertEqual(
             discovery_scope("https://example.com/products/widget"),
@@ -354,9 +354,16 @@ class DiscoveryTests(unittest.TestCase):
             discovery_scope("https://example.com/blog-posts/local-seo-mastery"),
             "INDEX",
         )
+        for segment in ("news-posts", "press-releases"):
+            self.assertEqual(
+                discovery_scope(f"https://example.com/{segment}/entry"),
+                "INDEX",
+            )
+            self.assertEqual(
+                normalize_url(f"https://example.com/{segment}/entry"),
+                f"https://example.com/{segment}",
+            )
         for segment in (
-            "news-posts",
-            "press-releases",
             "client-testimonials",
             "client-reviews",
             "about-lyfe-marketing",
@@ -365,11 +372,11 @@ class DiscoveryTests(unittest.TestCase):
         ):
             self.assertEqual(
                 discovery_scope(f"https://example.com/{segment}/entry"),
-                "INDEX",
+                "UNMATCHED",
             )
             self.assertEqual(
                 normalize_url(f"https://example.com/{segment}/entry"),
-                f"https://example.com/{segment}",
+                f"https://example.com/{segment}/entry",
             )
         self.assertEqual(
             discovery_scope("https://example.com/what-your-score-says-about-you-2"),
@@ -570,6 +577,58 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(classifier.batches), 1)
         self.assertEqual([candidate.url for candidate in classifier.batches[0]], ["https://example.com/opaque"])
 
+    def test_production_rule_schema_only_suggests_six_core_types(self):
+        core_paths = {
+            "/blog": "BLOG",
+            "/news": "NEWS",
+            "/pricing": "PRICING",
+            "/sale": "PRODUCTS",
+            "/services": "SERVICES",
+            "/press": "PRESS",
+            "/product/blue-shoe": "PRODUCTS",
+            "/solutions": "PRODUCTS",
+        }
+        for path, expected_type in core_paths.items():
+            with self.subTest(path=path):
+                result = classify_by_rules(
+                    CandidateForClassification(
+                        f"https://example.com{path}",
+                        f"https://example.com{path}",
+                    )
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result.page_type, expected_type)
+                self.assertEqual(result.discovery_status, "SUGGESTED")
+
+        removed_paths = (
+            "/about-us",
+            "/careers",
+            "/work",
+            "/contact",
+            "/case-study-archive",
+            "/packages",
+        )
+        for path in removed_paths:
+            with self.subTest(path=path):
+                result = classify_by_rules(
+                    CandidateForClassification(
+                        f"https://example.com{path}",
+                        f"https://example.com{path}",
+                    )
+                )
+                self.assertIsNone(result)
+                fallback = classify_candidates(
+                    (
+                        CandidateForClassification(
+                            f"https://example.com{path}",
+                            f"https://example.com{path}",
+                        ),
+                    ),
+                    DeterministicStubClassifier(),
+                )[0]
+                self.assertEqual(fallback.page_type, "OTHER")
+                self.assertEqual(fallback.discovery_status, "DISCARDED")
+
     def test_flat_leaf_slugs_do_not_match_index_page_types(self):
         false_positive_paths = (
             "/instagram-video-for-business-review",
@@ -749,11 +808,40 @@ class DiscoveryTests(unittest.TestCase):
 
         instructions = " ".join(provider.calls[0]["instructions"].split())
         self.assertIn("index-vs-item distinction strictly", instructions)
-        self.assertIn("individual article", instructions)
+        self.assertIn("individual item", instructions)
         self.assertIn("flat descriptive slug is not an index merely", instructions)
-        self.assertIn("durable service or industry offering", instructions)
+        self.assertIn("durable service page", instructions)
         self.assertIn('homepage root URL (path "/")', instructions)
-        self.assertIn("choose DISCARDED rather than guessing", instructions)
+        self.assertIn("choose OTHER and DISCARDED rather than guessing", instructions)
+        self.assertIn(
+            "BLOG, NEWS, PRICING, PRODUCTS, SERVICES, PRESS, or OTHER",
+            instructions,
+        )
+        for removed_type in (
+            "CAREERS",
+            "TEAM",
+            "CEO",
+            "ABOUT",
+            "CASE_STUDIES",
+            "SUCCESS_STORIES",
+            "TESTIMONIALS",
+            "REVIEWS",
+            "INDUSTRIES",
+            "CONTACT",
+            "WORK",
+            "RESULTS",
+            "PORTFOLIO",
+            "PACKAGES",
+        ):
+            self.assertNotIn(removed_type, instructions)
+
+        page_type_schema = provider.calls[0]["response_format"]["schema"]
+        self.assertEqual(
+            page_type_schema["properties"]["classifications"]["items"]["properties"][
+                "page_type"
+            ]["enum"],
+            ["BLOG", "NEWS", "PRICING", "PRODUCTS", "SERVICES", "PRESS", "OTHER"],
+        )
 
     def test_openai_classifier_sends_default_gpt4o_to_shared_provider(self):
         client = _FakeOpenAIClient(

@@ -478,6 +478,9 @@ class ChangeCreationTests(unittest.TestCase):
         self.assertEqual(derive_change_type("BLOG"), "NEW_BLOG")
         self.assertEqual(derive_change_type("PRICING"), "PRICE_CHANGE")
         self.assertEqual(derive_change_type("PRODUCTS"), "PAGE_UPDATE")
+        self.assertEqual(derive_change_type("NEWS"), "PAGE_UPDATE")
+        self.assertEqual(derive_change_type("SERVICES"), "PAGE_UPDATE")
+        self.assertEqual(derive_change_type("PRESS"), "PAGE_UPDATE")
         self.assertEqual(derive_change_type("CAMPAIGN"), "PAGE_UPDATE")
 
 
