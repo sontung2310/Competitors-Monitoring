@@ -11,7 +11,7 @@ deferred to roadmap Step 5.
 
 - Python 3.11 or newer
 - A MongoDB database, typically MongoDB Atlas for the live PoC data
-- An OpenAI API key for discovery fallback classification and simulations
+- An OpenAI API key for discovery fallback classification and optional narrative enrichment
 - Chromium for Playwright’s browser-fetch fallback
 
 ## Installation
@@ -105,16 +105,15 @@ Open [http://127.0.0.1:8000/](http://127.0.0.1:8000/) in a browser. The Django
 frontend uses `FLASK_API_BASE_URL` to reach the Flask service; start Flask
 first and make sure this value points to the same host and port.
 
-## PoC UI flow
+## UI flow
 
 The UI is company-scoped through the company selector:
 
 1. Select Marketing Eye to view Lyfe Marketing.
 2. Open the competitor detail page and review or activate discovered candidates.
-3. Use **Simulate a Change** on an active target to run the real persistence-enabled simulation.
-4. Open the changes feed and verify the result carries the visible **SIMULATED** marker.
-5. Switch to The Athletes Foot to view JD Sports AU without Marketing Eye data.
-6. Repeat the flow for JD Sports, including a product-listing simulation.
+3. Open the changes feed to review detected changes.
+4. Switch to The Athletes Foot to view JD Sports AU without Marketing Eye data.
+5. Repeat the discovery and monitoring flow for JD Sports.
 
 JD Sports discovery can take up to approximately 12 minutes. For a live demo,
 run that discovery before the session. Marketing Eye/Lyfe discovery normally
@@ -129,7 +128,7 @@ backend/flask/
 ├── companies/                # Company identity routes, service, repository
 ├── competitors/              # Competitor CRUD and company scoping
 ├── discovery/                # Robots, sitemaps, links, classification, runs
-├── website_monitoring/       # Fetch, normalize, monitor, simulate
+├── website_monitoring/       # Fetch, normalize, monitor, and process changes
 ├── snapshot/                 # Snapshot metadata and local content storage
 ├── change_detection/         # Change/event reads and persistence boundary
 ├── scheduler/                # Per-target scheduling service
@@ -195,6 +194,6 @@ python scripts/check_unmerged_branches.py
   [docs/api-contract.md](docs/api-contract.md) when the Flask surface changes.
 - Do not place API keys, MongoDB URIs, or other credentials in source files,
   logs, screenshots, or commits.
-- The original read-only simulation helpers remain available for acceptance
-  verification. The HTTP simulation endpoint is the explicit PoC path that
-  persists clearly tagged simulated records.
+- Production has no simulation endpoint or simulation-only verification tooling.
+  The legacy `is_simulated` field remains readable for historical records, but
+  production code does not create simulated snapshots or changes.

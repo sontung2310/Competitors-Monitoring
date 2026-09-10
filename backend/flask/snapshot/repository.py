@@ -36,7 +36,6 @@ class SnapshotRepository(BaseMongoRepository):
         storage_path: str,
         fetch_method: str,
         http_status: int,
-        is_simulated: bool = False,
         now: Optional[Any] = None,
     ) -> dict[str, Any]:
         """Insert snapshot metadata and return its serialized representation."""
@@ -47,9 +46,6 @@ class SnapshotRepository(BaseMongoRepository):
         _require_relative_storage_path(storage_path)
         _require_text(fetch_method, "fetch_method")
         _require_http_status(http_status)
-        if not isinstance(is_simulated, bool):
-            raise ValueError("is_simulated must be a boolean")
-
         timestamp = now or utc_now()
         document = {
             "monitoring_target_id": to_object_id(monitoring_target_id),
@@ -62,8 +58,6 @@ class SnapshotRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
-        if is_simulated:
-            document["is_simulated"] = True
         result = self.collection.insert_one(document)
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:

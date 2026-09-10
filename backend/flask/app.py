@@ -27,7 +27,6 @@ from backend.flask.llm_provider import OpenAIProvider
 from backend.flask.snapshot.repository import SnapshotRepository
 from backend.flask.snapshot.service import SnapshotService
 from backend.flask.snapshot.storage import SnapshotStorage
-from backend.flask.website_monitoring.simulated_persistence import SimulationPersistenceService
 from backend.flask.website_monitoring.repository import (
     MonitoringRunRepository,
     MonitoringTargetRepository,
@@ -150,12 +149,6 @@ def _build_services(
         storage_root=storage_root,
         narrative_provider_factory=llm_provider_factory,
     )
-    simulation_service = SimulationPersistenceService.from_database(
-        database,
-        storage_root=storage_root,
-        provider_factory=llm_provider_factory,
-        narrative_provider_factory=llm_provider_factory,
-    )
     return {
         "companies": company_service,
         "competitors": CompetitorService(competitor_repository, user_id=user_id),
@@ -163,7 +156,6 @@ def _build_services(
         "targets": target_service,
         "changes": change_service,
         "monitoring": monitoring_service,
-        "simulation": simulation_service,
     }
 
 

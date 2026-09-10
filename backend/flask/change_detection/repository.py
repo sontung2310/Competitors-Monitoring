@@ -47,7 +47,6 @@ class ChangeRepository(BaseMongoRepository):
         change_type: str,
         summary: str,
         status: str,
-        is_simulated: bool = False,
         now: Optional[Any] = None,
         narrative_summary: Optional[str] = None,
         detected_url: Optional[str] = None,
@@ -62,9 +61,6 @@ class ChangeRepository(BaseMongoRepository):
         if detected_url is not None:
             _require_text(detected_url, "detected_url")
         _require_text(status, "status")
-        if not isinstance(is_simulated, bool):
-            raise ValueError("is_simulated must be a boolean")
-
         timestamp = now or utc_now()
         document = {
             "monitoring_target_id": to_object_id(monitoring_target_id),
@@ -79,8 +75,6 @@ class ChangeRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
-        if is_simulated:
-            document["is_simulated"] = True
         result = self.collection.insert_one(document)
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:

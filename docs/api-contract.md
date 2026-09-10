@@ -233,9 +233,9 @@ Read the newest change feed. It never creates or mutates records.
   }]
   ```
 
-  For backwards compatibility, older real change records may omit
-  `is_simulated`; an omitted field means `false`. Simulated records and
-  simulation responses always include `is_simulated: true`.
+  For backwards compatibility, older change records may omit `is_simulated`;
+  an omitted field means `false`. The field is retained for historical data,
+  but production does not create simulated records.
 
 ### `GET /changes/<id>`
 
@@ -314,35 +314,12 @@ company.
 previous discovery run. `FAILED` exposes the backend's error message for the
 frontend error state.
 
-### `POST /monitoring-targets/<id>/simulate`
-
-Run the persistence-enabled PoC simulation for an active target. Optional
-`company_id` may be supplied as a query parameter or in the JSON body.
-
-- Request: `{ "mutation_type": string?, "company_id": string? }`
-- `mutation_type` is only used for `PRODUCT_LISTING` targets and may be
-  `NEW_PRODUCT`, `PRODUCT_REMOVED`, or `PRICE_CHANGE`. When omitted, the
-  product-listing simulation generates all three events.
-- Response `200`:
-
-  ```json
-  {"monitoring_target_id", "page_type", "is_simulated": true,
-  "previous_snapshot", "snapshot", "change", "changes"}
-  ```
-
-The endpoint calls the original read-only simulation helper first, then
-persists a new snapshot and one or more change records with
-`is_simulated: true`. It does not update the target's real monitoring
-baseline. The next genuine `monitor_target` comparison explicitly excludes
-simulated snapshots and uses the newest non-simulated snapshot.
-
 ## Step 4 contract audit checkpoint (2026-09-09)
 
 The registered Flask routes and the Django API client were audited together
 against this frozen document. Every actual frontend call uses the documented
 method, path, query/body fields, and success/error handling. Every registered
 backend endpoint is represented above, including the PoC discovery-run status
-and simulation endpoints. One documentation gap was found and corrected: real
-legacy change rows may omit `is_simulated`, while simulated rows include it as
-`true`; the frontend treats an omitted flag as false. No backend or frontend
-code change was required for this audit.
+endpoint. One documentation gap was found and corrected: legacy change rows
+may omit `is_simulated`, while the frontend treats an omitted flag as false.
+Production retains the field for compatibility but has no simulation writer.

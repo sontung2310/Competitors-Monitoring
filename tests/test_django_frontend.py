@@ -69,15 +69,14 @@ class FakeAPIClient:
         self.targets = [dict(TARGET), dict(CANDIDATE)]
         self.changes = [
             {
-                "id": "change-simulated",
+                "id": "change-real",
                 "monitoring_target_id": TARGET["id"],
                 "change_type": "NEW_BLOG",
-                "summary": "NEW_BLOG: a simulated article was added.",
+                "summary": "NEW_BLOG: a new article was added.",
                 "narrative_summary": "Lyfe Marketing published a new article in its blog feed.",
                 "detected_url": "https://www.lyfemarketing.com/blog/new-article",
                 "detected_at": "2026-09-08T01:02:03Z",
                 "status": "NEW",
-                "is_simulated": True,
             }
         ]
 
@@ -174,7 +173,7 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, "https://www.lyfemarketing.com/")
         self.assertNotContains(response, "JD Sports AU")
 
-    def test_detail_renders_candidate_and_simulated_marker_from_api_flag(self):
+    def test_detail_renders_candidate_and_changes(self):
         response = self.client.get("/competitors/competitor-lyfe/?company_id=company-marketing-eye")
 
         self.assertEqual(response.status_code, 200)
@@ -182,10 +181,16 @@ class DjangoFrontendViewTests(SimpleTestCase):
         self.assertContains(response, "Activate")
         self.assertNotContains(response, "The Athletes Foot")
 
+        active_response = self.client.get(
+            "/competitors/competitor-lyfe/?company_id=company-marketing-eye&status=ACTIVE"
+        )
+        self.assertEqual(active_response.status_code, 200)
+        self.assertNotContains(active_response, "Simulate a Change")
+        self.assertNotContains(active_response, "/simulate/")
+
         response = self.client.get("/changes/?company_id=company-marketing-eye")
-        self.assertContains(response, "🧪 SIMULATED")
         self.assertContains(response, "Lyfe Marketing published a new article in its blog feed.")
-        self.assertContains(response, "NEW_BLOG: a simulated article was added.")
+        self.assertContains(response, "NEW_BLOG: a new article was added.")
         self.assertContains(response, "change-narrative")
         self.assertContains(response, "change-mechanical")
         self.assertContains(response, 'href="https://www.lyfemarketing.com/blog/new-article"')

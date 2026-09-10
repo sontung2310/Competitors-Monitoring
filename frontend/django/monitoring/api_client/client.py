@@ -171,18 +171,6 @@ class APIClient:
     def delete_target(self, target_id: str, company_id: str) -> None:
         self._request("DELETE", f"monitoring-targets/{target_id}", params={"company_id": company_id})
 
-    def simulate(
-        self,
-        target_id: str,
-        company_id: str,
-        *,
-        mutation_type: str | None = None,
-    ) -> dict[str, Any]:
-        body: dict[str, Any] = {"company_id": company_id}
-        if mutation_type:
-            body["mutation_type"] = mutation_type
-        return self._request("POST", f"monitoring-targets/{target_id}/simulate", body=body)
-
     def list_changes(
         self,
         company_id: str,
