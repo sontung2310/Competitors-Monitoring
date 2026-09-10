@@ -10,8 +10,8 @@ separate, focused tasks on the `production` branch.
 
 ## P.0 Branch & infrastructure setup
 
-- [ ] P.0.1 Create the `production` branch from the current `main` branch.
-- [ ] P.0.2 Enable GitHub branch protection on both `main` and `production` (require PRs and prohibit direct pushes).
+- [x] P.0.1 Create the `production` branch from the current `main` branch.
+- [x] P.0.2 Enable GitHub branch protection on both `main` and `production` (require PRs and prohibit direct pushes).
 
 ## P.1 Page-type schema consolidation
 
