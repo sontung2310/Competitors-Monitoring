@@ -124,6 +124,23 @@ class CompetitorRepository(BaseMongoRepository):
                 result = migrated
         return serialize_document(result)
 
+    def find_by_company_and_website_url(
+        self,
+        company_id: Any,
+        website_url: str,
+    ) -> Optional[dict[str, Any]]:
+        """Find one competitor by its tenant and normalized website URL."""
+
+        _require_text(website_url, "website_url")
+        return serialize_document(
+            self.collection.find_one(
+                {
+                    "company_id": _relationship_id(company_id, "company_id"),
+                    "website_url": website_url.strip(),
+                }
+            )
+        )
+
     def list_for_user(
         self,
         user_id: str,

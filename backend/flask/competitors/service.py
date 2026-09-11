@@ -62,6 +62,52 @@ class CompetitorService:
             active=active,
         )
 
+    def find_or_create_competitor(
+        self,
+        *,
+        company_id: Any,
+        name: str,
+        website_url: str,
+        active: bool = True,
+    ) -> dict[str, Any]:
+        """Resolve one tenant-scoped competitor without duplicate inserts."""
+
+        if company_id is None:
+            raise RequestValidationError("company_id is required")
+        if not isinstance(name, str) or not name.strip():
+            raise RequestValidationError("name must be a non-empty string")
+        if not isinstance(website_url, str) or not website_url.strip():
+            raise RequestValidationError("website_url must be a non-empty string")
+        if not isinstance(active, bool):
+            raise RequestValidationError("active must be a boolean")
+
+        normalized_name = name.strip()
+        normalized_url = website_url.strip()
+        existing = self.repository.find_by_company_and_website_url(
+            company_id,
+            normalized_url,
+        )
+        if existing is not None:
+            return existing
+
+        try:
+            return self.repository.create(
+                company_id=company_id,
+                name=normalized_name,
+                website_url=normalized_url,
+                active=active,
+            )
+        except Exception as exc:  # noqa: BLE001 - recover only a unique-key race
+            if not _is_duplicate_key_error(exc):
+                raise
+            existing = self.repository.find_by_company_and_website_url(
+                company_id,
+                normalized_url,
+            )
+            if existing is None:
+                raise
+            return existing
+
     def update_competitor(
         self,
         competitor_id: Any,
@@ -88,3 +134,11 @@ class CompetitorService:
             company_id=company_id,
         ):
             raise NotFoundError(f"competitor {competitor_id!r} was not found")
+
+
+def _is_duplicate_key_error(error: Exception) -> bool:
+    try:
+        from pymongo.errors import DuplicateKeyError
+    except ImportError:
+        return False
+    return isinstance(error, DuplicateKeyError)
