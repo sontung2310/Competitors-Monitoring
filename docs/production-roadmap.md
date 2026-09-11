@@ -42,6 +42,12 @@ separate, focused tasks on the `production` branch.
 - [ ] P.4.2 Implement the new-competitor first-run flow: create the record, run discovery, auto-activate the suggested pages, and establish an initial snapshot for each newly active target without creating a change.
 - [ ] P.4.3 Wire both flows into `monitor_target()` for fresh snapshots and change detection, relying on the existing hash-comparison behavior.
 
+### P.3/P.4 prerequisite implementation (TON-41)
+
+- [x] Add a `discovery_runs` repository query for the latest successful run per competitor; freshness continues to come from the existing run lifecycle rather than a second timestamp field.
+- [x] Add the service-layer automatic discovery reconciliation entry point: run discovery, activate newly suggested targets, and history-aware deactivate targets no longer suggested.
+- [x] Keep reconciliation deliberately snapshot-free. The SQS-triggered flow will hand newly active targets to the existing per-target scheduler on its next cycle, removing active-target snapshotting from the SQS visibility-timeout window. A real Lyfe Marketing run completed in 41.17 seconds against the 900-second queue timeout and changed target state without creating snapshots or monitoring runs.
+
 ## P.5 Automatic tracking reconciliation
 
 - [ ] P.5.1 Add a monthly discovery schedule for every competitor, in addition to on-demand re-discovery when an SQS message finds stale discovery data.

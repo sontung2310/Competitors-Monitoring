@@ -172,6 +172,59 @@ class CompanyAndScopingTests(unittest.TestCase):
         self.assertEqual(finished["candidate_count"], 0)
         self.assertEqual(repository.get("run-1")["summary"]["suggested_count"], 0)
 
+    def test_discovery_run_repository_returns_latest_successful_run(self):
+        database = _Database()
+        repository = DiscoveryRunRepository.from_database(database)
+        repository.ensure_indexes()
+        started_at = datetime(2026, 9, 1, tzinfo=timezone.utc)
+
+        repository.start(
+            "run-old",
+            competitor_id="c" * 24,
+            company_id="a" * 24,
+            started_at=started_at,
+        )
+        repository.succeed(
+            "run-old",
+            candidate_count=1,
+            finished_at=datetime(2026, 9, 1, 0, 5, tzinfo=timezone.utc),
+        )
+        repository.start(
+            "run-failed",
+            competitor_id="c" * 24,
+            company_id="a" * 24,
+            started_at=datetime(2026, 9, 2, tzinfo=timezone.utc),
+        )
+        repository.fail("run-failed", "source unavailable")
+        repository.start(
+            "run-new",
+            competitor_id="c" * 24,
+            company_id="a" * 24,
+            started_at=datetime(2026, 9, 3, tzinfo=timezone.utc),
+        )
+        repository.succeed(
+            "run-new",
+            candidate_count=2,
+            finished_at=datetime(2026, 9, 3, 0, 7, tzinfo=timezone.utc),
+        )
+
+        latest = repository.find_latest_successful(
+            "c" * 24,
+            company_id="a" * 24,
+        )
+
+        self.assertEqual(latest["run_id"], "run-new")
+        self.assertEqual(
+            latest["finished_at"],
+            datetime(2026, 9, 3, 0, 7, tzinfo=timezone.utc),
+        )
+        self.assertIsNone(
+            repository.find_latest_successful(
+                "c" * 24,
+                company_id="b" * 24,
+            )
+        )
+
     def test_migration_does_not_clear_explicit_company_assignments(self):
         database = _Database()
         competitors = CompetitorRepository.from_database(database)

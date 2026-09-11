@@ -7,6 +7,7 @@ import time
 from dataclasses import dataclass, replace
 from typing import Any, Callable, Iterable, Mapping, Optional, Protocol, Sequence
 from urllib.parse import urlsplit, urlunsplit
+from uuid import uuid4
 
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
@@ -141,6 +142,14 @@ class DiscoveryRunTracker(Protocol):
     def get(self, run_id: str) -> Mapping[str, Any] | None:
         """Read one discovery run by its public run identifier."""
 
+    def find_latest_successful(
+        self,
+        competitor_id: Any,
+        *,
+        company_id: Any = None,
+    ) -> Mapping[str, Any] | None:
+        """Return the latest successful run for one scoped competitor."""
+
 
 @dataclass(frozen=True)
 class _NormalizedCandidate:
@@ -173,6 +182,40 @@ class DiscoverySummary:
     normalized_count: int
     suggested_count: int
     discarded_count: int
+
+
+@dataclass(frozen=True)
+class DiscoveryReconciliationResult:
+    """The state transition produced by one automatic discovery pass.
+
+    This result deliberately contains no monitoring snapshots.  SQS-triggered
+    discovery and target reconciliation must finish independently of the
+    per-target monitoring scheduler so a long discovery does not also have to
+    wait for every active page fetch.
+    """
+
+    run_id: str
+    competitor_id: Any
+    active_before: tuple[Mapping[str, Any], ...]
+    active_after: tuple[Mapping[str, Any], ...]
+    activated_target_ids: tuple[Any, ...]
+    deactivated_target_ids: tuple[Any, ...]
+    suggested_count: int
+    discovered_count: int
+
+    def as_dict(self) -> dict[str, Any]:
+        """Return a defensive, JSON-friendly summary for callers."""
+
+        return {
+            "run_id": self.run_id,
+            "competitor_id": self.competitor_id,
+            "active_before": [dict(target) for target in self.active_before],
+            "active_after": [dict(target) for target in self.active_after],
+            "activated_target_ids": list(self.activated_target_ids),
+            "deactivated_target_ids": list(self.deactivated_target_ids),
+            "suggested_count": self.suggested_count,
+            "discovered_count": self.discovered_count,
+        }
 
 
 class DiscoveryService:
@@ -226,6 +269,7 @@ class DiscoveryService:
         self.liveness_backoff_seconds = liveness_backoff_seconds
         self.liveness_sleep = liveness_sleep or time.sleep
         self.last_summary: DiscoverySummary | None = None
+        self.last_discovered_suggested_urls: frozenset[str] = frozenset()
         self.last_audit_result: DiscoveryAuditResult | None = None
         self.last_audit_error: str | None = None
         if any(source is None for source in (robots_source, sitemap_source, link_source)):
@@ -637,6 +681,141 @@ class DiscoveryService:
             raise
         return persisted
 
+    def latest_successful_run(
+        self,
+        competitor_id: Any,
+        *,
+        company_id: Any = None,
+    ) -> Mapping[str, Any] | None:
+        """Return the latest successful discovery run for one competitor."""
+
+        if self.run_repository is None:
+            raise DiscoveryError(
+                "discovery run repository is required to query discovery freshness"
+            )
+        return self.run_repository.find_latest_successful(
+            competitor_id,
+            company_id=company_id,
+        )
+
+    def discover_and_reconcile(
+        self,
+        competitor_id: Any,
+        *,
+        user_id: Optional[str] = None,
+        company_id: Any = None,
+        run_id: str | None = None,
+    ) -> DiscoveryReconciliationResult:
+        """Run discovery and reconcile the automatically tracked target set.
+
+        This is the production/SQS discovery boundary.  It intentionally does
+        not call ``monitor_target`` or create snapshots.  The existing
+        scheduler will pick up the resulting active targets on its next
+        cadence, keeping the SQS message's processing window limited to
+        discovery and state reconciliation.
+        """
+
+        if self.run_repository is None:
+            raise DiscoveryError(
+                "discovery run repository is required for automatic reconciliation"
+            )
+        if company_id is None and user_id is not None:
+            competitor = self.competitor_repository.get(
+                competitor_id,
+                user_id=user_id,
+            )
+            if competitor is None:
+                raise DiscoveryNotFoundError(
+                    f"competitor {competitor_id!r} was not found"
+                )
+        else:
+            self._get_competitor(competitor_id, company_id=company_id)
+        active_before = tuple(
+            dict(target)
+            for target in self.monitoring_target_repository.list_active_targets(
+                competitor_id
+            )
+        )
+        resolved_run_id = run_id or uuid4().hex
+        self.run_repository.start(
+            resolved_run_id,
+            competitor_id=competitor_id,
+            company_id=company_id,
+        )
+
+        activated_target_ids: list[Any] = []
+        deactivated_target_ids: list[Any] = []
+        try:
+            persisted = self._discover_website_impl(
+                competitor_id,
+                user_id=user_id,
+                company_id=company_id,
+            )
+            persisted_by_url = {
+                candidate.get("url"): candidate
+                for candidate in persisted
+                if isinstance(candidate.get("url"), str)
+            }
+            suggested_urls = set(self.last_discovered_suggested_urls)
+            # The second-pass audit may discard a first-pass suggestion.  Its
+            # persisted state is the final decision used by reconciliation.
+            suggested_urls.difference_update(
+                url
+                for url in suggested_urls
+                if persisted_by_url.get(url, {}).get("discovery_status")
+                == "DISCARDED"
+            )
+
+            for candidate in persisted:
+                if (
+                    candidate.get("url") in suggested_urls
+                    and candidate.get("active") is not True
+                    and candidate.get("discovery_status") in {"SUGGESTED", "ACTIVE"}
+                ):
+                    activated = self.activate_candidate(
+                        candidate["id"],
+                        company_id=company_id,
+                    )
+                    activated_target_ids.append(activated["id"])
+
+            for target in active_before:
+                if target.get("url") in suggested_urls:
+                    continue
+                self.remove_candidate(target["id"], company_id=company_id)
+                deactivated_target_ids.append(target["id"])
+
+            active_after = tuple(
+                dict(target)
+                for target in self.monitoring_target_repository.list_active_targets(
+                    competitor_id
+                )
+            )
+            self.run_repository.succeed(
+                resolved_run_id,
+                candidate_count=len(persisted),
+                summary=_discovery_summary_payload(self.last_summary),
+            )
+        except Exception as exc:
+            try:
+                self.run_repository.fail(resolved_run_id, str(exc))
+            except Exception:
+                logger.exception(
+                    "could not mark reconciliation run failed run_id=%s",
+                    resolved_run_id,
+                )
+            raise
+
+        return DiscoveryReconciliationResult(
+            run_id=resolved_run_id,
+            competitor_id=competitor_id,
+            active_before=active_before,
+            active_after=active_after,
+            activated_target_ids=tuple(activated_target_ids),
+            deactivated_target_ids=tuple(deactivated_target_ids),
+            suggested_count=len(suggested_urls),
+            discovered_count=len(persisted),
+        )
+
     def get_discovery_run(
         self,
         run_id: str,
@@ -662,6 +841,8 @@ class DiscoveryService:
         company_id: Any = None,
     ) -> list[dict[str, Any]]:
         """Discover, classify, and persist Layer 2 candidates for one competitor."""
+
+        self.last_discovered_suggested_urls = frozenset()
 
         if company_id is not None:
             competitor = self.competitor_repository.get(
@@ -735,6 +916,11 @@ class DiscoveryService:
             classification_inputs,
             self.fallback_classifier,
             batch_size=self.classifier_batch_size,
+        )
+        self.last_discovered_suggested_urls = frozenset(
+            candidate.url
+            for candidate, classification in zip(normalized, classifications)
+            if classification.discovery_status == "SUGGESTED"
         )
 
         persisted: list[dict[str, Any]] = []

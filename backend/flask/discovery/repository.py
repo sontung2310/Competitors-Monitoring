@@ -66,6 +66,32 @@ class DiscoveryRunRepository(BaseMongoRepository):
         _require_text(run_id, "run_id")
         return serialize_document(self.collection.find_one({"run_id": run_id}))
 
+    def find_latest_successful(
+        self,
+        competitor_id: Any,
+        *,
+        company_id: Any = None,
+    ) -> Optional[dict[str, Any]]:
+        """Return the most recently finished successful run for a competitor.
+
+        Discovery freshness is derived from the existing discovery-run
+        lifecycle records.  No timestamp is copied onto the competitor, so
+        failed and in-progress runs cannot accidentally make a competitor
+        appear fresh.
+        """
+
+        query: dict[str, Any] = {
+            "competitor_id": to_object_id(competitor_id),
+            "status": self.SUCCESS,
+        }
+        if company_id is not None:
+            query["company_id"] = to_object_id(company_id)
+        runs = self._find_sorted(
+            query,
+            [("finished_at", -1), ("started_at", -1)],
+        )
+        return runs[0] if runs else None
+
     def succeed(
         self,
         run_id: str,
