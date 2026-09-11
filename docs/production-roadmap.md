@@ -29,12 +29,18 @@ separate, focused tasks on the `production` branch.
 
 ## P.3 SQS ingestion
 
-- [ ] P.3.1 Add a standalone background worker process that long-polls the AWS SQS queue and calls the existing service layer without going through a Flask HTTP route or the internal scheduler.
-- [ ] P.3.2 Implement handling for the inbound message schema: `strategy_id`, `company_domain_id`, `company_url`, and informational `host` metadata, without filtering on `host`.
-- [ ] P.3.3 Implement find-or-create company/competitor logic keyed by `company_domain_id` and `company_url`, with the competitor scoped to the identified company.
-- [ ] P.3.4 Make message processing idempotent for SQS at-least-once delivery by reusing the existing 1.10 duplicate-handling pattern rather than introducing a separate deduplication mechanism.
-- [ ] P.3.5 Configure bounded retries and route messages that continue to fail to a Dead Letter Queue; confirm the AWS-side DLQ configuration or include it in implementation setup.
-- [ ] P.3.6 Configure SQS queue URL, region, and IAM credentials through environment variables, never hardcoding or logging credentials.
+- [x] P.3.1 Add a standalone background worker process that long-polls the AWS SQS queue and calls the existing service layer without going through a Flask HTTP route or the internal scheduler.
+- [x] P.3.2 Implement handling for the inbound message schema: `strategy_id`, `company_domain_id`, `company_url`, and informational `host` metadata, without filtering on `host`.
+- [x] P.3.3 Implement find-or-create company/competitor logic keyed by `company_domain_id` and `company_url`, with the competitor scoped to the identified company.
+- [x] P.3.4 Make message processing idempotent for SQS at-least-once delivery by reusing the existing 1.10 duplicate-handling pattern rather than introducing a separate deduplication mechanism.
+- [x] P.3.5 Configure bounded retries and route messages that continue to fail to a Dead Letter Queue; confirm the AWS-side DLQ configuration or include it in implementation setup.
+- [x] P.3.6 Configure SQS queue URL, region, and IAM credentials through environment variables, never hardcoding or logging credentials.
+
+### P.3 handler/worker evidence (TON-42, 2026-09-11)
+
+- `sqs_handler.py` validates and normalizes the four-field message schema, handles existing/new competitors through the service layer, and keeps both paths discovery/reconciliation-only.
+- `sqs_worker.py` uses a 20-second long poll and deletes only successfully processed messages; malformed and failed messages remain for the AWS retry/DLQ policy.
+- Real AWS verification confirmed `ap-southeast-2`, a 900-second visibility timeout, a configured DLQ with `maxReceiveCount=10`, valid-message acknowledgement, identical duplicate-handler state, and malformed-message redelivery after no acknowledgement. Temporary test Mongo rows and queue messages were cleaned up.
 
 ## P.4 Two-case processing logic
 
