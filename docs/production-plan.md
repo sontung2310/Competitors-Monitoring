@@ -62,8 +62,9 @@ host: dev                                  # informational metadata only, not a 
 continuously polls the SQS queue (long-polling via boto3's SQS client is the standard approach).
 This is a new kind of caller into the existing service layer, following the same
 routes→service→repository layering already established: the worker calls the same
-company/competitor/discovery/monitoring service functions the HTTP API and scheduler already use,
-it just doesn't go through an HTTP route or the internal scheduler to reach them.
+company/competitor/discovery/reconciliation service functions already established in the
+application. The SQS message flow calls `discover_and_reconcile()` where needed; it does not call
+the monitoring scheduler or take snapshots directly.
 
 **Processing logic on receiving a message** — two cases:
 
@@ -72,33 +73,40 @@ it just doesn't go through an HTTP route or the internal scheduler to reach them
      timestamp tracking).
    - If discovery is stale (≥ 30 days, same threshold as the monthly cadence in section 4):
      re-run discovery, apply the auto-activate/auto-deactivate reconciliation from section 4,
-     then proceed to the next step.
-   - If discovery is fresh (< 30 days): skip straight to the next step.
-   - Take a fresh snapshot of every currently-active (tracked) page for this competitor — reuse
-     `monitor_target()` as-is, which already handles "compare against the previous snapshot, save
-     a change record if different" with no new logic needed.
+     then finish the SQS message after reconciliation.
+   - If discovery is fresh (< 30 days): finish without running discovery or reconciliation.
+   - The SQS flow deliberately does **not** take a fresh snapshot of every currently-active
+     (tracked) page. The existing internal scheduler (1.9) calls `monitor_target()` for those
+     targets on its next scheduled cycle.
 
 2. **Competitor does not exist yet** (first run):
    - Create the competitor record, scoped to the company identified by `company_domain_id`.
    - Run discovery, auto-activate the suggested pages (section 4's reconciliation logic, applied
-     to this initial suggested set).
-   - Take an initial snapshot for each newly-active target via `monitor_target()`. Since there's no
-     previous snapshot yet, no change can be (or should be) detected on this first run — this
-     falls out naturally from the existing hash-comparison logic, no special-casing needed. The
-     *next* snapshot (from a later SQS message, or the internal scheduler — see below) is what can
-     detect a real change against this baseline.
+     to this initial suggested set), then finish the SQS message.
+   - No initial snapshot is taken synchronously. The scheduler picks up newly-active targets on
+     its next cycle and calls `monitor_target()`. Since there is no previous snapshot yet, no
+     change can be (or should be) detected on that first scheduled run; the next scheduler run
+     can detect a real change against the baseline.
+
+**Visibility-timeout boundary**: the queue's fixed visibility timeout is 900 seconds. Discovery
+alone has been observed to take close to 12 minutes for a large competitor, and synchronously
+snapshotting every active target would add further variable work to the same message. The SQS
+handler therefore ends after discovery and reconciliation; leaving snapshots to the existing
+scheduler is the concrete mitigation for message visibility expiring during processing. A real
+reconciliation run completed in 41.17 seconds without snapshots, leaving a substantial margin
+under the current timeout.
 
 **This coexists with the existing internal per-target scheduler (1.9), it does not replace it.**
 The scheduler keeps running independently on each target's own `check_interval_minutes`; SQS
-messages trigger additional, on-demand checks on top of that regular cadence. Because both
-mechanisms can occasionally land on the same target around the same time, this relies on the
-concurrency guard already built in 1.8 (atomic duplicate-run prevention) — no new protection is
-needed here, this is exactly the situation that guard exists for.
+messages trigger discovery/reconciliation only. Newly-activated targets are picked up by the
+scheduler on its next cycle, which remains responsible for snapshots and change detection.
+The concurrency guard already built in 1.8 (atomic duplicate-run prevention) continues to protect
+scheduler monitoring runs and any other monitor attempts — no new protection is needed here.
 
 **Idempotency requirement**: SQS has at-least-once delivery — the same message can occasionally
 arrive more than once. Processing the same `company_domain_id` + `company_url` pair twice must not
-create a duplicate competitor or double-trigger discovery/snapshotting beyond what the logic above
-already produces. Reuse the same duplicate-handling logic already built for candidates (1.10) —
+create a duplicate competitor or double-trigger discovery/reconciliation beyond what the logic
+above already produces. Reuse the same duplicate-handling logic already built for candidates (1.10) —
 extend that pattern to inbound queue messages, don't build a second, separate deduplication
 mechanism.
 
@@ -171,6 +179,12 @@ backend should be a contained change against that existing interface, not a rewr
 - Billing
 - Whether a manual "force re-discovery now" trigger should also exist alongside the monthly
   schedule for admin/ops use — reasonable to include, not mandated by this doc
+
+## Change log
+- 2026-09-11 — Updated section 3 to reflect the decoupled SQS flow: discovery/reconciliation
+  finishes the message, while the existing scheduler owns snapshots. This avoids consuming the
+  900-second visibility-timeout margin with variable snapshot work; a real reconciliation run
+  completed in 41.17 seconds without snapshots.
 
 ---
 
