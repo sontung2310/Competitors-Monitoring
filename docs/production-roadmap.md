@@ -93,8 +93,10 @@ shipped code, all now fixed:
 2. **Nothing ran `SchedulerService` against DynamoDB in production** — `SchedulerService.from_database()`
    still hardcoded the Mongo `MonitoringTargetRepository`, and no process called it at all. Fixed
    with P.6.7 above; `SchedulerService` itself needed zero code changes.
-3. **Doc self-contradiction on `changes` routing** (section 5.3 vs 5.5) — resolution tracked
-   separately as an open decision (see the P.6 follow-up discussion); not yet fixed in code.
+3. **Doc self-contradiction on `changes` routing** (section 5.3 vs 5.5) — resolved: `RM_HOST`
+   fixed-per-deployment is the confirmed design, since most change creation now happens via the
+   scheduler's tick (no per-message `host` to route by at all after fix 1/2 above). No code change
+   needed; `docs/production-plan.md` section 5.3 and the summary table were corrected to match.
 
 ### P.6 implementation evidence (TON-45, 2026-09-17)
 
