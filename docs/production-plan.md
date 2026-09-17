@@ -48,15 +48,63 @@ system publishes messages to an AWS SQS queue; our backend consumes them, proces
 writes the result to the database. Whatever reads the database afterward (a frontend, or anything
 else) does so independently — this ingestion path has no synchronous response to any caller.
 
-**Message schema**:
+**Message schema** (revised, TON-44):
 ```
-strategy_id: 1              # fixed for now, forward-looking extensibility field
-company_domain_id: marketingeye.com.au   # the CLIENT's own domain — the tenant identifier
-company_url: <competitor's website>       # the competitor to add and start tracking
-host: dev                                  # informational metadata only, not a routing filter —
-                                            # real production messages will say "prod", the
-                                            # consumer does not need to filter by this field
+company_domain_id: marketingeye.com.au     # the CLIENT's own domain — the tenant identifier
+competitor_lst: [<competitor url>, ...]    # explicit competitors to track; null/empty means
+                                            # "resolve automatically" (see below)
+host: dev                                  # selects which external RM database the automatic
+                                            # resolution below reads from: dev -> rm_dev_testing,
+                                            # prod -> rm_pre_release. Defaults to "dev" when
+                                            # omitted. (Supersedes the earlier "informational
+                                            # only, not a routing filter" note.)
 ```
+
+`strategy_id` is removed from the schema — it was validated on receipt but never persisted
+anywhere in our own collections, so dropping it required no data migration.
+
+**Competitor resolution**: when `competitor_lst` is non-empty (after dropping any malformed
+entries — the valid entries in the same list are still processed), it is used directly as the
+tracked-competitor list. When it is empty or null, the competitors are resolved automatically from
+the external RM platform's own MongoDB collections, replicating this reference lookup exactly (no
+`strategy_status` filtering — selection is purely on `strategy_priority`):
+
+```python
+def get_primary_strategy_id_from_company_domain(self, company_domain_id, host_name=None):
+    primary_strategy_id = None
+    mongodb_conn = MongodbConnections.get_mongodb_conn_by_host(host_name)
+    account_company = mongodb_conn['account_company']
+    matched_document = account_company.find_one({'company_domain': company_domain_id})
+    if not matched_document:
+        return
+    strategy_ids = matched_document.get('strategies_associated_id')
+    for strategy_id in strategy_ids:
+        strategy_doc = mongodb_conn['strategy_strategy'].find_one({'id': strategy_id})
+        if not strategy_doc:
+            continue
+        if strategy_doc.get('strategy_priority') == 'Primary':
+            primary_strategy_id = strategy_id
+            break
+    return primary_strategy_id
+```
+
+The competitor URLs are then the non-blank, deduplicated `website` values from that strategy's
+`competitors_client` array. If `account_company` has no match for the domain, no associated
+strategy is `Primary`, or the `Primary` strategy resolves to zero usable URLs, the message is
+skipped quietly: acknowledged/finished with no discovery work, logged for visibility. No error, no
+retry.
+
+**Multi-competitor fan-out**: a message can resolve to more than one competitor (an explicit
+multi-entry `competitor_lst`, or a Primary strategy with several `competitors_client`). Discovery
+alone can take close to 12 minutes for a large competitor against the queue's 900-second visibility
+timeout, so running discovery for several competitors sequentially inside one message risks that
+timeout. A resolved list of exactly one URL is processed inline through the flow below. A resolved
+list of two or more is not processed inline at all — the handler re-publishes one child message per
+URL (same schema, `competitor_lst` narrowed to that single URL) and acknowledges the original
+message immediately. Each child then gets its own full visibility window through the same
+single-competitor flow, with failure isolation for free: one competitor's redelivery never touches
+the others. This requires `sqs:SendMessage` IAM permission on the worker in addition to the
+existing receive/delete permissions.
 
 **Architecture**: a new, standalone background worker process — not a Flask HTTP route —
 continuously polls the SQS queue (long-polling via boto3's SQS client is the standard approach).
@@ -66,9 +114,11 @@ company/competitor/discovery/reconciliation service functions already establishe
 application. The SQS message flow calls `discover_and_reconcile()` where needed; it does not call
 the monitoring scheduler or take snapshots directly.
 
-**Processing logic on receiving a message** — two cases:
+**Processing logic on receiving a message** — two cases. This logic runs once per resolved
+competitor URL, i.e. after the resolution/fan-out step above has reduced the message to exactly one
+competitor:
 
-1. **Competitor already exists** (matched by `company_domain_id` + `company_url`):
+1. **Competitor already exists** (matched by `company_domain_id` + the resolved competitor URL):
    - Check when discovery last ran for this competitor (reuse the existing discovery-run
      timestamp tracking).
    - If discovery is stale (≥ 30 days, same threshold as the monthly cadence in section 4):
@@ -117,6 +167,10 @@ is already configured on the AWS side, or needs to be planned as part of impleme
 
 **Credentials**: AWS SQS access (queue URL, region, IAM credentials) follows the same pattern as
 existing MongoDB/OpenAI credentials — environment-variable based, never hardcoded, never logged.
+The external RM database lookup follows the same pattern: `RM_MONGODB_URI` (falls back to
+`MONGODB_URI` when unset, since it may be the same cluster) plus `RM_MONGODB_DATABASE_DEV`
+(default `rm_dev_testing`) and `RM_MONGODB_DATABASE_PROD` (default `rm_pre_release`) selected by
+the message's `host` field.
 
 ## 4. No manual target selection — fully automatic tracking
 This is the biggest behavioral difference from dev.
@@ -185,6 +239,12 @@ backend should be a contained change against that existing interface, not a rewr
   finishes the message, while the existing scheduler owns snapshots. This avoids consuming the
   900-second visibility-timeout margin with variable snapshot work; a real reconciliation run
   completed in 41.17 seconds without snapshots.
+- 2026-09-17 (TON-44) — Replaced the `{strategy_id, company_domain_id, company_url, host}` schema
+  with `{company_domain_id, competitor_lst, host}`. Added automatic competitor resolution via the
+  external RM platform's `account_company`/`strategy_strategy` collections (Primary-strategy
+  lookup) when `competitor_lst` is empty, host-routed to `rm_dev_testing`/`rm_pre_release`. Added
+  fan-out to one competitor per message when resolution yields more than one URL, to keep every
+  message's discovery work inside the 900-second visibility timeout.
 
 ---
 

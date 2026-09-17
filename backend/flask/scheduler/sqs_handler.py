@@ -14,7 +14,6 @@ from urllib.parse import urlsplit, urlunsplit
 from backend.flask.database.base_repository import utc_now
 
 
-SUPPORTED_STRATEGY_ID = 1
 DISCOVERY_STALE_AFTER = timedelta(days=30)
 _DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
@@ -35,9 +34,10 @@ class MessageProcessingError(RuntimeError):
 def parse_message(body: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
     """Parse and normalize the supported inbound message schema.
 
-    ``host`` is retained as normalized metadata only. It is intentionally
-    never consulted by ``handle_message`` when deciding whether to process a
-    message.
+    ``host`` selects which external RM database ``handle_message`` reads from
+    when it has to resolve competitors automatically (see
+    ``backend.flask.scheduler.strategy_lookup``); it defaults to ``"dev"``
+    when absent.
     """
 
     if isinstance(body, Mapping):
@@ -59,13 +59,12 @@ def parse_message(body: str | bytes | Mapping[str, Any]) -> dict[str, Any]:
         payload = dict(decoded)
 
     return {
-        "strategy_id": _normalize_strategy_id(payload.get("strategy_id")),
         "company_domain_id": _normalize_domain(
             payload.get("company_domain_id"),
             field="company_domain_id",
         ),
-        "company_url": _normalize_company_url(payload.get("company_url")),
-        "host": _normalize_metadata(payload.get("host"), field="host"),
+        "competitor_lst": _normalize_competitor_list(payload.get("competitor_lst")),
+        "host": _normalize_host(payload.get("host")),
     }
 
 
@@ -82,6 +81,11 @@ def handle_message(
     the Flask app. Discovery/reconciliation remains snapshot-free; active
     targets are handed to ``monitor_target`` afterward. ``message_id`` is the
     SQS at-least-once delivery identity used to make monitoring idempotent.
+
+    ``services["strategy_lookup"]`` and ``services["queue_publisher"]`` are
+    only required when actually needed (empty ``competitor_lst``, and a
+    multi-competitor resolution, respectively) so a message that already
+    names exactly one competitor never needs them.
     """
 
     normalized = parse_message(message)
@@ -104,6 +108,50 @@ def handle_message(
         normalized["company_domain_id"],
     )
     company_id = _required_identifier(company, "company")
+
+    competitor_urls = normalized["competitor_lst"]
+    if not competitor_urls:
+        strategy_lookup = _required_service(services, "strategy_lookup")
+        competitor_urls = _call_service(
+            strategy_lookup,
+            "resolve_primary_competitor_urls",
+            normalized["company_domain_id"],
+            normalized["host"],
+        )
+        if not isinstance(competitor_urls, (list, tuple)):
+            raise MessageProcessingError(
+                "strategy lookup service returned invalid competitor URLs"
+            )
+
+    if not competitor_urls:
+        logger.info(
+            "no trackable competitors resolved for company_domain_id %s; skipping",
+            normalized["company_domain_id"],
+        )
+        return {
+            "action": "skipped_no_competitors",
+            "company": dict(company),
+        }
+
+    if len(competitor_urls) > 1:
+        queue_publisher = _required_service(services, "queue_publisher")
+        for url in competitor_urls:
+            _call_service(
+                queue_publisher,
+                "publish",
+                {
+                    "company_domain_id": normalized["company_domain_id"],
+                    "competitor_lst": [url],
+                    "host": normalized["host"],
+                },
+            )
+        return {
+            "action": "fanned_out",
+            "company": dict(company),
+            "fanned_out_urls": list(competitor_urls),
+        }
+
+    company_url = competitor_urls[0]
     ensure_with_status = getattr(
         competitors,
         "find_or_create_competitor_with_status",
@@ -114,8 +162,8 @@ def handle_message(
             competitors,
             "find_or_create_competitor_with_status",
             company_id=company_id,
-            name=_competitor_name(normalized["company_url"]),
-            website_url=normalized["company_url"],
+            name=_competitor_name(company_url),
+            website_url=company_url,
         )
         if not isinstance(competitor_created, bool):
             raise MessageProcessingError(
@@ -128,8 +176,8 @@ def handle_message(
             competitors,
             "find_or_create_competitor",
             company_id=company_id,
-            name=_competitor_name(normalized["company_url"]),
-            website_url=normalized["company_url"],
+            name=_competitor_name(company_url),
+            website_url=company_url,
         )
         competitor_created = False
     competitor_id = _required_identifier(competitor, "competitor")
@@ -204,22 +252,6 @@ def handle_message(
     }
 
 
-def _normalize_strategy_id(value: Any) -> int:
-    if isinstance(value, bool):
-        raise MessageValidationError("strategy_id must be an integer")
-    if isinstance(value, int):
-        strategy_id = value
-    elif isinstance(value, str) and re.fullmatch(r"[0-9]+", value.strip()):
-        strategy_id = int(value.strip())
-    else:
-        raise MessageValidationError("strategy_id must be an integer")
-    if strategy_id != SUPPORTED_STRATEGY_ID:
-        raise MessageValidationError(
-            f"unsupported strategy_id {strategy_id!r}; expected {SUPPORTED_STRATEGY_ID}"
-        )
-    return strategy_id
-
-
 def _normalize_domain(value: Any, *, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise MessageValidationError(f"{field} must be a non-empty domain")
@@ -252,9 +284,42 @@ def _normalize_company_url(value: Any) -> str:
     return urlunsplit((parsed.scheme.lower(), netloc, path, parsed.query, ""))
 
 
-def _normalize_metadata(value: Any, *, field: str) -> str:
+def try_normalize_company_url(value: Any) -> str | None:
+    """Normalize a URL, returning ``None`` instead of raising when malformed.
+
+    Shared with ``strategy_lookup.py`` for filtering the (often messy)
+    ``competitors_client.website`` values pulled from the external RM
+    database, and used here to drop malformed entries from an explicit
+    ``competitor_lst`` without failing the whole message.
+    """
+
+    try:
+        return _normalize_company_url(value)
+    except MessageValidationError:
+        return None
+
+
+def _normalize_competitor_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise MessageValidationError("competitor_lst must be a list or null")
+    urls: list[str] = []
+    seen: set[str] = set()
+    for entry in value:
+        normalized = try_normalize_company_url(entry)
+        if normalized is None or normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(normalized)
+    return urls
+
+
+def _normalize_host(value: Any) -> str:
+    if value is None:
+        return "dev"
     if not isinstance(value, str) or not value.strip():
-        raise MessageValidationError(f"{field} must be a non-empty string")
+        raise MessageValidationError("host must be a non-empty string when provided")
     return value.strip().lower()
 
 
@@ -355,7 +420,7 @@ __all__ = [
     "DISCOVERY_STALE_AFTER",
     "MessageProcessingError",
     "MessageValidationError",
-    "SUPPORTED_STRATEGY_ID",
     "handle_message",
     "parse_message",
+    "try_normalize_company_url",
 ]

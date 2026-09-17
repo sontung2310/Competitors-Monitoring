@@ -109,9 +109,8 @@ def run_live_verification() -> dict[str, object]:
         before_changes = _documents_for_targets(database["changes"], target_ids)
         message = parse_message(
             {
-                "strategy_id": 1,
                 "company_domain_id": COMPANY_DOMAIN,
-                "company_url": COMPETITOR_URL,
+                "competitor_lst": [COMPETITOR_URL],
                 "host": "prod",
             }
         )
@@ -171,9 +170,8 @@ def run_live_verification() -> dict[str, object]:
 
         new_message = parse_message(
             {
-                "strategy_id": 1,
                 "company_domain_id": COMPANY_DOMAIN,
-                "company_url": new_competitor_url,
+                "competitor_lst": [new_competitor_url],
                 "host": "prod",
             }
         )
