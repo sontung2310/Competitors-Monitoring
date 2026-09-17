@@ -72,6 +72,30 @@ class CompetitorService:
     ) -> dict[str, Any]:
         """Resolve one tenant-scoped competitor without duplicate inserts."""
 
+        competitor, _created = self.find_or_create_competitor_with_status(
+            company_id=company_id,
+            name=name,
+            website_url=website_url,
+            active=active,
+        )
+        return competitor
+
+    def find_or_create_competitor_with_status(
+        self,
+        *,
+        company_id: Any,
+        name: str,
+        website_url: str,
+        active: bool = True,
+    ) -> tuple[dict[str, Any], bool]:
+        """Resolve a competitor and report whether this call inserted it.
+
+        The status is useful to queue/application orchestrators that have a
+        first-run path. It is determined at the same repository boundary as
+        the existing idempotent find-or-create operation, including the
+        unique-key race fallback.
+        """
+
         if company_id is None:
             raise RequestValidationError("company_id is required")
         if not isinstance(name, str) or not name.strip():
@@ -88,15 +112,16 @@ class CompetitorService:
             normalized_url,
         )
         if existing is not None:
-            return existing
+            return existing, False
 
         try:
-            return self.repository.create(
+            created = self.repository.create(
                 company_id=company_id,
                 name=normalized_name,
                 website_url=normalized_url,
                 active=active,
             )
+            return created, True
         except Exception as exc:  # noqa: BLE001 - recover only a unique-key race
             if not _is_duplicate_key_error(exc):
                 raise
@@ -106,7 +131,7 @@ class CompetitorService:
             )
             if existing is None:
                 raise
-            return existing
+            return existing, False
 
     def update_competitor(
         self,

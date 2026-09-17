@@ -23,6 +23,9 @@ class _CompetitorService:
     def find_or_create_competitor(self, **kwargs):
         return {"id": "competitor-1", **kwargs}
 
+    def find_or_create_competitor_with_status(self, **kwargs):
+        return {"id": "competitor-1", **kwargs}, True
+
 
 class _DiscoveryService:
     def __init__(self, error=None):
@@ -34,7 +37,17 @@ class _DiscoveryService:
         return None
 
     def discover_and_reconcile(self, competitor_id, *, company_id):
+        if self.error:
+            raise self.error
         return {"run_id": "run-1", "competitor_id": competitor_id}
+
+    def list_active_targets(self, competitor_id, *, company_id):
+        return []
+
+
+class _MonitoringService:
+    def monitor_target(self, target_id, *, idempotency_key):
+        return {"run": {"status": "SUCCESS"}, "snapshot": None, "changes": []}
 
 
 def _services(error=None):
@@ -42,11 +55,12 @@ def _services(error=None):
         "companies": _CompanyService(),
         "competitors": _CompetitorService(),
         "discovery": _DiscoveryService(error=error),
+        "monitoring": _MonitoringService(),
     }
 
 
 def _record(body, receipt):
-    return {"Body": body, "ReceiptHandle": receipt}
+    return {"Body": body, "ReceiptHandle": receipt, "MessageId": receipt}
 
 
 class _SQSClient:

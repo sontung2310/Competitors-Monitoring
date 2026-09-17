@@ -80,6 +80,8 @@ class _FakeCollection:
         for document in self.documents:
             if _matches(document, query):
                 document.update(deepcopy(update["$set"]))
+                for field in update.get("$unset", {}):
+                    document.pop(field, None)
                 return _WriteResult(matched_count=1)
         return _WriteResult(matched_count=0)
 
@@ -133,6 +135,7 @@ class _RunRepository:
         record = {
             "id": f"run-{len(self.records) + 1}",
             "monitoring_target_id": monitoring_target_id,
+            "idempotency_key": kwargs.get("idempotency_key"),
             "started_at": started_at,
             "finished_at": None,
             "status": status,
@@ -142,6 +145,15 @@ class _RunRepository:
         self.transitions.append((record["id"], status))
         return deepcopy(record)
 
+    def find_by_idempotency_key(self, monitoring_target_id, idempotency_key):
+        for record in self.records:
+            if (
+                record["monitoring_target_id"] == monitoring_target_id
+                and record.get("idempotency_key") == idempotency_key
+            ):
+                return deepcopy(record)
+        return None
+
     def claim(
         self,
         *,
@@ -150,11 +162,13 @@ class _RunRepository:
         status="RUNNING",
         stale_after,
         now,
+        idempotency_key=None,
     ):
         return self.create(
             monitoring_target_id=monitoring_target_id,
             started_at=started_at,
             status=status,
+            idempotency_key=idempotency_key,
         )
 
     def finish(self, run_id, *, status, finished_at, error_message=None):
@@ -280,6 +294,7 @@ class MonitoringRunRepositoryTests(unittest.TestCase):
                 "ix_monitoring_runs_target_started_at",
                 "ix_monitoring_runs_target_status",
                 "uq_monitoring_runs_running_target",
+                "uq_monitoring_runs_target_idempotency_key",
             },
         )
         unique_index = next(
@@ -338,6 +353,33 @@ class MonitoringRunRepositoryTests(unittest.TestCase):
         self.assertEqual(first["status"], "RUNNING")
         self.assertEqual(second["status"], "RUNNING")
         self.assertEqual(len(collection.documents), 2)
+
+    def test_failed_idempotent_run_releases_key_for_retry(self):
+        collection = _UniqueRunningCollection()
+        repository = MonitoringRunRepository(collection)
+        repository.ensure_indexes()
+        now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+
+        run = repository.claim(
+            monitoring_target_id="000000000000000000000001",
+            started_at=now,
+            now=now,
+            idempotency_key="sqs:retry-me",
+        )
+        failed = repository.finish(
+            run["id"],
+            status="FAILED",
+            finished_at=now + timedelta(seconds=1),
+            error_message="temporary failure",
+        )
+
+        self.assertNotIn("idempotency_key", failed)
+        self.assertIsNone(
+            repository.find_by_idempotency_key(
+                "000000000000000000000001",
+                "sqs:retry-me",
+            )
+        )
 
     def test_stale_claim_is_failed_then_replaced(self):
         collection = _UniqueRunningCollection()
@@ -478,6 +520,19 @@ class MonitoringRunServiceTests(unittest.TestCase):
         self.assertEqual(snapshot_service.calls[0]["fetch_method"], "BROWSER")
         self.assertEqual(len(snapshots.snapshots), 2)
         self.assertEqual(runs.transitions[-1], ("run-1", "SUCCESS"))
+
+    def test_sqs_idempotency_key_replays_completed_run_without_fetching_or_resnapshotting(self):
+        service, target, snapshots, snapshot_service, change_service, runs = self._make_service()
+
+        first = service.monitor_target(self.target_id, idempotency_key="sqs:message-1")
+        second = service.monitor_target(self.target_id, idempotency_key="sqs:message-1")
+
+        self.assertEqual(first["run"]["status"], "SUCCESS")
+        self.assertTrue(second["idempotent"])
+        self.assertEqual(len(runs.records), 1)
+        self.assertEqual(len(snapshot_service.calls), 1)
+        self.assertEqual(len(snapshots.snapshots), 1)
+        self.assertEqual(change_service.calls, [])
 
     def test_fetch_failure_marks_failed_without_snapshot_or_change_and_preserves_previous(self):
         previous_content = "<main>Previously valid content with enough visible text to monitor.</main>"

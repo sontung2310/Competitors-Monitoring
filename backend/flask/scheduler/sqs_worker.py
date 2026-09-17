@@ -112,7 +112,12 @@ def process_message_record(
         return RecordResult(acknowledged=False, malformed=True)
 
     try:
-        outcome = handle_message(message, services, clock=clock)
+        outcome = handle_message(
+            message,
+            services,
+            clock=clock,
+            message_id=record.get("MessageId"),
+        )
     except Exception as exc:  # noqa: BLE001 - leave failed messages for DLQ retry
         output_log.exception("leaving failed SQS message unacknowledged: %s", exc)
         return RecordResult(acknowledged=False, failed=True)
