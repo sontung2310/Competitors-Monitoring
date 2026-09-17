@@ -199,19 +199,146 @@ reference that production's eventual frontend would only need two of dev's four 
 competitors dashboard and the changes feed, since discovery-review and simulate don't apply to
 production), not something to build now.
 
-## 5. Snapshot storage: DynamoDB with 30-day TTL
-Production snapshot content moves from local `.txt.gz` files to DynamoDB, using DynamoDB's native
-TTL feature (an expiry timestamp attribute; AWS auto-deletes after it passes, no custom cleanup
-job needed). Confirmed: plain DynamoDB, not a DynamoDB+S3 hybrid — accepting the 400KB per-item
-limit for now.
+## 5. Storage layer: DynamoDB for monitoring targets and snapshots, RM MongoDB for changes (TON-45)
+This replaces the earlier "snapshot storage" section with the full, confirmed split of where each
+piece of state lives in production. Only three things change persistence; everything else
+(`companies`, `competitors`, `monitoring_runs`, `discovery_runs`) keeps living in our own MongoDB
+exactly as it does today — no schema or backend change for those collections in this round.
+
+| Data | Dev (Mongo) | Production |
+| --- | --- | --- |
+| Tracked pages (`monitoring_targets`) | `monitoring_targets` collection, `active`/`discovery_status` lifecycle | DynamoDB table `AWS_DYNAMODB_MONITORING_TARGETS_TABLE` (`competitors_analysis_monitoring_targets`) |
+| Snapshot content + metadata | `snapshots` collection + local `.txt.gz` files | DynamoDB table `AWS_DYNAMODB_SNAPSHOTS_TABLE` (`competitors_analysys_snapshots`), content included in the item |
+| Detected changes | `changes` collection, same database as everything else | A new collection (`competitors_changes`) in the external RM database, host-routed like section 3's strategy lookup |
+| `companies`, `competitors`, `monitoring_runs`, `discovery_runs` | our own MongoDB | unchanged — still our own MongoDB |
+
+### 5.1 Monitoring targets: DynamoDB, `SUGGESTED`-only, presence means tracked
+Dev's `monitoring_targets` collection double-duties as both the candidate review list (SUGGESTED/
+DISCARDED) and the finalized monitored set (`active`/`discovery_status=ACTIVE`). Production only
+ever needs the second half of that — pages actually being watched — so the DynamoDB table is
+deliberately narrower:
+
+- Only rows with `discovery_status = "SUGGESTED"` (the label the rule-based/LLM classifier already
+  produces) are written. `DISCARDED` candidates are never written to DynamoDB at all, to avoid
+  paying to store rows production has no reviewer to look at.
+- A row's mere presence in the table means it is currently tracked — there is no separate
+  `active` boolean or `ACTIVE` status to maintain in DynamoDB the way dev tracks it in Mongo.
+- **Deactivation means deletion.** When reconciliation (section 4) decides a page is no longer
+  suggested, its DynamoDB row is deleted outright, not soft-deactivated with a flag. This is a
+  deliberate divergence from dev's 1.11 "deactivate, don't hard-delete" rule: dev preserves
+  deactivated rows because Mongo also holds the change/snapshot history that references them in
+  the same database, but production's history (see 5.3) no longer lives in the same store, so
+  there is nothing left referencing a production `monitoring_targets` row once it stops being
+  tracked.
+
+**Key schema** (already provisioned, confirmed via `describe-table`): partition key `_id` (string)
+only, no secondary indexes, TTL disabled (not needed here — unlike snapshots, a tracked target
+doesn't expire on a timer, it's removed by reconciliation). This only supports point lookups by id,
+which isn't enough on its own:
+
+- **Discovery reconciliation** needs "every target currently tracked for competitor X," to compare
+  against a fresh discovery run. This needs a new **Global Secondary Index keyed by `competitor_id`**
+  — the one addition to the table's indexing.
+- **The scheduler** needs "every tracked target, across every competitor, due for a check." Since
+  every row in the table is already tracked (nothing else is ever written here), this is served by
+  a plain **table Scan** — there's no `active`/`discovery_status` filter left to apply, only the
+  same due-by-`last_checked_at` check the scheduler already does in Python today. At the data
+  volumes this system operates at, a Scan is simple and cheap; it can be revisited if the tracked
+  set grows large enough for that to change.
+
+**Field mapping**:
+
+| Field (Mongo today) | Type today | After migration | Notes |
+| --- | --- | --- | --- |
+| `_id` | ObjectId, Mongo-generated | `_id` (String) | DynamoDB doesn't auto-generate ids; minted ourselves before every `PutItem`, in Mongo ObjectId *format*, just stringified, so nothing downstream has to care the id "looks different." |
+| `competitor_id` | ObjectId | `competitor_id` (String) | Same value, stringified — the competitor itself is unaffected and still lives in Mongo. |
+| `raw_url`, `url`, `page_type`, `discovery_source`, `classification_method`, `check_interval_minutes`, `last_checked_at`, `last_changed_at` | as today | unchanged, same meaning | Timestamps become ISO-8601 strings (DynamoDB has no native datetime type). |
+| `discovery_status` | `SUGGESTED`/`ACTIVE`/`DISCARDED` | always `"SUGGESTED"` | `DISCARDED` rows are never written. Every row that exists is tracked, so this value never varies — kept only as a label of how it got here (classifier output), not a lifecycle. |
+| `active` | boolean | **dropped** | With "row exists = tracked," this flag would always be `true` for any row you could find — redundant, so it isn't stored. |
+| `created_at`, `updated_at` | datetime | ISO-8601 strings | Same meaning. |
+
+How the operations change: "activate a newly-suggested page" (reconciliation) becomes a `PutItem`
+for a row that didn't exist before; "deactivate a page no longer suggested" becomes a `DeleteItem`,
+not a flag flip; "list targets for competitor X" becomes a `Query` against the new GSI instead of a
+Mongo filter; "list everything due for a check" becomes a `Scan` followed by the same Python
+due-time check that already runs today.
+
+### 5.2 Snapshots: DynamoDB, content included in the item, 30-day TTL
+**Key schema** (already provisioned): partition key `monitoring_target_id`, sort key `captured_at`
+(string) — this already matches the exact access pattern dev uses today (`list_for_target`, newest
+first), so no new index is needed here.
+
+Snapshot **content itself** (not just metadata) moves into the DynamoDB item as the compressed
+bytes, replacing local `.txt.gz` files and the `storage_path` pointer entirely — confirmed plain
+DynamoDB, not a DynamoDB+S3 hybrid, accepting the 400KB-per-item limit.
 
 **Pre-flight check needed before implementation**: verify the largest real compressed snapshot
 (JD Sports' `/sale` page is the largest known example) stays safely under 400KB. Cheap to check now,
 expensive to discover as a production incident later.
 
+**TTL**: the table's TTL is currently disabled and needs to be turned on as part of implementation,
+using an epoch-seconds expiry attribute (proposed name: `expires_at`) computed as
+`captured_at + 30 days`. AWS then auto-deletes expired items with no custom cleanup job needed.
+
 The existing snapshot storage abstraction (`snapshot/storage.py`) was built with a pluggable
 backend in mind from the start (spec always anticipated moving off local storage) — swapping the
 backend should be a contained change against that existing interface, not a rewrite.
+
+**Field mapping**:
+
+| Field (Mongo today) | Type today | After migration | Notes |
+| --- | --- | --- | --- |
+| `_id` | ObjectId | **dropped entirely** | Nothing ever needs to look up a snapshot by one flat id — every caller already has both `monitoring_target_id` and `captured_at` in hand. The table's real key replaces it. |
+| `monitoring_target_id` | ObjectId | `monitoring_target_id` (String) — partition key | Now a DynamoDB target id, stringified. |
+| `captured_at` | datetime | `captured_at` (String, ISO-8601) — sort key | Already provisioned this way; gives a native `Query` for "this target's history, newest first," no separate index needed. |
+| `content_hash`, `content_size`, `fetch_method`, `http_status` | as today | unchanged | |
+| `storage_path` (pointer to a local `.txt.gz` file) | string | **replaced by `content`** (Binary — the actual gzip bytes) | The real substance of the move: content lives *in* the item now, not on disk. |
+| `created_at` / `updated_at` | both stored | just `created_at` kept | Snapshots are never modified after creation, so the two were always identical — one is redundant. |
+| *(new)* | — | `expires_at` (Number, epoch seconds) | The TTL attribute described above. |
+| `is_simulated` | legacy/optional | **dropped** | Production never creates simulated snapshots (section 2), so this never applies. |
+
+How the operations change: `create()` becomes one `PutItem` carrying metadata and content together;
+fetching one snapshot becomes `GetItem(monitoring_target_id, captured_at)` instead of a bare-id
+lookup; `list_for_target()` becomes a `Query` on the table's own primary key
+(`ScanIndexForward=False` for newest-first) — functionally identical to today's Mongo sort, just
+native to the table instead of a secondary index.
+
+### 5.3 Changes: a new collection in the external RM MongoDB database
+The `changes` collection is the one piece of history that still needs a durable, queryable store
+(it's the actual client-facing result), but it no longer lives alongside `monitoring_targets`/
+`snapshots` since those moved to DynamoDB. It moves to a **new collection in the external RM
+database** (proposed name: `competitors_changes`), reusing the exact same host-routed connection
+already built for the Primary-strategy lookup in section 3: `host=dev` → `rm_dev_testing`,
+`host=prod` → `rm_pre_release`.
+
+**Reference shape**: dev's `changes` documents reference `monitoring_target_id`,
+`previous_snapshot_id`, and `current_snapshot_id` as single Mongo ObjectIds. DynamoDB's snapshot
+table has no single opaque id — a snapshot is identified by the pair `(monitoring_target_id,
+captured_at)` — so a production change document's snapshot references become that same pair
+(e.g. `{"monitoring_target_id": ..., "captured_at": ...}`) instead of one flat id string. This lets
+anything holding a change record fetch the real snapshot directly from DynamoDB with a plain
+`GetItem`, with no extra index required.
+
+This move is far less disruptive than 5.1/5.2 — it's still MongoDB, just a different database, so
+every existing query capability (the `$in` filter, the `since` range filter, the narrative-backfill
+query, the index) keeps working unchanged. Only two fields actually change shape:
+
+| Field | Today | After migration |
+| --- | --- | --- |
+| `monitoring_target_id` | ObjectId | plain string (the DynamoDB target id) |
+| `previous_snapshot_id` / `current_snapshot_id` | single ObjectId each | replaced by `previous_snapshot` / `current_snapshot`, each an embedded `{"monitoring_target_id": ..., "captured_at": ...}` pair |
+| `detected_at`, `change_type`, `summary`, `narrative_summary`, `detected_url`, `status`, `created_at`, `updated_at` | as today | unchanged |
+| `is_simulated` | legacy/optional | dropped (production never simulates, same reasoning as 5.2) |
+
+### 5.4 The one ripple in a collection that isn't moving: `monitoring_runs`
+`monitoring_runs` (the concurrency guard that prevents two monitoring checks running on the same
+target at once) stays in our own MongoDB, unchanged as a collection. But its repository
+(`MonitoringRunRepository`) currently forces `monitoring_target_id` through `to_object_id()` on
+every read/write and in one of its unique indexes. Since that field now holds a DynamoDB string id
+instead of a Mongo ObjectId, that conversion needs to be relaxed — a real code change even though
+the collection itself doesn't move. `companies`, `competitors`, and `discovery_runs` were checked
+for the same issue and none of them store a `monitoring_target_id` reference at all, so they're
+genuinely untouched.
 
 ## Explicit assumptions to confirm
 - "Candidate pages" in section 3's processing logic means currently-tracked/active pages for that
@@ -245,6 +372,18 @@ backend should be a contained change against that existing interface, not a rewr
   lookup) when `competitor_lst` is empty, host-routed to `rm_dev_testing`/`rm_pre_release`. Added
   fan-out to one competitor per message when resolution yields more than one URL, to keep every
   message's discovery work inside the 900-second visibility timeout.
+- 2026-09-17 (TON-45) — Rewrote section 5: `monitoring_targets` and `snapshots` move to two
+  already-provisioned DynamoDB tables (`AWS_DYNAMODB_MONITORING_TARGETS_TABLE`,
+  `AWS_DYNAMODB_SNAPSHOTS_TABLE`); `changes` moves to a new collection in the external RM MongoDB
+  database instead of our own; `companies`/`competitors`/`monitoring_runs`/`discovery_runs` are
+  unaffected. Confirmed: DynamoDB `monitoring_targets` only ever stores `SUGGESTED` rows (no
+  `DISCARDED` rows, ever), presence in the table means tracked, and "deactivate" now means deleting
+  the row rather than flipping a flag.
+- 2026-09-17 (TON-45) — Added a field-by-field mapping table to each of 5.1/5.2/5.3 (old Mongo
+  field → new DynamoDB/RM-Mongo field, with the reasoning for each drop/rename), and a new 5.4
+  documenting that `monitoring_runs` needs a code change (relaxing its `to_object_id()` calls on
+  `monitoring_target_id`) even though the collection itself doesn't move; `companies`, `competitors`,
+  and `discovery_runs` were checked and confirmed to have no such reference.
 
 ---
 

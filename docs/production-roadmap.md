@@ -66,8 +66,11 @@ separate, focused tasks on the `production` branch.
 - [ ] P.5.2 Automatically activate newly suggested pages using the existing 1.10 activation logic, including its liveness gate.
 - [ ] P.5.3 Automatically deactivate tracked pages no longer suggested by discovery using the existing 1.11 history-preserving deactivation logic.
 
-## P.6 DynamoDB snapshot storage
+## P.6 DynamoDB storage for monitoring targets and snapshots, RM MongoDB for changes (TON-45)
 
 - [ ] P.6.1 Run a pre-flight size check against the largest real compressed snapshot, including JD Sports' `/sale` page, and verify it stays safely below DynamoDB's 400KB per-item limit.
-- [ ] P.6.2 Swap local snapshot persistence for DynamoDB behind the existing `snapshot/storage.py` abstraction.
-- [ ] P.6.3 Configure DynamoDB native TTL with a 30-day expiry timestamp so expired snapshot items are removed automatically.
+- [ ] P.6.2 Configure `AWS_DYNAMODB_MONITORING_TARGETS_TABLE` / `AWS_DYNAMODB_SNAPSHOTS_TABLE` environment-based DynamoDB access, alongside the existing AWS SQS credential pattern.
+- [ ] P.6.3 Swap `monitoring_targets` persistence to DynamoDB: write only `SUGGESTED` rows (never `DISCARDED`), add the `competitor_id` GSI for per-competitor reconciliation lookups, use a table Scan for the scheduler's global due-for-check job, and delete a row (instead of soft-deactivating) when reconciliation stops suggesting it.
+- [ ] P.6.4 Swap snapshot persistence to DynamoDB behind the existing `snapshot/storage.py` abstraction, storing compressed content directly in the item and replacing local `.txt.gz` files/`storage_path` entirely.
+- [ ] P.6.5 Enable DynamoDB native TTL on the snapshots table with a 30-day expiry attribute so expired items are removed automatically.
+- [ ] P.6.6 Move `changes` persistence to a new collection (`competitors_changes`) in the external RM MongoDB database, host-routed the same way as the section 3 strategy lookup (`dev` → `rm_dev_testing`, `prod` → `rm_pre_release`); update change documents' snapshot references to the `(monitoring_target_id, captured_at)` pair instead of a single Mongo id.
