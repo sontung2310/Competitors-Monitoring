@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from typing import Any, Mapping, Optional
 
 from backend.flask.database.base_repository import (
@@ -11,6 +11,13 @@ from backend.flask.database.base_repository import (
     to_object_id,
     utc_now,
 )
+
+
+class DiscoveryRunAlreadyRunningError(RuntimeError):
+    """Raised when a competitor already has an in-progress discovery run."""
+
+
+DEFAULT_DISCOVERY_RUN_STALE_AFTER = timedelta(minutes=30)
 
 
 class DiscoveryRunRepository(BaseMongoRepository):
@@ -32,6 +39,12 @@ class DiscoveryRunRepository(BaseMongoRepository):
             [("competitor_id", 1), ("started_at", -1)],
             name="ix_discovery_runs_competitor_started_at",
         )
+        self.collection.create_index(
+            [("competitor_id", 1), ("status", 1)],
+            unique=True,
+            partialFilterExpression={"status": self.RUNNING},
+            name="uq_discovery_runs_running_competitor",
+        )
 
     def start(
         self,
@@ -40,9 +53,11 @@ class DiscoveryRunRepository(BaseMongoRepository):
         competitor_id: Any,
         company_id: Any = None,
         started_at: Optional[datetime] = None,
+        stale_after: timedelta = DEFAULT_DISCOVERY_RUN_STALE_AFTER,
     ) -> dict[str, Any]:
         _require_text(run_id, "run_id")
         timestamp = started_at or utc_now()
+        _require_stale_after(stale_after)
         document = {
             "run_id": run_id,
             "competitor_id": to_object_id(competitor_id),
@@ -56,7 +71,54 @@ class DiscoveryRunRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
-        result = self.collection.insert_one(document)
+        try:
+            result = self.collection.insert_one(document)
+        except Exception as exc:  # noqa: BLE001 - translate the unique race only
+            if _is_duplicate_key_error(exc):
+                running = self.collection.find_one(
+                    {
+                        "competitor_id": document["competitor_id"],
+                        "status": self.RUNNING,
+                    }
+                )
+                if running is not None:
+                    running_started_at = running.get("started_at")
+                    if _is_stale_run(running_started_at, timestamp, stale_after):
+                        marked = self.collection.update_one(
+                            {
+                                "run_id": running.get("run_id"),
+                                "status": self.RUNNING,
+                                "started_at": running_started_at,
+                            },
+                            {
+                                "$set": {
+                                    "status": self.FAILED,
+                                    "finished_at": timestamp,
+                                    "error_message": (
+                                        "discovery run was marked failed after exceeding "
+                                        f"the {stale_after} staleness threshold"
+                                    ),
+                                    "updated_at": utc_now(),
+                                }
+                            },
+                        )
+                        if self._matched(marked):
+                            try:
+                                result = self.collection.insert_one(document)
+                            except Exception as retry_exc:
+                                if not _is_duplicate_key_error(retry_exc):
+                                    raise
+                                raise DiscoveryRunAlreadyRunningError(
+                                    f"competitor {competitor_id!r} won a concurrent discovery retry"
+                                ) from retry_exc
+                            inserted_id = getattr(result, "inserted_id", None)
+                            if inserted_id is not None:
+                                document["_id"] = inserted_id
+                            return serialize_document(document) or {}
+                    raise DiscoveryRunAlreadyRunningError(
+                        f"competitor {competitor_id!r} already has a running discovery"
+                    ) from exc
+            raise
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:
             document["_id"] = inserted_id
@@ -168,3 +230,22 @@ class DiscoveryRunRepository(BaseMongoRepository):
 def _require_text(value: Any, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
+
+
+def _is_duplicate_key_error(error: Exception) -> bool:
+    return getattr(error, "code", None) == 11000
+
+
+def _require_stale_after(value: timedelta) -> None:
+    if not isinstance(value, timedelta) or value <= timedelta(0):
+        raise ValueError("stale_after must be a positive timedelta")
+
+
+def _is_stale_run(value: Any, now: datetime, stale_after: timedelta) -> bool:
+    if not isinstance(value, datetime):
+        return False
+    if value.tzinfo is None or value.utcoffset() is None:
+        value = value.replace(tzinfo=timezone.utc)
+    if now.tzinfo is None or now.utcoffset() is None:
+        now = now.replace(tzinfo=timezone.utc)
+    return now - value.astimezone(timezone.utc) >= stale_after

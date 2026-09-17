@@ -44,9 +44,9 @@ separate, focused tasks on the `production` branch.
 
 ## P.4 Two-case processing logic
 
-- [ ] P.4.1 Implement the existing-competitor flow: check discovery freshness, re-run discovery only when the last run is at least 30 days old, apply automatic reconciliation, and otherwise skip directly to monitoring.
-- [ ] P.4.2 Implement the new-competitor first-run flow: create the record, run discovery, auto-activate the suggested pages, and establish an initial snapshot for each newly active target without creating a change.
-- [ ] P.4.3 Wire both flows into `monitor_target()` for fresh snapshots and change detection, relying on the existing hash-comparison behavior.
+- [x] P.4.1 Implement the existing-competitor flow: check discovery freshness, re-run discovery only when the last run is at least 30 days old, apply automatic reconciliation, and otherwise skip directly to monitoring.
+- [x] P.4.2 Implement the new-competitor first-run flow: create the record, run discovery, auto-activate the suggested pages, and establish an initial snapshot for each newly active target without creating a change.
+- [x] P.4.3 Wire both flows into `monitor_target()` for fresh snapshots and change detection, relying on the existing hash-comparison behavior.
 
 ### P.3/P.4 prerequisite implementation (TON-41)
 
