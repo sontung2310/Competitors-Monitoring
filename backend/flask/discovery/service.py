@@ -17,6 +17,7 @@ from backend.flask.website_monitoring.service import (
     fetch_page,
 )
 from backend.flask.website_monitoring.intervals import default_check_interval_minutes
+from backend.flask.discovery.repository import DiscoveryRunAlreadyRunningError
 
 from .audit import (
     DiscoveryAuditClassifier,
@@ -737,11 +738,16 @@ class DiscoveryService:
             )
         )
         resolved_run_id = run_id or uuid4().hex
-        self.run_repository.start(
-            resolved_run_id,
-            competitor_id=competitor_id,
-            company_id=company_id,
-        )
+        try:
+            self.run_repository.start(
+                resolved_run_id,
+                competitor_id=competitor_id,
+                company_id=company_id,
+            )
+        except DiscoveryRunAlreadyRunningError as exc:
+            raise DiscoveryConflictError(
+                f"discovery is already running for competitor {competitor_id!r}"
+            ) from exc
 
         activated_target_ids: list[Any] = []
         deactivated_target_ids: list[Any] = []

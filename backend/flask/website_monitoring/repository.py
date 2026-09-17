@@ -375,6 +375,12 @@ class MonitoringRunRepository(BaseMongoRepository):
             partialFilterExpression={"status": self.RUNNING},
             name="uq_monitoring_runs_running_target",
         )
+        self.collection.create_index(
+            [("monitoring_target_id", 1), ("idempotency_key", 1)],
+            unique=True,
+            partialFilterExpression={"idempotency_key": {"$exists": True}},
+            name="uq_monitoring_runs_target_idempotency_key",
+        )
 
     def claim(
         self,
@@ -383,6 +389,7 @@ class MonitoringRunRepository(BaseMongoRepository):
         started_at: datetime,
         stale_after: timedelta = DEFAULT_RUN_STALE_AFTER,
         now: Optional[datetime] = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Atomically claim one target with a RUNNING record.
 
@@ -394,6 +401,8 @@ class MonitoringRunRepository(BaseMongoRepository):
 
         _require_timestamp(started_at, "started_at")
         _require_stale_after(stale_after)
+        if idempotency_key is not None:
+            _require_text(idempotency_key, "idempotency_key")
         claim_time = now or utc_now()
         _require_timestamp(claim_time, "now")
 
@@ -406,6 +415,7 @@ class MonitoringRunRepository(BaseMongoRepository):
                     started_at=started_at,
                     status=self.RUNNING,
                     now=claim_time,
+                    idempotency_key=idempotency_key,
                 )
             except Exception as exc:
                 if not _is_duplicate_key_error(exc):
@@ -444,6 +454,7 @@ class MonitoringRunRepository(BaseMongoRepository):
         status: str = RUNNING,
         error_message: Optional[str] = None,
         now: Optional[Any] = None,
+        idempotency_key: str | None = None,
     ) -> dict[str, Any]:
         """Insert a run, normally in the ``RUNNING`` state."""
 
@@ -453,6 +464,8 @@ class MonitoringRunRepository(BaseMongoRepository):
             raise ValueError("a newly-created monitoring run must start RUNNING")
         if error_message is not None:
             _require_text(error_message, "error_message")
+        if idempotency_key is not None:
+            _require_text(idempotency_key, "idempotency_key")
 
         timestamp = now or utc_now()
         document = {
@@ -464,6 +477,8 @@ class MonitoringRunRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
+        if idempotency_key is not None:
+            document["idempotency_key"] = idempotency_key
         result = self.collection.insert_one(document)
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:
@@ -499,7 +514,13 @@ class MonitoringRunRepository(BaseMongoRepository):
             "error_message": error_message,
             "updated_at": utc_now(),
         }
-        result = self.collection.update_one(query, {"$set": values})
+        update: dict[str, Any] = {"$set": values}
+        if status == self.FAILED:
+            # Failed SQS deliveries must be retryable with the same message
+            # identity. Successful runs retain the key for duplicate replay;
+            # failed attempts release it for the next claim.
+            update["$unset"] = {"idempotency_key": ""}
+        result = self.collection.update_one(query, update)
         if not self._matched(result):
             return None
         return self.get(run_id)
@@ -519,6 +540,23 @@ class MonitoringRunRepository(BaseMongoRepository):
                 {
                     "monitoring_target_id": to_object_id(monitoring_target_id),
                     "status": self.RUNNING,
+                }
+            )
+        )
+
+    def find_by_idempotency_key(
+        self,
+        monitoring_target_id: Any,
+        idempotency_key: str,
+    ) -> Optional[dict[str, Any]]:
+        """Return a prior run for one target and queue-message identity."""
+
+        _require_text(idempotency_key, "idempotency_key")
+        return serialize_document(
+            self.collection.find_one(
+                {
+                    "monitoring_target_id": to_object_id(monitoring_target_id),
+                    "idempotency_key": idempotency_key,
                 }
             )
         )

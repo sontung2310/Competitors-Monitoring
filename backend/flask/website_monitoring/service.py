@@ -586,7 +586,12 @@ class MonitoringRunService:
             detected_url_liveness_checker=detected_url_liveness_checker,
         )
 
-    def monitor_target(self, target_id: Any) -> dict[str, Any]:
+    def monitor_target(
+        self,
+        target_id: Any,
+        *,
+        idempotency_key: str | None = None,
+    ) -> dict[str, Any]:
         """Execute one tracked attempt for an active monitoring target.
 
         ``last_checked_at`` is written immediately after the RUNNING record is
@@ -594,6 +599,11 @@ class MonitoringRunService:
         Fetch failures return a FAILED run result and never reach snapshot or
         change creation. A successful fetch always creates a snapshot; change
         creation is limited to a different previous hash.
+
+        When an idempotency key is supplied, a completed run for the same
+        target and key is returned without fetching or creating another
+        snapshot. The SQS handler uses the queue message identity for this
+        key so at-least-once delivery cannot repeat monitoring side effects.
         """
 
         target = self.target_repository.get(target_id)
@@ -604,14 +614,47 @@ class MonitoringRunService:
                 f"monitoring target {target_id!r} is not an active target"
             )
 
+        claim_idempotency_key = idempotency_key
+        if idempotency_key is not None:
+            _require_idempotency_key(idempotency_key)
+            find_by_key = getattr(self.run_repository, "find_by_idempotency_key", None)
+            previous_run = (
+                find_by_key(target_id, idempotency_key)
+                if callable(find_by_key)
+                else None
+            )
+            if previous_run is not None:
+                if previous_run.get("status") == MonitoringRunRepository.SUCCESS:
+                    snapshots = _list_real_snapshots(self.snapshot_repository, target_id)
+                    return {
+                        "run": previous_run,
+                        "previous_snapshot": None,
+                        "snapshot": snapshots[0] if snapshots else None,
+                        "change": None,
+                        "changes": [],
+                        "idempotent": True,
+                    }
+                if previous_run.get("status") == MonitoringRunRepository.RUNNING:
+                    raise AlreadyRunningError(
+                        f"monitoring target {target_id!r} already has active "
+                        f"RUNNING run {previous_run.get('id')!r}"
+                    )
+                # A failed delivery may be retried. Repository-backed runs
+                # release the key on failure; an injected legacy repository
+                # may retain it, so avoid colliding with that failed row.
+                claim_idempotency_key = None
+
         started_at = self.clock()
         try:
-            run = self.run_repository.claim(
-                monitoring_target_id=target_id,
-                started_at=started_at,
-                stale_after=self.stale_after,
-                now=started_at,
-            )
+            claim_kwargs = {
+                "monitoring_target_id": target_id,
+                "started_at": started_at,
+                "stale_after": self.stale_after,
+                "now": started_at,
+            }
+            if claim_idempotency_key is not None:
+                claim_kwargs["idempotency_key"] = claim_idempotency_key
+            run = self.run_repository.claim(**claim_kwargs)
         except RunAlreadyClaimedError as exc:
             raise AlreadyRunningError(str(exc)) from exc
         previous_snapshot: dict[str, Any] | None = None
@@ -768,6 +811,7 @@ def monitor_target(
     snapshot_content_loader: SnapshotContentLoader | None = None,
     content_processors: Mapping[str, ContentProcessor] | None = None,
     detected_url_liveness_checker: Callable[[str], Any] | None = None,
+    idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Functional entry point for one repository-backed monitoring attempt."""
 
@@ -783,11 +827,16 @@ def monitor_target(
         snapshot_content_loader=snapshot_content_loader,
         content_processors=content_processors,
         detected_url_liveness_checker=detected_url_liveness_checker,
-    ).monitor_target(target_id)
+    ).monitor_target(target_id, idempotency_key=idempotency_key)
 
 
 def _is_active_monitoring_target(target: Mapping[str, Any]) -> bool:
     return target.get("active") is True and target.get("discovery_status") == "ACTIVE"
+
+
+def _require_idempotency_key(value: Any) -> None:
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError("idempotency_key must be a non-empty string")
 
 
 def _list_real_snapshots(

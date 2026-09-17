@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import logging
 import re
 from collections.abc import Mapping
 from datetime import datetime, timedelta, timezone
@@ -18,6 +20,8 @@ _DOMAIN_PATTERN = re.compile(
     r"^(?=.{1,253}$)(?:[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?\.)+"
     r"[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$"
 )
+
+logger = logging.getLogger(__name__)
 
 
 class MessageValidationError(ValueError):
@@ -70,12 +74,14 @@ def handle_message(
     services: Mapping[str, Any],
     *,
     clock: Callable[[], datetime] = utc_now,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
-    """Process one parsed message without SQS or direct database coupling.
+    """Process one parsed message through discovery and monitoring services.
 
     The injected services are the same application services used elsewhere by
-    the Flask app. This function deliberately ends after discovery and
-    reconciliation; it never invokes monitoring or snapshot operations.
+    the Flask app. Discovery/reconciliation remains snapshot-free; active
+    targets are handed to ``monitor_target`` afterward. ``message_id`` is the
+    SQS at-least-once delivery identity used to make monitoring idempotent.
     """
 
     normalized = parse_message(message)
@@ -84,6 +90,12 @@ def handle_message(
     companies = _required_service(services, "companies")
     competitors = _required_service(services, "competitors")
     discovery = _required_service(services, "discovery")
+    monitoring = _required_service(services, "monitoring")
+
+    if message_id is not None and (
+        not isinstance(message_id, str) or not message_id.strip()
+    ):
+        raise MessageProcessingError("message_id must be a non-empty string")
 
     now = _as_utc(_clock_value(clock))
     company = _call_service(
@@ -92,39 +104,103 @@ def handle_message(
         normalized["company_domain_id"],
     )
     company_id = _required_identifier(company, "company")
-    competitor = _call_service(
+    ensure_with_status = getattr(
         competitors,
-        "find_or_create_competitor",
-        company_id=company_id,
-        name=_competitor_name(normalized["company_url"]),
-        website_url=normalized["company_url"],
+        "find_or_create_competitor_with_status",
+        None,
     )
+    if callable(ensure_with_status):
+        competitor, competitor_created = _call_service(
+            competitors,
+            "find_or_create_competitor_with_status",
+            company_id=company_id,
+            name=_competitor_name(normalized["company_url"]),
+            website_url=normalized["company_url"],
+        )
+        if not isinstance(competitor_created, bool):
+            raise MessageProcessingError(
+                "competitor status service returned a non-boolean created flag"
+            )
+    else:
+        # Keep direct P.3-style service doubles usable while the production
+        # CompetitorService exposes the authoritative created/not-created bit.
+        competitor = _call_service(
+            competitors,
+            "find_or_create_competitor",
+            company_id=company_id,
+            name=_competitor_name(normalized["company_url"]),
+            website_url=normalized["company_url"],
+        )
+        competitor_created = False
     competitor_id = _required_identifier(competitor, "competitor")
 
-    latest = _call_service(
-        discovery,
-        "latest_successful_run",
-        competitor_id,
-        company_id=company_id,
-    )
-    if _is_stale(latest, now):
+    if competitor_created:
+        latest = None
         reconciliation = _call_service(
             discovery,
             "discover_and_reconcile",
             competitor_id,
             company_id=company_id,
         )
-        action = "reconciled"
+        action = "first_run"
     else:
-        reconciliation = None
-        action = "skipped_fresh"
+        latest = _call_service(
+            discovery,
+            "latest_successful_run",
+            competitor_id,
+            company_id=company_id,
+        )
+        if _is_stale(latest, now):
+            reconciliation = _call_service(
+                discovery,
+                "discover_and_reconcile",
+                competitor_id,
+                company_id=company_id,
+            )
+            action = "reconciled"
+        else:
+            reconciliation = None
+            action = "skipped_fresh"
+            logger.info(
+                "skipping discovery for competitor %s: latest successful run is fresh",
+                competitor_id,
+            )
+
+    active_targets = _call_service(
+        discovery,
+        "list_active_targets",
+        competitor_id,
+        company_id=company_id,
+    )
+    if not isinstance(active_targets, (list, tuple)):
+        raise MessageProcessingError("discovery service returned invalid active targets")
+
+    resolved_message_id = (
+        message_id.strip() if isinstance(message_id, str) else None
+    )
+    idempotency_key = _message_idempotency_key(normalized, resolved_message_id)
+    monitoring_results: list[dict[str, Any]] = []
+    monitored_target_ids: list[Any] = []
+    for target in active_targets:
+        target_id = _required_identifier(target, "monitoring target")
+        monitoring_result = _call_service(
+            monitoring,
+            "monitor_target",
+            target_id,
+            idempotency_key=idempotency_key,
+        )
+        monitoring_results.append(_result_mapping(monitoring_result) or {})
+        monitored_target_ids.append(target_id)
 
     return {
         "action": action,
+        "competitor_created": competitor_created,
         "company": dict(company),
         "competitor": dict(competitor),
         "latest_successful_run": dict(latest) if isinstance(latest, Mapping) else None,
         "reconciliation": _result_mapping(reconciliation),
+        "monitored_target_ids": monitored_target_ids,
+        "monitoring": monitoring_results,
     }
 
 
@@ -257,6 +333,22 @@ def _result_mapping(value: Any) -> dict[str, Any] | None:
     if isinstance(value, Mapping):
         return dict(value)
     return {"value": value}
+
+
+def _message_idempotency_key(
+    message: Mapping[str, Any],
+    message_id: str | None,
+) -> str:
+    """Build a stable key for SQS delivery retries and direct callers."""
+
+    if message_id is not None:
+        return f"sqs:{message_id}"
+    encoded = json.dumps(
+        dict(message),
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return f"message:{hashlib.sha256(encoded).hexdigest()}"
 
 
 __all__ = [

@@ -1,8 +1,9 @@
-"""Opt-in live evidence for the P.3 SQS handler and worker.
+"""Opt-in live evidence for the P.3/P.4 SQS handler and worker.
 
 This verification sends two clearly labeled messages to the configured real
-queue, writes only to the dedicated test Mongo database, and removes every
-test company, competitor, target, and discovery-run row before returning.
+queue, writes only to the dedicated test Mongo database, proves first-run
+monitoring behavior, and removes every test company, competitor, target,
+discovery-run, snapshot, monitoring-run, and change row before returning.
 
 Run from the repository root with:
 
@@ -38,6 +39,7 @@ from backend.flask.scheduler.sqs_worker import (
     load_worker_config,
     process_message_record,
 )
+from backend.flask.snapshot.storage import SnapshotStorage
 from backend.flask.website_monitoring.repository import MonitoringTargetRepository
 
 
@@ -160,19 +162,29 @@ def run_live_verification() -> dict[str, object]:
         monitoring_run_count_after = database["monitoring_runs"].count_documents({})
         if len(test_runs) != 1 or test_runs[0].get("status") != "SUCCESS":
             raise AssertionError(f"expected one successful discovery run: {test_runs}")
-        if valid_result.outcome is None or valid_result.outcome.get("action") != "reconciled":
+        if valid_result.outcome is None or valid_result.outcome.get("action") != "first_run":
             raise AssertionError(f"worker did not reconcile the new competitor: {valid_result}")
-        if snapshot_count_after != snapshot_count_before:
-            raise AssertionError("new-competitor SQS processing unexpectedly created a snapshot")
-        if monitoring_run_count_after != monitoring_run_count_before:
+        if snapshot_count_after - snapshot_count_before != len(active_targets):
+            raise AssertionError("new-competitor flow did not create one snapshot per active target")
+        if monitoring_run_count_after - monitoring_run_count_before != len(active_targets):
             raise AssertionError(
-                "new-competitor SQS processing unexpectedly created a monitoring run"
+                "new-competitor flow did not create one monitoring run per active target"
             )
 
         parsed = parse_message(message_body)
-        first_duplicate_call = handle_message(parsed, services, clock=_utc_now)
+        first_duplicate_call = handle_message(
+            parsed,
+            services,
+            clock=_utc_now,
+            message_id=valid_record.get("MessageId"),
+        )
         state_after_first_duplicate = _state(database, created_company_id, created_competitor_id)
-        second_duplicate_call = handle_message(parsed, services, clock=_utc_now)
+        second_duplicate_call = handle_message(
+            parsed,
+            services,
+            clock=_utc_now,
+            message_id=valid_record.get("MessageId"),
+        )
         state_after_second_duplicate = _state(database, created_company_id, created_competitor_id)
         if state_after_first_duplicate != state_after_second_duplicate:
             raise AssertionError("identical handle_message calls changed the persisted state")
@@ -180,6 +192,15 @@ def run_live_verification() -> dict[str, object]:
             raise AssertionError("identical messages created a duplicate competitor")
         if first_duplicate_call["action"] != "skipped_fresh" or second_duplicate_call["action"] != "skipped_fresh":
             raise AssertionError("fresh duplicate calls did not skip discovery")
+        if not all(
+            item.get("idempotent") is True
+            for item in first_duplicate_call.get("monitoring", ())
+        ):
+            raise AssertionError("duplicate delivery did not reuse completed monitoring runs")
+        if database["snapshots"].count_documents({}) != snapshot_count_after:
+            raise AssertionError("duplicate delivery created another snapshot")
+        if database["monitoring_runs"].count_documents({}) != monitoring_run_count_after:
+            raise AssertionError("duplicate delivery created another monitoring run")
 
         malformed_sent = sqs.send_message(
             QueueUrl=config.queue_url,
@@ -234,9 +255,9 @@ def run_live_verification() -> dict[str, object]:
             "test_competitor_id": created_competitor_id,
             "active_target_count_after_reconciliation": len(active_targets),
             "successful_discovery_runs": len(test_runs),
-            "snapshots_unchanged": snapshot_count_after == snapshot_count_before,
-            "monitoring_runs_unchanged": (
-                monitoring_run_count_after == monitoring_run_count_before
+            "initial_snapshots_created": snapshot_count_after - snapshot_count_before,
+            "initial_monitoring_runs_created": (
+                monitoring_run_count_after - monitoring_run_count_before
             ),
             "idempotency": {
                 "first_action": first_duplicate_call["action"],
@@ -259,6 +280,30 @@ def run_live_verification() -> dict[str, object]:
         if valid_record is not None and not valid_acknowledged:
             _best_effort_delete(sqs, config.queue_url, valid_record)
         if created_competitor_id is not None:
+            target_ids = [
+                target["id"]
+                for target in targets.list_for_competitor(created_competitor_id)
+            ]
+            storage = SnapshotStorage()
+            for target_id in target_ids:
+                snapshot_documents = list(
+                    database["snapshots"].find(
+                        {"monitoring_target_id": to_object_id(target_id)},
+                        {"storage_path": 1},
+                    )
+                )
+                for snapshot in snapshot_documents:
+                    if snapshot.get("storage_path"):
+                        storage.delete_snapshot(snapshot["storage_path"])
+                database["snapshots"].delete_many(
+                    {"monitoring_target_id": to_object_id(target_id)}
+                )
+                database["monitoring_runs"].delete_many(
+                    {"monitoring_target_id": to_object_id(target_id)}
+                )
+                database["changes"].delete_many(
+                    {"monitoring_target_id": to_object_id(target_id)}
+                )
             for target in targets.list_for_competitor(created_competitor_id):
                 targets.delete(target["id"], competitor_id=created_competitor_id)
             database["discovery_runs"].delete_many(

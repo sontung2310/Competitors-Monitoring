@@ -9,6 +9,7 @@ from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.competitors.service import CompetitorService
 from backend.flask.scheduler.sqs_handler import (
+    MessageProcessingError,
     MessageValidationError,
     handle_message,
     parse_message,
@@ -32,7 +33,7 @@ class _CompetitorService:
         self.calls = []
         self.rows = {}
 
-    def find_or_create_competitor(self, *, company_id, name, website_url):
+    def find_or_create_competitor_with_status(self, *, company_id, name, website_url):
         key = (company_id, website_url)
         self.calls.append({"company_id": company_id, "name": name, "website_url": website_url})
         if key not in self.rows:
@@ -42,7 +43,15 @@ class _CompetitorService:
                 "name": name,
                 "website_url": website_url,
             }
-        return dict(self.rows[key])
+            return dict(self.rows[key]), True
+        return dict(self.rows[key]), False
+
+    def find_or_create_competitor(self, *, company_id, name, website_url):
+        return self.find_or_create_competitor_with_status(
+            company_id=company_id,
+            name=name,
+            website_url=website_url,
+        )[0]
 
 
 class _DiscoveryService:
@@ -50,6 +59,9 @@ class _DiscoveryService:
         self.latest = latest
         self.latest_calls = []
         self.reconciliation_calls = []
+        self.active_targets = [
+            {"id": "target-1", "active": True, "discovery_status": "ACTIVE"}
+        ]
 
     def latest_successful_run(self, competitor_id, *, company_id):
         self.latest_calls.append((competitor_id, company_id))
@@ -68,6 +80,43 @@ class _DiscoveryService:
             "activated_target_ids": [],
             "deactivated_target_ids": [],
         }
+
+    def list_active_targets(self, competitor_id, *, company_id):
+        return [dict(target) for target in self.active_targets]
+
+
+class _MonitoringService:
+    def __init__(self):
+        self.calls = []
+        self.completed_keys = set()
+
+    def monitor_target(self, target_id, *, idempotency_key):
+        self.calls.append((target_id, idempotency_key))
+        delivery_key = (target_id, idempotency_key)
+        idempotent = delivery_key in self.completed_keys
+        self.completed_keys.add(delivery_key)
+        return {
+            "run": {"id": f"run-{len(self.calls)}", "status": "SUCCESS"},
+            "snapshot": {"id": f"snapshot-{len(self.calls)}"} if not idempotent else None,
+            "change": None,
+            "changes": [],
+            "idempotent": idempotent,
+        }
+
+
+class _FailOnceDiscoveryService(_DiscoveryService):
+    def __init__(self):
+        super().__init__()
+        self.failures_remaining = 1
+
+    def discover_and_reconcile(self, competitor_id, *, company_id):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary discovery outage")
+        return super().discover_and_reconcile(
+            competitor_id,
+            company_id=company_id,
+        )
 
 
 def _message(host="DEV"):
@@ -118,13 +167,24 @@ class HandleMessageTests(unittest.TestCase):
         self.companies = _CompanyService()
         self.competitors = _CompetitorService()
         self.discovery = _DiscoveryService()
+        self.monitoring = _MonitoringService()
         self.services = {
             "companies": self.companies,
             "competitors": self.competitors,
             "discovery": self.discovery,
+            "monitoring": self.monitoring,
+        }
+
+    def _existing_competitor(self):
+        self.competitors.rows[("company-1", "https://example.com/p3-test")] = {
+            "id": "competitor-1",
+            "company_id": "company-1",
+            "name": "example.com",
+            "website_url": "https://example.com/p3-test",
         }
 
     def test_stale_existing_competitor_reconciles_at_thirty_day_boundary(self):
+        self._existing_competitor()
         self.discovery.latest = {
             "run_id": "old-run",
             "finished_at": NOW - timedelta(days=30),
@@ -136,8 +196,11 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(result["action"], "reconciled")
         self.assertEqual(len(self.competitors.calls), 1)
         self.assertEqual(self.discovery.reconciliation_calls, [("competitor-1", "company-1")])
+        self.assertEqual([call[0] for call in self.monitoring.calls], ["target-1"])
+        self.assertTrue(self.monitoring.calls[0][1].startswith("message:"))
 
     def test_fresh_existing_competitor_skips_discovery_and_reconciliation(self):
+        self._existing_competitor()
         self.discovery.latest = {
             "run_id": "fresh-run",
             "finished_at": NOW - timedelta(days=29, seconds=1),
@@ -150,17 +213,57 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(self.discovery.reconciliation_calls, [])
         self.assertEqual(self.companies.calls, ["tenant.example"])
 
-    def test_identical_message_is_idempotent_without_snapshot_or_monitoring_calls(self):
+        self.assertEqual([call[0] for call in self.monitoring.calls], ["target-1"])
+
+    def test_new_competitor_runs_first_discovery_and_duplicate_delivery_does_not_resnapshot(self):
+        self.discovery.active_targets = [
+            {"id": "target-1", "active": True, "discovery_status": "ACTIVE"},
+            {"id": "target-2", "active": True, "discovery_status": "ACTIVE"},
+        ]
         first = handle_message(_message(), self.services, clock=lambda: NOW)
         second = handle_message(_message(), self.services, clock=lambda: NOW)
 
-        self.assertEqual(first["action"], "reconciled")
+        self.assertEqual(first["action"], "first_run")
         self.assertEqual(second["action"], "skipped_fresh")
         self.assertEqual(len(self.companies.calls), 2)
         self.assertEqual(len(self.competitors.rows), 1)
         self.assertEqual(len(self.competitors.calls), 2)
         self.assertEqual(len(self.discovery.reconciliation_calls), 1)
         self.assertEqual(first["competitor"], second["competitor"])
+        self.assertEqual(first["monitored_target_ids"], ["target-1", "target-2"])
+        self.assertEqual(len(self.monitoring.calls), 4)
+        self.assertTrue(all(item["snapshot"] for item in first["monitoring"]))
+        self.assertTrue(all(item["change"] is None for item in first["monitoring"]))
+        self.assertTrue(all(not item["idempotent"] for item in first["monitoring"]))
+        self.assertTrue(all(item["idempotent"] for item in second["monitoring"]))
+        self.assertTrue(all(item["snapshot"] is None for item in second["monitoring"]))
+
+    def test_failed_new_competitor_discovery_keeps_record_retryable(self):
+        discovery = _FailOnceDiscoveryService()
+        services = {
+            **self.services,
+            "discovery": discovery,
+        }
+
+        with self.assertRaises(MessageProcessingError):
+            handle_message(_message(), services, clock=lambda: NOW)
+
+        self.assertEqual(len(self.competitors.rows), 1)
+        retry = handle_message(_message(), services, clock=lambda: NOW)
+
+        self.assertEqual(retry["action"], "reconciled")
+        self.assertEqual(len(discovery.reconciliation_calls), 1)
+        self.assertEqual(len(self.monitoring.calls), 1)
+
+    def test_new_competitor_with_no_live_targets_creates_no_initial_change(self):
+        self.discovery.active_targets = []
+
+        result = handle_message(_message(), self.services, clock=lambda: NOW)
+
+        self.assertEqual(result["action"], "first_run")
+        self.assertEqual(result["monitored_target_ids"], [])
+        self.assertEqual(result["monitoring"], [])
+        self.assertEqual(self.monitoring.calls, [])
 
 
 class RealServiceFindOrCreateTests(unittest.TestCase):
