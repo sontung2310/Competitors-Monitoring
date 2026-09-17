@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from backend.flask.companies.repository import CompanyRepository
 from backend.flask.companies.service import CompanyService
@@ -261,6 +261,26 @@ class CompanyAndScopingTests(unittest.TestCase):
         repository.succeed("run-1", candidate_count=0)
         resumed = repository.start("run-2", competitor_id="c" * 24)
         self.assertEqual(resumed["run_id"], "run-2")
+
+    def test_stale_discovery_run_is_failed_then_replaced(self):
+        database = _RunningUniqueDatabase()
+        repository = DiscoveryRunRepository.from_database(database)
+        repository.ensure_indexes()
+        now = datetime(2026, 9, 4, 12, tzinfo=timezone.utc)
+
+        stale = repository.start(
+            "run-stale",
+            competitor_id="c" * 24,
+            started_at=now - timedelta(minutes=31),
+        )
+        replacement = repository.start(
+            "run-replacement",
+            competitor_id="c" * 24,
+            started_at=now,
+        )
+
+        self.assertEqual(repository.get(stale["run_id"])["status"], "FAILED")
+        self.assertEqual(replacement["run_id"], "run-replacement")
 
     def test_migration_does_not_clear_explicit_company_assignments(self):
         database = _Database()
