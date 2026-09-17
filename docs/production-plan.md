@@ -112,8 +112,20 @@ This is a new kind of caller into the existing service layer, following the same
 routes→service→repository layering already established: the worker calls the same
 company/competitor/discovery/reconciliation service functions already established in the
 application. The SQS message flow calls `discover_and_reconcile()` only when discovery is
-missing or stale. When discovery is fresh it skips that call and instead calls `monitor_target()`
-for each currently tracked page. It does not call the monitoring scheduler itself.
+missing or stale. **It never calls `monitor_target()` for a `"first_run"` or `"reconciled"`
+message** — both already spent the message's time budget on discovery, so calling
+`monitor_target()` for every tracked page too would risk the same 900-second visibility timeout
+discovery alone is already close to. Only a `"skipped_fresh"` message (which did no discovery at
+all) calls `monitor_target()` inline, for each currently tracked page.
+
+**This requires a second, standalone production process — the scheduler
+(`scheduler/scheduler_runner.py`)** — deployed and run continuously alongside the SQS worker, not
+instead of it. It is what actually checks a `"first_run"`/`"reconciled"` message's targets (and
+every other tracked page, on its own `check_interval_minutes`) once the SQS worker has moved on.
+Without it running, those targets are never checked at all. `SchedulerService` itself needed no
+DynamoDB-specific code: it only calls `target_repository.list_active_targets()` with no
+competitor_id (a full table Scan, already exactly the tracked set per 5.1) and reads
+`id`/`check_interval_minutes`/`last_checked_at` off whatever comes back.
 
 **Processing logic on receiving a message** — two cases. This logic runs once per resolved
 competitor URL, i.e. after the resolution/fan-out step above has reduced the message to exactly one
@@ -447,6 +459,18 @@ the unmerged TON-44 work this depends on for the RM Mongo connection helper).
   documenting that `monitoring_runs` needs a code change (relaxing its `to_object_id()` calls on
   `monitoring_target_id`) even though the collection itself doesn't move; `companies`, `competitors`,
   and `discovery_runs` were checked and confirmed to have no such reference.
+- 2026-09-17 (TON-45 gap review) — Fixed three real gaps between this doc and the shipped code,
+  caught by an independent review: (1) `sqs_handler.py` was still calling `monitor_target()`
+  unconditionally for every action, including `"reconciled"` and `"first_run"` — contradicting the
+  2026-09-17 correction above and reopening the exact visibility-timeout risk that correction
+  existed to avoid; fixed by only calling it for `"skipped_fresh"`. (2) `SchedulerService` was
+  never wired to run against DynamoDB at all in production — the doc assumed a scheduler was
+  catching first-run/stale-rediscovery targets that, in practice, nothing was checking; fixed with
+  `scheduler/scheduler_runner.py`, a new production process. `SchedulerService` itself needed no
+  changes — its Mongo-specific behavior was in `MonitoringTargetRepository`'s query, not in
+  `SchedulerService`. (3) `docs/production-plan.md` 5.3/the summary table still described `changes`
+  as host-routed like the strategy lookup, contradicting 5.5's `RM_HOST` (fixed-per-deployment)
+  description — see the open gap 4 discussion for the resolution.
 
 ---
 

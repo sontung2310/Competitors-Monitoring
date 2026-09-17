@@ -78,9 +78,14 @@ def handle_message(
     """Process one parsed message through discovery and monitoring services.
 
     The injected services are the same application services used elsewhere by
-    the Flask app. Discovery/reconciliation remains snapshot-free; active
-    targets are handed to ``monitor_target`` afterward. ``message_id`` is the
-    SQS at-least-once delivery identity used to make monitoring idempotent.
+    the Flask app. Discovery/reconciliation remains snapshot-free. Active
+    targets are handed to ``monitor_target`` inline only for a
+    ``"skipped_fresh"`` message; ``"first_run"`` and ``"reconciled"`` already
+    spent the message's time budget on discovery, so their targets are left
+    for the scheduler's next tick instead (see the "Visibility-timeout
+    boundary" note in docs/production-plan.md section 3). ``message_id`` is
+    the SQS at-least-once delivery identity used to make monitoring
+    idempotent.
 
     ``services["strategy_lookup"]`` and ``services["queue_publisher"]`` are
     only required when actually needed (empty ``competitor_lst``, and a
@@ -214,31 +219,38 @@ def handle_message(
                 competitor_id,
             )
 
-    active_targets = _call_service(
-        discovery,
-        "list_active_targets",
-        competitor_id,
-        company_id=company_id,
-    )
-    if not isinstance(active_targets, (list, tuple)):
-        raise MessageProcessingError("discovery service returned invalid active targets")
-
+    # Only a "skipped_fresh" message has time budget to spare: "first_run" and
+    # "reconciled" already spent it on discovery (up to ~12 minutes for a
+    # large competitor), so calling monitor_target() for every active target
+    # here too risks the queue's 900-second visibility timeout. Those two
+    # actions deliberately leave monitoring to the scheduler's next tick
+    # instead (see docs/production-plan.md section 3's "Visibility-timeout
+    # boundary" and the scheduler in scheduler/scheduler_runner.py).
     resolved_message_id = (
         message_id.strip() if isinstance(message_id, str) else None
     )
     idempotency_key = _message_idempotency_key(normalized, resolved_message_id)
     monitoring_results: list[dict[str, Any]] = []
     monitored_target_ids: list[Any] = []
-    for target in active_targets:
-        target_id = _required_identifier(target, "monitoring target")
-        monitoring_result = _call_service(
-            monitoring,
-            "monitor_target",
-            target_id,
-            idempotency_key=idempotency_key,
+    if action == "skipped_fresh":
+        active_targets = _call_service(
+            discovery,
+            "list_active_targets",
+            competitor_id,
+            company_id=company_id,
         )
-        monitoring_results.append(_result_mapping(monitoring_result) or {})
-        monitored_target_ids.append(target_id)
+        if not isinstance(active_targets, (list, tuple)):
+            raise MessageProcessingError("discovery service returned invalid active targets")
+        for target in active_targets:
+            target_id = _required_identifier(target, "monitoring target")
+            monitoring_result = _call_service(
+                monitoring,
+                "monitor_target",
+                target_id,
+                idempotency_key=idempotency_key,
+            )
+            monitoring_results.append(_result_mapping(monitoring_result) or {})
+            monitored_target_ids.append(target_id)
 
     return {
         "action": action,

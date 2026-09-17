@@ -237,8 +237,11 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(result["action"], "reconciled")
         self.assertEqual(len(self.competitors.calls), 1)
         self.assertEqual(self.discovery.reconciliation_calls, [("competitor-1", "company-1")])
-        self.assertEqual([call[0] for call in self.monitoring.calls], ["target-1"])
-        self.assertTrue(self.monitoring.calls[0][1].startswith("message:"))
+        # "reconciled" already spent the message's time budget on discovery,
+        # so it defers monitoring to the scheduler's next tick instead of
+        # calling monitor_target() inline (see the sqs_handler docstring).
+        self.assertEqual(self.monitoring.calls, [])
+        self.assertEqual(result["monitored_target_ids"], [])
 
     def test_fresh_existing_competitor_skips_discovery_and_reconciliation(self):
         self._existing_competitor()
@@ -263,21 +266,34 @@ class HandleMessageTests(unittest.TestCase):
         ]
         first = handle_message(_message(), self.services, clock=lambda: NOW)
         second = handle_message(_message(), self.services, clock=lambda: NOW)
+        third = handle_message(_message(), self.services, clock=lambda: NOW)
 
         self.assertEqual(first["action"], "first_run")
         self.assertEqual(second["action"], "skipped_fresh")
-        self.assertEqual(len(self.companies.calls), 2)
+        self.assertEqual(third["action"], "skipped_fresh")
+        self.assertEqual(len(self.companies.calls), 3)
         self.assertEqual(len(self.competitors.rows), 1)
-        self.assertEqual(len(self.competitors.calls), 2)
+        self.assertEqual(len(self.competitors.calls), 3)
         self.assertEqual(len(self.discovery.reconciliation_calls), 1)
         self.assertEqual(first["competitor"], second["competitor"])
-        self.assertEqual(first["monitored_target_ids"], ["target-1", "target-2"])
+
+        # "first_run" already spent the time budget on discovery + activating
+        # the suggested pages; it defers the first real check to the
+        # scheduler instead of monitoring inline.
+        self.assertEqual(first["monitored_target_ids"], [])
+        self.assertEqual(first["monitoring"], [])
+
+        # "skipped_fresh" is the action that monitors inline. `second` is the
+        # first real check for these targets; `third` is a duplicate delivery
+        # of the same message (same derived idempotency key) and must reuse
+        # the completed run rather than re-snapshotting.
+        self.assertEqual(second["monitored_target_ids"], ["target-1", "target-2"])
         self.assertEqual(len(self.monitoring.calls), 4)
-        self.assertTrue(all(item["snapshot"] for item in first["monitoring"]))
-        self.assertTrue(all(item["change"] is None for item in first["monitoring"]))
-        self.assertTrue(all(not item["idempotent"] for item in first["monitoring"]))
-        self.assertTrue(all(item["idempotent"] for item in second["monitoring"]))
-        self.assertTrue(all(item["snapshot"] is None for item in second["monitoring"]))
+        self.assertTrue(all(item["snapshot"] for item in second["monitoring"]))
+        self.assertTrue(all(item["change"] is None for item in second["monitoring"]))
+        self.assertTrue(all(not item["idempotent"] for item in second["monitoring"]))
+        self.assertTrue(all(item["idempotent"] for item in third["monitoring"]))
+        self.assertTrue(all(item["snapshot"] is None for item in third["monitoring"]))
 
     def test_failed_new_competitor_discovery_keeps_record_retryable(self):
         discovery = _FailOnceDiscoveryService()
@@ -294,7 +310,8 @@ class HandleMessageTests(unittest.TestCase):
 
         self.assertEqual(retry["action"], "reconciled")
         self.assertEqual(len(discovery.reconciliation_calls), 1)
-        self.assertEqual(len(self.monitoring.calls), 1)
+        # "reconciled" defers monitoring to the scheduler's next tick.
+        self.assertEqual(self.monitoring.calls, [])
 
     def test_new_competitor_with_no_live_targets_creates_no_initial_change(self):
         self.discovery.active_targets = []
