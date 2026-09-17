@@ -111,8 +111,9 @@ continuously polls the SQS queue (long-polling via boto3's SQS client is the sta
 This is a new kind of caller into the existing service layer, following the same
 routes→service→repository layering already established: the worker calls the same
 company/competitor/discovery/reconciliation service functions already established in the
-application. The SQS message flow calls `discover_and_reconcile()` where needed; it does not call
-the monitoring scheduler or take snapshots directly.
+application. The SQS message flow calls `discover_and_reconcile()` only when discovery is
+missing or stale. When discovery is fresh it skips that call and instead calls `monitor_target()`
+for each currently tracked page. It does not call the monitoring scheduler itself.
 
 **Processing logic on receiving a message** — two cases. This logic runs once per resolved
 competitor URL, i.e. after the resolution/fan-out step above has reduced the message to exactly one
@@ -123,11 +124,14 @@ competitor:
      timestamp tracking).
    - If discovery is stale (≥ 30 days, same threshold as the monthly cadence in section 4):
      re-run discovery, apply the auto-activate/auto-deactivate reconciliation from section 4,
-     then finish the SQS message after reconciliation.
-   - If discovery is fresh (< 30 days): finish without running discovery or reconciliation.
-   - The SQS flow deliberately does **not** take a fresh snapshot of every currently-active
-     (tracked) page. The existing internal scheduler (1.9) calls `monitor_target()` for those
-     targets on its next scheduled cycle.
+     then finish the SQS message after reconciliation. Do not snapshot inside this message.
+     Discovery alone can approach the 900-second visibility timeout, so the scheduler snapshots
+     those targets on its next cycle.
+   - If discovery is fresh (< 30 days): skip discovery and reconciliation, then still snapshot
+     every currently tracked page by calling `monitor_target()` before finishing the message.
+     A successful fetch always stores a snapshot. A change is created only when the new content
+     hash differs from the previous snapshot. This message has no discovery work, so the snapshot
+     pass is its job rather than being deferred to the scheduler.
 
 2. **Competitor does not exist yet** (first run):
    - Create the competitor record, scoped to the company identified by `company_domain_id`.
@@ -140,16 +144,19 @@ competitor:
 
 **Visibility-timeout boundary**: the queue's fixed visibility timeout is 900 seconds. Discovery
 alone has been observed to take close to 12 minutes for a large competitor, and synchronously
-snapshotting every active target would add further variable work to the same message. The SQS
-handler therefore ends after discovery and reconciliation; leaving snapshots to the existing
-scheduler is the concrete mitigation for message visibility expiring during processing. A real
+snapshotting every active target on top of that discovery would add further variable work to the
+same message. A first-run or stale message therefore ends after discovery and reconciliation, and
+leaves snapshots to the scheduler. That split does not apply to a fresh message: it does no
+discovery, so it must snapshot its currently tracked pages before it finishes. A real
 reconciliation run completed in 41.17 seconds without snapshots, leaving a substantial margin
-under the current timeout.
+under the current timeout when discovery is the work being done.
 
 **This coexists with the existing internal per-target scheduler (1.9), it does not replace it.**
-The scheduler keeps running independently on each target's own `check_interval_minutes`; SQS
-messages trigger discovery/reconciliation only. Newly-activated targets are picked up by the
-scheduler on its next cycle, which remains responsible for snapshots and change detection.
+The scheduler keeps running independently on each target's own `check_interval_minutes`. SQS
+triggers discovery and reconciliation only when the competitor is new or discovery is stale.
+A fresh existing competitor is snapshot-only inside the message. Newly-activated targets from a
+first-run or stale message are picked up by the scheduler on its next cycle, which remains
+responsible for their first snapshot and later change detection.
 The concurrency guard already built in 1.8 (atomic duplicate-run prevention) continues to protect
 scheduler monitoring runs and any other monitor attempts — no new protection is needed here.
 
@@ -330,15 +337,65 @@ query, the index) keeps working unchanged. Only two fields actually change shape
 | `detected_at`, `change_type`, `summary`, `narrative_summary`, `detected_url`, `status`, `created_at`, `updated_at` | as today | unchanged |
 | `is_simulated` | legacy/optional | dropped (production never simulates, same reasoning as 5.2) |
 
-### 5.4 The one ripple in a collection that isn't moving: `monitoring_runs`
+### 5.4 The one near-ripple in a collection that isn't moving: `monitoring_runs`
 `monitoring_runs` (the concurrency guard that prevents two monitoring checks running on the same
-target at once) stays in our own MongoDB, unchanged as a collection. But its repository
-(`MonitoringRunRepository`) currently forces `monitoring_target_id` through `to_object_id()` on
-every read/write and in one of its unique indexes. Since that field now holds a DynamoDB string id
-instead of a Mongo ObjectId, that conversion needs to be relaxed — a real code change even though
-the collection itself doesn't move. `companies`, `competitors`, and `discovery_runs` were checked
-for the same issue and none of them store a `monitoring_target_id` reference at all, so they're
-genuinely untouched.
+target at once) stays in our own MongoDB, unchanged as a collection. Its repository
+(`MonitoringRunRepository`) forces `monitoring_target_id` through `to_object_id()` on every
+read/write and in one of its unique indexes, which would break once that field holds a DynamoDB
+target id instead of a genuine Mongo ObjectId — **except** DynamoDB target ids are deliberately
+minted in valid Mongo ObjectId *format* (`str(ObjectId())`, see 5.1's field mapping), purely so this
+kind of cross-reference keeps round-tripping through `to_object_id()`/`serialize_document()`
+unchanged. No code change was needed here after all; this is called out explicitly so the reason
+isn't a coincidence someone has to rediscover later. `companies`, `competitors`, and
+`discovery_runs` were checked for the same issue and none of them store a `monitoring_target_id`
+reference at all, so they're genuinely untouched.
+
+### 5.5 Implementation evidence (TON-45, 2026-09-17)
+
+Implemented on `feature/p6-dynamodb-storage` (off `feature/p3-multi-competitor-fanout`, which holds
+the unmerged TON-44 work this depends on for the RM Mongo connection helper).
+
+- **New modules**: `database/dynamodb_connection.py` (env config + boto3 client/resource
+  construction), `website_monitoring/dynamodb_repository.py` (`DynamoDBMonitoringTargetRepository`),
+  `snapshot/dynamodb_service.py` (`DynamoDBSnapshotService`, content + metadata in one item),
+  `change_detection/rm_repository.py` (`RmChangeRepository`, subclasses the existing
+  `ChangeRepository` — only `create()` differs), `scheduler/production_services.py`
+  (`build_production_services()`, the full production wiring).
+- **Necessary-for-P.6 slice of P.5** (not the monthly schedule, P.5.1, which remains open):
+  `discovery.service.activate_candidate`/`discard_candidate` now call new
+  `mark_activated()`/`mark_discarded()` repository methods instead of a raw `update()` with
+  `active`/`discovery_status` fields — the Mongo repository's versions are thin, behavior-preserving
+  wrappers around today's exact update calls; the DynamoDB repository's versions implement the real
+  presence-based/delete-on-discard semantics. `discover_and_reconcile()` and `remove_candidate()`
+  needed no changes at all: `_is_activated()` naturally evaluates `False` for every DynamoDB target
+  (no `active` field, `discovery_status` never `"ACTIVE"`), which happens to route `remove_candidate`
+  straight to its existing hard-delete branch — exactly the confirmed "deactivate means delete" rule,
+  for a different reason than why it was originally written that way.
+- **Two small injectable hooks**, both defaulting to today's exact behavior (zero change for
+  dev/Mongo): `MonitoringRunService.active_target_check` (replaces the hardcoded
+  `active=True and discovery_status="ACTIVE"` check, which would reject every DynamoDB target
+  otherwise) and `ChangeService.snapshot_reference_extractor` (replaces the hardcoded single-id
+  extraction, since a DynamoDB snapshot has no single id — only the `{monitoring_target_id,
+  captured_at}` pair).
+- **`RM_HOST`** (new env var, default `"dev"`): which RM database the *changes* repository writes to
+  is a fixed, per-deployment choice resolved once at process startup, not a per-message one — unlike
+  the strategy lookup's `host` field, `ChangeService`/`MonitoringRunService` are built once per
+  process and the scheduler calls `monitor_target()` independently of SQS entirely, so there is no
+  per-message context available to route by at that point.
+- **Real-infrastructure verification**: every new piece was smoke-tested directly against the real,
+  already-provisioned DynamoDB tables and the real `rm_dev_testing` database (not just fakes) —
+  create/get/GSI-query/scan/update/delete on both DynamoDB tables, TTL attribute computation,
+  newest-first snapshot ordering, and create/get/list/delete on the RM Mongo changes collection.
+  This caught two real bugs a mocked unit test would have missed: DynamoDB's resource API returns
+  `Decimal` for every Number attribute (needed explicit `int()` conversion back), and a
+  `dict`-iteration bug in the generic `update_item` builder (`enumerate(values)` iterates a dict's
+  *keys*, not its values). `build_production_services()` and `sqs_worker.build_application_services()`
+  were also verified to construct cleanly against real infrastructure.
+- **Not done in this round**: the actual end-to-end pipeline (SQS message → discovery/reconciliation
+  → scheduler → snapshot → change) has not been exercised live as one continuous flow against the
+  new storage — that was deliberately deferred to right after this work, per the agreed sequencing.
+  `live_sqs_verification.py`/`live_p4_verification.py` were left untouched and still exercise the
+  Mongo-only graph via `create_app(...)`, not the new DynamoDB/RM-Mongo graph.
 
 ## Explicit assumptions to confirm
 - "Candidate pages" in section 3's processing logic means currently-tracked/active pages for that
@@ -365,7 +422,13 @@ genuinely untouched.
 - 2026-09-11 — Updated section 3 to reflect the decoupled SQS flow: discovery/reconciliation
   finishes the message, while the existing scheduler owns snapshots. This avoids consuming the
   900-second visibility-timeout margin with variable snapshot work; a real reconciliation run
-  completed in 41.17 seconds without snapshots.
+  completed in 41.17 seconds without snapshots. Superseded for the fresh path by the 2026-09-17
+  correction below: a message whose discovery is under 30 days still snapshots inside SQS.
+- 2026-09-17 — Corrected section 3. An existing competitor whose last successful discovery is
+  under 30 days skips discovery and reconciliation, but the SQS message must call
+  `monitor_target()` and snapshot every currently tracked page. First-run and stale messages
+  still leave snapshots to the scheduler, because discovery already consumes the
+  visibility-timeout margin.
 - 2026-09-17 (TON-44) — Replaced the `{strategy_id, company_domain_id, company_url, host}` schema
   with `{company_domain_id, competitor_lst, host}`. Added automatic competitor resolution via the
   external RM platform's `account_company`/`strategy_strategy` collections (Primary-strategy

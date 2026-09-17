@@ -512,6 +512,7 @@ class MonitoringRunService:
         snapshot_content_loader: SnapshotContentLoader | None = None,
         content_processors: Mapping[str, ContentProcessor] | None = None,
         detected_url_liveness_checker: Callable[[str], Any] | None = None,
+        active_target_check: Callable[[Mapping[str, Any]], bool] | None = None,
     ) -> None:
         self.target_repository = target_repository
         self.run_repository = run_repository
@@ -524,6 +525,13 @@ class MonitoringRunService:
         self.snapshot_content_loader = snapshot_content_loader
         self.content_processors = dict(content_processors or {})
         self.detected_url_liveness_checker = detected_url_liveness_checker
+        # Dev/Mongo targets prove they're trackable via active=True and
+        # discovery_status="ACTIVE". Production's DynamoDB targets have
+        # neither field the same way (see docs/production-plan.md 5.1) — the
+        # repository only ever returns rows that are already tracked, so
+        # existence alone is proof enough there. Production wiring injects a
+        # check reflecting that instead of this Mongo-specific default.
+        self.active_target_check = active_target_check or _is_active_monitoring_target
         if isinstance(run_repository, MonitoringRunRepository):
             # The partial unique index is part of the runtime safety contract,
             # so repository-backed construction makes sure it exists before
@@ -609,7 +617,7 @@ class MonitoringRunService:
         target = self.target_repository.get(target_id)
         if target is None:
             raise MonitoringRunError(f"monitoring target {target_id!r} was not found")
-        if not _is_active_monitoring_target(target):
+        if not self.active_target_check(target):
             raise MonitoringRunError(
                 f"monitoring target {target_id!r} is not an active target"
             )
@@ -811,6 +819,7 @@ def monitor_target(
     snapshot_content_loader: SnapshotContentLoader | None = None,
     content_processors: Mapping[str, ContentProcessor] | None = None,
     detected_url_liveness_checker: Callable[[str], Any] | None = None,
+    active_target_check: Callable[[Mapping[str, Any]], bool] | None = None,
     idempotency_key: str | None = None,
 ) -> dict[str, Any]:
     """Functional entry point for one repository-backed monitoring attempt."""
@@ -826,6 +835,7 @@ def monitor_target(
         stale_after=stale_after,
         snapshot_content_loader=snapshot_content_loader,
         content_processors=content_processors,
+        active_target_check=active_target_check,
         detected_url_liveness_checker=detected_url_liveness_checker,
     ).monitor_target(target_id, idempotency_key=idempotency_key)
 

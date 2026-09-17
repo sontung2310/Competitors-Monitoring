@@ -355,19 +355,14 @@ class DiscoveryService:
         if candidate.get("active") and candidate.get("discovery_status") == "ACTIVE":
             return candidate
 
-        activation_updates = {
-            "active": True,
-            "discovery_status": "ACTIVE",
-        }
+        check_interval_minutes = None
         if not _has_positive_interval(candidate.get("check_interval_minutes")):
-            activation_updates["check_interval_minutes"] = (
-                default_check_interval_minutes(candidate.get("page_type"))
-            )
+            check_interval_minutes = default_check_interval_minutes(candidate.get("page_type"))
 
-        updated = self.monitoring_target_repository.update(
+        updated = self.monitoring_target_repository.mark_activated(
             candidate_id,
-            activation_updates,
             competitor_id=candidate.get("competitor_id"),
+            check_interval_minutes=check_interval_minutes,
         )
         if updated is None:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be activated")
@@ -543,9 +538,8 @@ class DiscoveryService:
             )
         if candidate.get("discovery_status") == "DISCARDED":
             return candidate
-        updated = self.monitoring_target_repository.update(
+        updated = self.monitoring_target_repository.mark_discarded(
             candidate_id,
-            {"active": False, "discovery_status": "DISCARDED"},
             competitor_id=candidate.get("competitor_id"),
         )
         if updated is None:

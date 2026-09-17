@@ -231,19 +231,21 @@ class SqsQueuePublisher:
 
 
 def build_application_services() -> Mapping[str, Any]:
-    """Build the normal repository-backed service graph for the process entry point.
+    """Build the production service graph for the process entry point.
 
-    Adds ``strategy_lookup`` (a pure MongoDB read against the external RM
-    database, safe to construct without AWS credentials) on top of the Flask
-    app's own service graph. ``queue_publisher`` is deliberately not included
-    here since it needs a live SQS client/queue URL; see
-    ``build_worker_services``.
+    Per docs/production-plan.md section 5: monitoring_targets/snapshots come
+    from DynamoDB and changes from the external RM MongoDB database, while
+    companies/competitors/monitoring_runs/discovery_runs are unaffected and
+    still come from this application's own MongoDB database (see
+    ``production_services.build_production_services``). ``strategy_lookup``
+    is added on top (a pure MongoDB read, safe to construct without AWS
+    credentials). ``queue_publisher`` is deliberately not included here since
+    it needs a live SQS client/queue URL; see ``build_worker_services``.
     """
 
-    from backend.flask.app import create_app
+    from .production_services import build_production_services
 
-    app = create_app()
-    services = dict(app.extensions["api_services"])
+    services = dict(build_production_services())
     services["strategy_lookup"] = StrategyLookupService()
     return services
 
