@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import json
 import unittest
 from datetime import datetime, timezone
 
 from backend.flask.scheduler.sqs_worker import (
     SQSConfigurationError,
+    SqsQueuePublisher,
     load_worker_config,
     poll_once,
     process_message_record,
@@ -68,6 +70,7 @@ class _SQSClient:
         self.messages = messages
         self.receive_calls = []
         self.delete_calls = []
+        self.send_calls = []
 
     def receive_message(self, **kwargs):
         self.receive_calls.append(kwargs)
@@ -76,10 +79,13 @@ class _SQSClient:
     def delete_message(self, **kwargs):
         self.delete_calls.append(kwargs)
 
+    def send_message(self, **kwargs):
+        self.send_calls.append(kwargs)
+
 
 VALID_BODY = (
-    '{"strategy_id": 1, "company_domain_id": "tenant.example", '
-    '"company_url": "https://example.com", "host": "prod"}'
+    '{"company_domain_id": "tenant.example", '
+    '"competitor_lst": ["https://example.com"], "host": "prod"}'
 )
 
 
@@ -136,6 +142,30 @@ class WorkerTests(unittest.TestCase):
         self.assertFalse(result.acknowledged)
         self.assertTrue(result.failed)
         self.assertEqual(client.delete_calls, [])
+
+    def test_queue_publisher_sends_json_message_body(self):
+        client = _SQSClient([])
+        publisher = SqsQueuePublisher(client, "https://sqs.example/queue")
+
+        publisher.publish(
+            {
+                "company_domain_id": "tenant.example",
+                "competitor_lst": ["https://example.com"],
+                "host": "dev",
+            }
+        )
+
+        self.assertEqual(len(client.send_calls), 1)
+        sent = client.send_calls[0]
+        self.assertEqual(sent["QueueUrl"], "https://sqs.example/queue")
+        self.assertEqual(
+            json.loads(sent["MessageBody"]),
+            {
+                "company_domain_id": "tenant.example",
+                "competitor_lst": ["https://example.com"],
+                "host": "dev",
+            },
+        )
 
     def test_worker_config_requires_region_and_queue_url(self):
         self.assertEqual(

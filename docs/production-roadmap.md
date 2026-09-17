@@ -42,6 +42,12 @@ separate, focused tasks on the `production` branch.
 - `sqs_worker.py` uses a 20-second long poll and deletes only successfully processed messages; malformed and failed messages remain for the AWS retry/DLQ policy.
 - Real AWS verification confirmed `ap-southeast-2`, a 900-second visibility timeout, a configured DLQ with `maxReceiveCount=10`, valid-message acknowledgement, identical duplicate-handler state, and malformed-message redelivery after no acknowledgement. Temporary test Mongo rows and queue messages were cleaned up.
 
+## P.3 follow-up: multi-competitor schema and Primary-strategy resolution (TON-44)
+
+- [ ] P.3.7 Replace the inbound schema with `{company_domain_id, competitor_lst, host}`; drop `strategy_id`.
+- [ ] P.3.8 Resolve competitors automatically when `competitor_lst` is empty, via the external RM `account_company` → `strategy_strategy` Primary-strategy lookup, host-routed (`dev` → `rm_dev_testing`, `prod` → `rm_pre_release`, default `dev`); skip quietly when no domain match, no Primary strategy, or zero usable URLs are found.
+- [ ] P.3.9 Fan out a multi-competitor resolution into one child SQS message per competitor URL instead of processing them inline, to stay within the 900-second visibility timeout; process single-URL resolutions inline through the existing P.4 flow unchanged.
+
 ## P.4 Two-case processing logic
 
 - [x] P.4.1 Implement the existing-competitor flow: check discovery freshness, re-run discovery only when the last run is at least 30 days old, apply automatic reconciliation, and otherwise skip directly to monitoring.

@@ -90,17 +90,15 @@ def run_live_verification() -> dict[str, object]:
     test_url = f"https://example.com/p3-sqs-test-{uuid4().hex}"
     message_body = json.dumps(
         {
-            "strategy_id": 1,
             "company_domain_id": test_domain,
-            "company_url": test_url,
+            "competitor_lst": [test_url],
             "host": "DEV",
         }
     )
     malformed_body = json.dumps(
         {
-            "strategy_id": 1,
-            "company_domain_id": test_domain,
-            "company_url": test_url,
+            "competitor_lst": [test_url],
+            "host": "DEV",
         }
     )
 

@@ -119,11 +119,28 @@ class _FailOnceDiscoveryService(_DiscoveryService):
         )
 
 
-def _message(host="DEV"):
+class _StrategyLookupService:
+    def __init__(self, urls_by_domain=None):
+        self.urls_by_domain = urls_by_domain or {}
+        self.calls = []
+
+    def resolve_primary_competitor_urls(self, company_domain_id, host):
+        self.calls.append((company_domain_id, host))
+        return list(self.urls_by_domain.get(company_domain_id, []))
+
+
+class _QueuePublisherService:
+    def __init__(self):
+        self.published = []
+
+    def publish(self, message):
+        self.published.append(dict(message))
+
+
+def _message(host="DEV", competitor_lst=("HTTPS://Example.COM/p3-test///",)):
     return {
-        "strategy_id": 1,
         "company_domain_id": "Tenant.Example.",
-        "company_url": "HTTPS://Example.COM/p3-test///",
+        "competitor_lst": list(competitor_lst) if competitor_lst is not None else None,
         "host": host,
     }
 
@@ -135,22 +152,42 @@ class ParseMessageTests(unittest.TestCase):
         self.assertEqual(
             parsed,
             {
-                "strategy_id": 1,
                 "company_domain_id": "tenant.example",
-                "company_url": "https://example.com/p3-test",
+                "competitor_lst": ["https://example.com/p3-test"],
                 "host": "dev",
             },
         )
 
-    def test_parse_message_accepts_mapping_for_direct_callers(self):
-        parsed = parse_message({**_message(), "strategy_id": "1"})
-        self.assertEqual(parsed["strategy_id"], 1)
+    def test_parse_message_defaults_host_to_dev_when_absent(self):
+        parsed = parse_message({**_message(), "host": None})
+        self.assertEqual(parsed["host"], "dev")
+
+        body = _message()
+        del body["host"]
+        self.assertEqual(parse_message(body)["host"], "dev")
+
+    def test_parse_message_treats_null_and_empty_competitor_lst_the_same(self):
+        self.assertEqual(parse_message(_message(competitor_lst=None))["competitor_lst"], [])
+        self.assertEqual(parse_message(_message(competitor_lst=[]))["competitor_lst"], [])
+
+    def test_parse_message_drops_malformed_entries_but_keeps_valid_ones(self):
+        parsed = parse_message(
+            _message(
+                competitor_lst=[
+                    "https://good.example.com/page",
+                    "ftp://bad-scheme.example.com",
+                    "",
+                    123,
+                    "https://good.example.com/page/",
+                ]
+            )
+        )
+        self.assertEqual(parsed["competitor_lst"], ["https://good.example.com/page"])
 
     def test_parse_message_rejects_malformed_values(self):
         invalid_messages = (
-            {**_message(), "strategy_id": 2},
             {**_message(), "company_domain_id": "not a domain"},
-            {**_message(), "company_url": "ftp://example.com"},
+            {**_message(), "competitor_lst": "https://example.com"},
             {**_message(), "host": ""},
         )
         for invalid in invalid_messages:
@@ -168,11 +205,15 @@ class HandleMessageTests(unittest.TestCase):
         self.competitors = _CompetitorService()
         self.discovery = _DiscoveryService()
         self.monitoring = _MonitoringService()
+        self.strategy_lookup = _StrategyLookupService()
+        self.queue_publisher = _QueuePublisherService()
         self.services = {
             "companies": self.companies,
             "competitors": self.competitors,
             "discovery": self.discovery,
             "monitoring": self.monitoring,
+            "strategy_lookup": self.strategy_lookup,
+            "queue_publisher": self.queue_publisher,
         }
 
     def _existing_competitor(self):
@@ -263,6 +304,85 @@ class HandleMessageTests(unittest.TestCase):
         self.assertEqual(result["action"], "first_run")
         self.assertEqual(result["monitored_target_ids"], [])
         self.assertEqual(result["monitoring"], [])
+        self.assertEqual(self.monitoring.calls, [])
+
+    def test_explicit_single_competitor_never_needs_strategy_lookup_or_publisher(self):
+        services = {
+            "companies": self.companies,
+            "competitors": self.competitors,
+            "discovery": self.discovery,
+            "monitoring": self.monitoring,
+        }
+
+        result = handle_message(_message(), services, clock=lambda: NOW)
+
+        self.assertEqual(result["action"], "first_run")
+
+    def test_empty_competitor_lst_resolves_via_strategy_lookup(self):
+        self.strategy_lookup.urls_by_domain["tenant.example"] = [
+            "https://resolved.example.com"
+        ]
+
+        result = handle_message(
+            _message(competitor_lst=None),
+            self.services,
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(self.strategy_lookup.calls, [("tenant.example", "dev")])
+        self.assertEqual(result["action"], "first_run")
+        self.assertEqual(
+            result["competitor"]["website_url"], "https://resolved.example.com"
+        )
+
+    def test_empty_competitor_lst_with_no_resolved_urls_skips_quietly(self):
+        result = handle_message(
+            _message(competitor_lst=None, host="prod"),
+            self.services,
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(result["action"], "skipped_no_competitors")
+        self.assertEqual(self.strategy_lookup.calls, [("tenant.example", "prod")])
+        self.assertEqual(self.competitors.calls, [])
+        self.assertEqual(self.discovery.reconciliation_calls, [])
+        self.assertEqual(self.monitoring.calls, [])
+
+    def test_multiple_resolved_competitors_fan_out_instead_of_processing_inline(self):
+        result = handle_message(
+            _message(
+                competitor_lst=[
+                    "https://one.example.com/page",
+                    "https://two.example.com/page",
+                ]
+            ),
+            self.services,
+            clock=lambda: NOW,
+        )
+
+        self.assertEqual(result["action"], "fanned_out")
+        self.assertEqual(
+            result["fanned_out_urls"],
+            ["https://one.example.com/page", "https://two.example.com/page"],
+        )
+        self.assertEqual(
+            self.queue_publisher.published,
+            [
+                {
+                    "company_domain_id": "tenant.example",
+                    "competitor_lst": ["https://one.example.com/page"],
+                    "host": "dev",
+                },
+                {
+                    "company_domain_id": "tenant.example",
+                    "competitor_lst": ["https://two.example.com/page"],
+                    "host": "dev",
+                },
+            ],
+        )
+        # No discovery/monitoring work happens inline for a fanned-out message.
+        self.assertEqual(self.competitors.calls, [])
+        self.assertEqual(self.discovery.reconciliation_calls, [])
         self.assertEqual(self.monitoring.calls, [])
 
 
