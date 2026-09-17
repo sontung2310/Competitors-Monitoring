@@ -228,7 +228,7 @@ exactly as it does today — no schema or backend change for those collections i
 | --- | --- | --- |
 | Tracked pages (`monitoring_targets`) | `monitoring_targets` collection, `active`/`discovery_status` lifecycle | DynamoDB table `AWS_DYNAMODB_MONITORING_TARGETS_TABLE` (`competitors_analysis_monitoring_targets`) |
 | Snapshot content + metadata | `snapshots` collection + local `.txt.gz` files | DynamoDB table `AWS_DYNAMODB_SNAPSHOTS_TABLE` (`competitors_analysys_snapshots`), content included in the item |
-| Detected changes | `changes` collection, same database as everything else | A new collection (`competitors_changes`) in the external RM database, host-routed like section 3's strategy lookup |
+| Detected changes | `changes` collection, same database as everything else | A new collection (`competitors_changes`) in the external RM database, selected once per deployment via `RM_HOST` (not per message — see 5.3) |
 | `companies`, `competitors`, `monitoring_runs`, `discovery_runs` | our own MongoDB | unchanged — still our own MongoDB |
 
 ### 5.1 Monitoring targets: DynamoDB, `SUGGESTED`-only, presence means tracked
@@ -326,9 +326,19 @@ native to the table instead of a secondary index.
 The `changes` collection is the one piece of history that still needs a durable, queryable store
 (it's the actual client-facing result), but it no longer lives alongside `monitoring_targets`/
 `snapshots` since those moved to DynamoDB. It moves to a **new collection in the external RM
-database** (proposed name: `competitors_changes`), reusing the exact same host-routed connection
-already built for the Primary-strategy lookup in section 3: `host=dev` → `rm_dev_testing`,
-`host=prod` → `rm_pre_release`.
+database** (`competitors_changes`).
+
+**Routing is fixed per deployment, not per message** (confirmed, TON-45 gap review — this
+deliberately diverges from the strategy lookup's per-message `host` routing in section 3): a new
+`RM_HOST` environment variable (default `"dev"`) selects `rm_dev_testing` or `rm_pre_release`
+once, when the worker process starts, via the same `rm_mongo_settings_for_host()` connection
+helper the strategy lookup already uses. This is not a simplification made for convenience — after
+the P.6 gap-review fix, most monitoring (and therefore most change creation) happens via the
+scheduler's own tick, not inline inside an SQS message, and the scheduler has no per-message `host`
+to route by at all; only a per-deployment setting can cover both the SQS-triggered path and the
+scheduler-triggered path consistently. A real deployment has a dev worker pointed at a dev queue
+and a prod worker pointed at a prod queue, so this matches how the two would actually be run, and
+each worker only ever needs to know its own `RM_HOST` once.
 
 **Reference shape**: dev's `changes` documents reference `monitoring_target_id`,
 `previous_snapshot_id`, and `current_snapshot_id` as single Mongo ObjectIds. DynamoDB's snapshot
@@ -470,7 +480,13 @@ the unmerged TON-44 work this depends on for the RM Mongo connection helper).
   changes — its Mongo-specific behavior was in `MonitoringTargetRepository`'s query, not in
   `SchedulerService`. (3) `docs/production-plan.md` 5.3/the summary table still described `changes`
   as host-routed like the strategy lookup, contradicting 5.5's `RM_HOST` (fixed-per-deployment)
-  description — see the open gap 4 discussion for the resolution.
+  description.
+- 2026-09-17 (TON-45 gap review, resolved) — Gap 4 resolved: `RM_HOST` fixed-per-deployment is the
+  confirmed design (Option A of three considered), not just an implementation shortcut — after the
+  gap-review fix above, most change creation happens via the scheduler's own tick, which has no
+  per-message `host` at all, so only a per-deployment setting can route both the SQS-triggered and
+  scheduler-triggered paths consistently. Section 5.3 and the summary table above were corrected to
+  match; no code change was needed since `RM_HOST` was already implemented this way.
 
 ---
 
