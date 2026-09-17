@@ -119,4 +119,26 @@ def build_production_services(
     }
 
 
-__all__ = ["build_production_services"]
+def build_production_scheduler(
+    *,
+    environ: Optional[Mapping[str, str]] = None,
+) -> Any:
+    """Build the scheduler that runs as its own process alongside the SQS
+    worker (not instead of it) — closing the gap where nothing previously
+    checked each DynamoDB-tracked page on its own interval.
+
+    ``SchedulerService`` itself needs no DynamoDB-specific code at all: it
+    only calls ``target_repository.list_active_targets()`` with no
+    competitor_id (a full table Scan) and reads ``id``/``check_interval_minutes``/
+    ``last_checked_at`` off whatever comes back, which the DynamoDB
+    repository already returns in the same shape as the Mongo one.
+    """
+
+    from backend.flask.scheduler.service import SchedulerService
+
+    services = build_production_services(environ=environ)
+    target_repository = DynamoDBMonitoringTargetRepository.from_settings()
+    return SchedulerService(target_repository, services["monitoring"].monitor_target)
+
+
+__all__ = ["build_production_scheduler", "build_production_services"]

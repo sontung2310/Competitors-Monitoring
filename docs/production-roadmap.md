@@ -79,6 +79,22 @@ separate, focused tasks on the `production` branch.
 - [x] P.6.4 Swap snapshot persistence to DynamoDB behind the existing `snapshot/storage.py` abstraction, storing compressed content directly in the item and replacing local `.txt.gz` files/`storage_path` entirely.
 - [x] P.6.5 Enable DynamoDB native TTL on the snapshots table with a 30-day expiry attribute so expired items are removed automatically.
 - [x] P.6.6 Move `changes` persistence to a new collection (`competitors_changes`) in the external RM MongoDB database — fixed per deployment via a new `RM_HOST` env var (default `dev`), not per-message like the section 3 strategy lookup, since `ChangeService` is built once at process startup with no per-message context available; update change documents' snapshot references to the `(monitoring_target_id, captured_at)` pair instead of a single Mongo id.
+- [x] P.6.7 Add a production scheduler process (`scheduler/scheduler_runner.py`) that actually runs `SchedulerService` against the DynamoDB target repository, and make `sqs_handler.py` only call `monitor_target()` inline for a `"skipped_fresh"` message — `"first_run"`/`"reconciled"` defer to this scheduler instead, closing the gap where neither the SQS handler nor anything else ever checked those targets.
+
+### P.6 gap review fixes (TON-45, 2026-09-17)
+
+An independent review found three real gaps between this tracker/`docs/production-plan.md` and the
+shipped code, all now fixed:
+
+1. **`sqs_handler.py` called `monitor_target()` unconditionally** for every action, including
+   `"reconciled"` and `"first_run"` — reopening the exact visibility-timeout risk the 2026-09-17
+   correction in `docs/production-plan.md`'s change log was written to avoid. Fixed: only
+   `"skipped_fresh"` monitors inline now.
+2. **Nothing ran `SchedulerService` against DynamoDB in production** — `SchedulerService.from_database()`
+   still hardcoded the Mongo `MonitoringTargetRepository`, and no process called it at all. Fixed
+   with P.6.7 above; `SchedulerService` itself needed zero code changes.
+3. **Doc self-contradiction on `changes` routing** (section 5.3 vs 5.5) — resolution tracked
+   separately as an open decision (see the P.6 follow-up discussion); not yet fixed in code.
 
 ### P.6 implementation evidence (TON-45, 2026-09-17)
 

@@ -189,21 +189,44 @@ def run_live_verification() -> dict[str, object]:
         if not new_targets:
             raise AssertionError("new-competitor discovery produced no live targets")
         new_target_ids = {str(target["id"]) for target in new_targets}
+        # "first_run" already spent the time budget on discovery + activation;
+        # it defers monitoring to the scheduler's next tick instead of
+        # snapshotting inline (P.6 gap fix — see docs/production-plan.md
+        # section 3's "Visibility-timeout boundary").
+        if new_first["monitored_target_ids"]:
+            raise AssertionError(
+                f"first_run unexpectedly monitored inline: {new_first['monitored_target_ids']}"
+            )
+        if _documents_for_targets(database["snapshots"], new_target_ids):
+            raise AssertionError("first_run unexpectedly created a snapshot")
+
+        # A later message for the same (now-fresh) competitor is what
+        # actually monitors these targets for the first time, standing in for
+        # the scheduler's next tick.
+        new_second_id = f"live-p4-new-second-{uuid4().hex}"
+        new_second = handle_message(
+            new_message,
+            services,
+            clock=utc_now,
+            message_id=new_second_id,
+        )
+        if new_second["action"] != "skipped_fresh":
+            raise AssertionError(f"expected the follow-up message to skip discovery: {new_second}")
         new_snapshots = _documents_for_targets(database["snapshots"], new_target_ids)
         new_runs = _documents_for_targets(database["monitoring_runs"], new_target_ids)
         new_changes = _documents_for_targets(database["changes"], new_target_ids)
         if len(new_snapshots) != len(new_targets):
-            raise AssertionError("new-competitor flow did not create one initial snapshot per target")
+            raise AssertionError("follow-up message did not create one initial snapshot per target")
         if len(new_runs) != len(new_targets):
-            raise AssertionError("new-competitor flow did not create one monitoring run per target")
+            raise AssertionError("follow-up message did not create one monitoring run per target")
         if new_changes:
-            raise AssertionError("new-competitor initial snapshots created change records")
+            raise AssertionError("initial snapshots unexpectedly created change records")
 
         new_duplicate = handle_message(
             new_message,
             services,
             clock=utc_now,
-            message_id=new_message_id,
+            message_id=new_second_id,
         )
         if not all(item.get("idempotent") is True for item in new_duplicate["monitoring"]):
             raise AssertionError("new-competitor duplicate did not reuse monitoring runs")

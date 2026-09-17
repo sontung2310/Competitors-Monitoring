@@ -132,6 +132,21 @@ class DynamoDBMonitoringTargetRepositoryTests(unittest.TestCase):
         self.assertEqual(second["classification_method"], "LLM")
         self.assertEqual(len(self.table.items), 1)
 
+    def test_last_checked_at_round_trips_as_a_real_datetime_not_a_string(self):
+        # SchedulerService._is_due() requires a real datetime; DynamoDB has no
+        # native datetime type, so this specifically guards the ISO-string
+        # round-trip in _to_dict()/_from_iso().
+        created = self.repo.create(
+            competitor_id="competitor-1", url="https://example.com/blog",
+            page_type="BLOG", check_interval_minutes=60, now=NOW,
+        )
+        updated = self.repo.update(created["id"], {"last_checked_at": NOW})
+        self.assertIsInstance(updated["last_checked_at"], datetime)
+        self.assertEqual(updated["last_checked_at"], NOW)
+        fetched = self.repo.get(created["id"])
+        self.assertIsInstance(fetched["last_checked_at"], datetime)
+        self.assertIsInstance(fetched["created_at"], datetime)
+
     def test_update_rejects_lifecycle_fields(self):
         created = self.repo.create(
             competitor_id="competitor-1", url="https://example.com/blog",

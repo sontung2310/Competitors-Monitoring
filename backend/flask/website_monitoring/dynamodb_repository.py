@@ -158,7 +158,10 @@ class DynamoDBMonitoringTargetRepository:
                 break
             query_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         rows = [_to_dict(item) for item in items]
-        rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
+        rows.sort(
+            key=lambda row: row.get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         return rows
 
     def list_active_targets(
@@ -181,7 +184,10 @@ class DynamoDBMonitoringTargetRepository:
                 break
             scan_kwargs["ExclusiveStartKey"] = response["LastEvaluatedKey"]
         rows = [_to_dict(item) for item in items]
-        rows.sort(key=lambda row: row.get("created_at") or "", reverse=True)
+        rows.sort(
+            key=lambda row: row.get("created_at") or datetime.min.replace(tzinfo=timezone.utc),
+            reverse=True,
+        )
         return rows
 
     def find_by_url(
@@ -416,6 +422,17 @@ def _iso(value: Any) -> Optional[str]:
     raise TypeError(f"unsupported timestamp value: {value!r}")
 
 
+def _from_iso(value: Any) -> Optional[datetime]:
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(f"unsupported stored timestamp value: {value!r}")
+
+
+_TIMESTAMP_FIELDS = ("last_checked_at", "last_changed_at", "created_at", "updated_at")
+
+
 def _to_dict(item: Mapping[str, Any]) -> dict[str, Any]:
     from decimal import Decimal
 
@@ -423,6 +440,13 @@ def _to_dict(item: Mapping[str, Any]) -> dict[str, Any]:
     result["id"] = result.pop("_id")
     if isinstance(result.get("check_interval_minutes"), Decimal):
         result["check_interval_minutes"] = int(result["check_interval_minutes"])
+    # DynamoDB has no native datetime type; every timestamp is stored as an
+    # ISO-8601 string (_iso()) and parsed back here so this repository's
+    # return shape matches the Mongo repository's (real datetime objects) —
+    # SchedulerService._is_due() specifically requires a real datetime.
+    for field in _TIMESTAMP_FIELDS:
+        if field in result:
+            result[field] = _from_iso(result[field])
     return result
 
 
