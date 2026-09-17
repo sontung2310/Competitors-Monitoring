@@ -9,6 +9,7 @@ from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
 from backend.flask.competitors.service import CompetitorService
 from backend.flask.scheduler.sqs_handler import (
+    MessageProcessingError,
     MessageValidationError,
     handle_message,
     parse_message,
@@ -101,6 +102,21 @@ class _MonitoringService:
             "changes": [],
             "idempotent": idempotent,
         }
+
+
+class _FailOnceDiscoveryService(_DiscoveryService):
+    def __init__(self):
+        super().__init__()
+        self.failures_remaining = 1
+
+    def discover_and_reconcile(self, competitor_id, *, company_id):
+        if self.failures_remaining:
+            self.failures_remaining -= 1
+            raise RuntimeError("temporary discovery outage")
+        return super().discover_and_reconcile(
+            competitor_id,
+            company_id=company_id,
+        )
 
 
 def _message(host="DEV"):
@@ -221,6 +237,33 @@ class HandleMessageTests(unittest.TestCase):
         self.assertTrue(all(not item["idempotent"] for item in first["monitoring"]))
         self.assertTrue(all(item["idempotent"] for item in second["monitoring"]))
         self.assertTrue(all(item["snapshot"] is None for item in second["monitoring"]))
+
+    def test_failed_new_competitor_discovery_keeps_record_retryable(self):
+        discovery = _FailOnceDiscoveryService()
+        services = {
+            **self.services,
+            "discovery": discovery,
+        }
+
+        with self.assertRaises(MessageProcessingError):
+            handle_message(_message(), services, clock=lambda: NOW)
+
+        self.assertEqual(len(self.competitors.rows), 1)
+        retry = handle_message(_message(), services, clock=lambda: NOW)
+
+        self.assertEqual(retry["action"], "reconciled")
+        self.assertEqual(len(discovery.reconciliation_calls), 1)
+        self.assertEqual(len(self.monitoring.calls), 1)
+
+    def test_new_competitor_with_no_live_targets_creates_no_initial_change(self):
+        self.discovery.active_targets = []
+
+        result = handle_message(_message(), self.services, clock=lambda: NOW)
+
+        self.assertEqual(result["action"], "first_run")
+        self.assertEqual(result["monitored_target_ids"], [])
+        self.assertEqual(result["monitoring"], [])
+        self.assertEqual(self.monitoring.calls, [])
 
 
 class RealServiceFindOrCreateTests(unittest.TestCase):

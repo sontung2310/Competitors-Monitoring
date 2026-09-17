@@ -13,6 +13,10 @@ from backend.flask.database.base_repository import (
 )
 
 
+class DiscoveryRunAlreadyRunningError(RuntimeError):
+    """Raised when a competitor already has an in-progress discovery run."""
+
+
 class DiscoveryRunRepository(BaseMongoRepository):
     """Persistence operations for the ``discovery_runs`` collection."""
 
@@ -31,6 +35,12 @@ class DiscoveryRunRepository(BaseMongoRepository):
         self.collection.create_index(
             [("competitor_id", 1), ("started_at", -1)],
             name="ix_discovery_runs_competitor_started_at",
+        )
+        self.collection.create_index(
+            [("competitor_id", 1), ("status", 1)],
+            unique=True,
+            partialFilterExpression={"status": self.RUNNING},
+            name="uq_discovery_runs_running_competitor",
         )
 
     def start(
@@ -56,7 +66,21 @@ class DiscoveryRunRepository(BaseMongoRepository):
             "created_at": timestamp,
             "updated_at": timestamp,
         }
-        result = self.collection.insert_one(document)
+        try:
+            result = self.collection.insert_one(document)
+        except Exception as exc:  # noqa: BLE001 - translate the unique race only
+            if _is_duplicate_key_error(exc):
+                running = self.collection.find_one(
+                    {
+                        "competitor_id": document["competitor_id"],
+                        "status": self.RUNNING,
+                    }
+                )
+                if running is not None:
+                    raise DiscoveryRunAlreadyRunningError(
+                        f"competitor {competitor_id!r} already has a running discovery"
+                    ) from exc
+            raise
         inserted_id = getattr(result, "inserted_id", None)
         if inserted_id is not None:
             document["_id"] = inserted_id
@@ -168,3 +192,7 @@ class DiscoveryRunRepository(BaseMongoRepository):
 def _require_text(value: Any, field: str) -> None:
     if not isinstance(value, str) or not value.strip():
         raise ValueError(f"{field} must be a non-empty string")
+
+
+def _is_duplicate_key_error(error: Exception) -> bool:
+    return getattr(error, "code", None) == 11000

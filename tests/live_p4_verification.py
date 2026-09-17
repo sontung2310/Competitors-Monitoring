@@ -1,10 +1,10 @@
 """Opt-in end-to-end evidence for P.4 against the seeded Lyfe demo pair.
 
 This exercises the real Mongo-backed application service graph and real HTTP
-monitoring fetches. It uses the existing fresh Lyfe competitor in the dedicated
-test database, verifies that discovery is skipped, verifies one fresh monitor
-snapshot per active target, replays the same SQS identity, and cleans up only
-the records created by this verification.
+monitoring fetches. It verifies the existing fresh Lyfe competitor path, then
+creates a temporary Lyfe URL to exercise the new-competitor first-run path,
+replays the same SQS identities, and cleans up only the records created by this
+verification.
 
 Run from the repository root with::
 
@@ -62,6 +62,8 @@ def run_live_verification() -> dict[str, object]:
     created_change_ids: list[object] = []
     target_before: dict[str, dict[str, object]] = {}
     message_id = f"live-p4-{uuid4().hex}"
+    new_competitor_id: object | None = None
+    new_competitor_url = f"{COMPETITOR_URL}?p4_live={uuid4().hex}"
     try:
         mongo_client.admin.command("ping")
         companies = CompanyRepository.from_database(database)
@@ -167,6 +169,52 @@ def run_live_verification() -> dict[str, object]:
         if len(_documents_for_targets(database["monitoring_runs"], target_ids)) != len(after_runs):
             raise AssertionError("duplicate delivery created another monitoring run")
 
+        new_message = parse_message(
+            {
+                "strategy_id": 1,
+                "company_domain_id": COMPANY_DOMAIN,
+                "company_url": new_competitor_url,
+                "host": "prod",
+            }
+        )
+        new_message_id = f"live-p4-new-{uuid4().hex}"
+        new_first = handle_message(
+            new_message,
+            services,
+            clock=utc_now,
+            message_id=new_message_id,
+        )
+        new_competitor_id = new_first["competitor"]["id"]
+        new_targets = targets.list_active_targets(new_competitor_id)
+        if new_first["action"] != "first_run":
+            raise AssertionError(f"expected new-competitor first run: {new_first}")
+        if not new_targets:
+            raise AssertionError("new-competitor discovery produced no live targets")
+        new_target_ids = {str(target["id"]) for target in new_targets}
+        new_snapshots = _documents_for_targets(database["snapshots"], new_target_ids)
+        new_runs = _documents_for_targets(database["monitoring_runs"], new_target_ids)
+        new_changes = _documents_for_targets(database["changes"], new_target_ids)
+        if len(new_snapshots) != len(new_targets):
+            raise AssertionError("new-competitor flow did not create one initial snapshot per target")
+        if len(new_runs) != len(new_targets):
+            raise AssertionError("new-competitor flow did not create one monitoring run per target")
+        if new_changes:
+            raise AssertionError("new-competitor initial snapshots created change records")
+
+        new_duplicate = handle_message(
+            new_message,
+            services,
+            clock=utc_now,
+            message_id=new_message_id,
+        )
+        if not all(item.get("idempotent") is True for item in new_duplicate["monitoring"]):
+            raise AssertionError("new-competitor duplicate did not reuse monitoring runs")
+        if len(_documents_for_targets(database["snapshots"], new_target_ids)) != len(new_snapshots):
+            raise AssertionError("new-competitor duplicate created another snapshot")
+
+        new_initial_snapshot_count = len(new_snapshots)
+        new_initial_change_count = len(new_changes)
+
         evidence = {
             "competitor": competitor["name"],
             "competitor_id": competitor["id"],
@@ -180,10 +228,24 @@ def run_live_verification() -> dict[str, object]:
             "fresh_unchanged_targets": unchanged_target_count,
             "duplicate_action": duplicate["action"],
             "duplicate_monitoring_idempotent": True,
+            "new_competitor_action": new_first["action"],
+            "new_active_target_count": len(new_targets),
+            "new_initial_snapshots": new_initial_snapshot_count,
+            "new_initial_changes": new_initial_change_count,
+            "new_duplicate_monitoring_idempotent": True,
         }
         print(json.dumps(evidence, default=str, indent=2, sort_keys=True))
         return evidence
     finally:
+        if new_competitor_id is None:
+            new_competitor = competitors.find_by_company_and_website_url(
+                company["id"],
+                new_competitor_url,
+            ) if "company" in locals() else None
+            if new_competitor is not None:
+                new_competitor_id = new_competitor["id"]
+        if new_competitor_id is not None:
+            _cleanup_competitor_artifacts(database, targets, competitors, new_competitor_id)
         storage = SnapshotStorage()
         if created_snapshot_ids:
             for document in database["snapshots"].find(
@@ -211,6 +273,32 @@ def _documents_for_targets(collection: object, target_ids: set[str]) -> list[dic
             {"monitoring_target_id": {"$in": [to_object_id(target_id) for target_id in target_ids]}}
         )
     )
+
+
+def _cleanup_competitor_artifacts(
+    database: object,
+    targets: MonitoringTargetRepository,
+    competitors: CompetitorRepository,
+    competitor_id: object,
+) -> None:
+    target_rows = targets.list_for_competitor(competitor_id)
+    storage = SnapshotStorage()
+    for target in target_rows:
+        target_id = to_object_id(target["id"])
+        for snapshot in database["snapshots"].find(
+            {"monitoring_target_id": target_id},
+            {"storage_path": 1},
+        ):
+            if snapshot.get("storage_path"):
+                storage.delete_snapshot(snapshot["storage_path"])
+        database["snapshots"].delete_many({"monitoring_target_id": target_id})
+        database["monitoring_runs"].delete_many({"monitoring_target_id": target_id})
+        database["changes"].delete_many({"monitoring_target_id": target_id})
+        targets.delete(target["id"], competitor_id=competitor_id)
+    database["discovery_runs"].delete_many(
+        {"competitor_id": to_object_id(competitor_id)}
+    )
+    competitors.delete(competitor_id, company_id=None)
 
 
 def _new_ids(before: list[dict[str, object]], after: list[dict[str, object]]) -> list[object]:

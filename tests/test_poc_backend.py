@@ -8,7 +8,10 @@ from datetime import datetime, timezone
 from backend.flask.companies.repository import CompanyRepository
 from backend.flask.companies.service import CompanyService
 from backend.flask.competitors.repository import CompetitorRepository
-from backend.flask.discovery.repository import DiscoveryRunRepository
+from backend.flask.discovery.repository import (
+    DiscoveryRunAlreadyRunningError,
+    DiscoveryRunRepository,
+)
 
 try:
     from bson import ObjectId
@@ -24,6 +27,10 @@ class _InsertResult:
 @dataclass
 class _WriteResult:
     matched_count: int = 1
+
+
+class _DuplicateKeyError(RuntimeError):
+    code = 11000
 
 
 class _Cursor(list):
@@ -78,6 +85,17 @@ class _Collection:
         return _WriteResult(matched_count=0)
 
 
+class _RunningUniqueCollection(_Collection):
+    def insert_one(self, document):
+        if document.get("status") == "RUNNING" and any(
+            existing.get("competitor_id") == document.get("competitor_id")
+            and existing.get("status") == "RUNNING"
+            for existing in self.documents
+        ):
+            raise _DuplicateKeyError("duplicate running competitor")
+        return super().insert_one(document)
+
+
 def _matches(document, query):
     for field, expected in query.items():
         actual = document.get(field)
@@ -98,6 +116,12 @@ class _Database:
 
     def __getitem__(self, name):
         return self.collections.setdefault(name, _Collection())
+
+
+class _RunningUniqueDatabase(_Database):
+    def __getitem__(self, name):
+        default = _RunningUniqueCollection() if name == "discovery_runs" else _Collection()
+        return self.collections.setdefault(name, default)
 
 
 class CompanyAndScopingTests(unittest.TestCase):
@@ -224,6 +248,19 @@ class CompanyAndScopingTests(unittest.TestCase):
                 company_id="b" * 24,
             )
         )
+
+    def test_discovery_run_repository_serializes_concurrent_run_as_retryable_conflict(self):
+        database = _RunningUniqueDatabase()
+        repository = DiscoveryRunRepository.from_database(database)
+        repository.ensure_indexes()
+
+        repository.start("run-1", competitor_id="c" * 24)
+        with self.assertRaises(DiscoveryRunAlreadyRunningError):
+            repository.start("run-2", competitor_id="c" * 24)
+
+        repository.succeed("run-1", candidate_count=0)
+        resumed = repository.start("run-2", competitor_id="c" * 24)
+        self.assertEqual(resumed["run_id"], "run-2")
 
     def test_migration_does_not_clear_explicit_company_assignments(self):
         database = _Database()
