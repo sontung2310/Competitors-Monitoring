@@ -29,6 +29,11 @@ class _WriteResult:
     matched_count: int = 1
 
 
+@dataclass
+class _DeleteResult:
+    deleted_count: int = 1
+
+
 class _DuplicateKeyError(RuntimeError):
     code = 11000
 
@@ -83,6 +88,16 @@ class _Collection:
                     document.pop(key, None)
                 return _WriteResult()
         return _WriteResult(matched_count=0)
+
+    def delete_one(self, query):
+        for index, document in enumerate(self.documents):
+            if _matches(document, query):
+                del self.documents[index]
+                return _DeleteResult(deleted_count=1)
+        return _DeleteResult(deleted_count=0)
+
+    def count_documents(self, query):
+        return sum(1 for document in self.documents if _matches(document, query))
 
 
 class _RunningUniqueCollection(_Collection):

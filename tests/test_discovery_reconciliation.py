@@ -142,6 +142,19 @@ class _TargetRepository:
         ]
         return len(self.rows) != before
 
+    def mark_activated(self, target_id, *, competitor_id=None, check_interval_minutes=None):
+        updates = {"active": True, "discovery_status": "ACTIVE"}
+        if check_interval_minutes is not None:
+            updates["check_interval_minutes"] = check_interval_minutes
+        return self.update(target_id, updates, competitor_id=competitor_id)
+
+    def mark_discarded(self, target_id, *, competitor_id=None):
+        return self.update(
+            target_id,
+            {"active": False, "discovery_status": "DISCARDED"},
+            competitor_id=competitor_id,
+        )
+
     def discard_discovered_candidates_by_url_patterns(self, competitor_id, *, url_patterns):
         return 0
 

@@ -123,6 +123,7 @@ class ChangeService:
         competitor_repository: Any | None = None,
         narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
         detected_url_liveness_checker: DetectedURLLivenessChecker | None = None,
+        snapshot_reference_extractor: Callable[[Mapping[str, Any], str], Any] = None,
     ) -> None:
         self.change_repository = change_repository
         self.monitoring_target_repository = monitoring_target_repository
@@ -130,6 +131,13 @@ class ChangeService:
         self.competitor_repository = competitor_repository
         self.narrative_provider_factory = narrative_provider_factory
         self.detected_url_liveness_checker = detected_url_liveness_checker
+        # Extracts whatever `previous_snapshot_id`/`current_snapshot_id` a
+        # concrete change_repository expects a snapshot mapping to become.
+        # Defaults to today's single-id extraction (Mongo ObjectId); the
+        # DynamoDB-backed production wiring injects one that returns the
+        # {monitoring_target_id, captured_at} reference pair instead, since a
+        # DynamoDB snapshot has no single opaque id.
+        self.snapshot_reference_extractor = snapshot_reference_extractor or _snapshot_id
 
     @classmethod
     def from_database(
@@ -141,6 +149,7 @@ class ChangeService:
         competitor_repository: Any | None = None,
         narrative_provider_factory: Callable[[], Any] = OpenAIProvider.from_env,
         detected_url_liveness_checker: DetectedURLLivenessChecker | None = None,
+        snapshot_reference_extractor: Callable[[Mapping[str, Any], str], Any] = None,
     ) -> "ChangeService":
         """Build a service with a repository backed by a database handle."""
 
@@ -151,6 +160,7 @@ class ChangeService:
             competitor_repository=competitor_repository,
             narrative_provider_factory=narrative_provider_factory,
             detected_url_liveness_checker=detected_url_liveness_checker,
+            snapshot_reference_extractor=snapshot_reference_extractor,
         )
 
     def create_change(
@@ -261,8 +271,12 @@ class ChangeService:
             )
         return self.change_repository.create(
             monitoring_target_id=target_id,
-            previous_snapshot_id=_snapshot_id(previous_snapshot, "previous_snapshot"),
-            current_snapshot_id=_snapshot_id(current_snapshot, "current_snapshot"),
+            previous_snapshot_id=self.snapshot_reference_extractor(
+                previous_snapshot, "previous_snapshot"
+            ),
+            current_snapshot_id=self.snapshot_reference_extractor(
+                current_snapshot, "current_snapshot"
+            ),
             detected_at=detected_at or utc_now(),
             change_type=resolved_change_type,
             summary=resolved_summary,
