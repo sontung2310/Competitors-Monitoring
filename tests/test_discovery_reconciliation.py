@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 
+from backend.flask.discovery.audit import DiscoveryAuditResult, RedundancyFlag
 from backend.flask.discovery.classification import DeterministicStubClassifier
 from backend.flask.discovery.service import DiscoveryService
 from backend.flask.discovery.sources import DiscoveredURL
@@ -223,6 +224,32 @@ class _LinksSource:
         return ()
 
 
+class _TwoCandidateSitemapSource:
+    """Discovers a parent page and a structurally-nested variant of it, so
+    the second-pass audit has something real to flag as redundant."""
+
+    def discover(self, website_url, declared_sitemaps=()):
+        return [
+            DiscoveredURL("https://example.com/sale", "SITEMAP"),
+            DiscoveredURL("https://example.com/men/sale", "SITEMAP"),
+        ]
+
+
+class _DiscardsNestedSaleAudit:
+    """Flags the nested page as redundant with its parent — exercises the
+    "second-pass audit discards a first-pass suggestion" path."""
+
+    def audit(self, candidates, *, homepage_title, homepage_meta_description):
+        return DiscoveryAuditResult(
+            flagged_redundant=(
+                RedundancyFlag(
+                    url="https://example.com/men/sale",
+                    reason="duplicate of the parent sale page",
+                ),
+            )
+        )
+
+
 class DiscoveryReconciliationTests(unittest.TestCase):
     def test_reconciliation_activates_new_suggestions_and_deactivates_missing_targets(self):
         competitors = _CompetitorRepository()
@@ -299,6 +326,46 @@ class DiscoveryReconciliationTests(unittest.TestCase):
         self.assertEqual(result.discovered_count, 1)
         self.assertEqual(result.suggested_count, 1)
         self.assertNotIn("snapshot", result.as_dict())
+
+    def test_reconciliation_survives_a_second_pass_audit_discard(self):
+        """Regression test for a real bug a live JD Sports run surfaced:
+        `suggested_urls.difference_update(generator-over-suggested_urls)`
+        raised "Set changed size during iteration" whenever the second-pass
+        audit actually discarded a first-pass-suggested URL, because the
+        generator was still lazily reading the same set difference_update
+        was mutating. This only triggers when at least one first-pass
+        SUGGESTED url is discarded by the audit in the same run — small
+        fixtures with a single candidate never exercised it."""
+
+        competitors = _CompetitorRepository()
+        targets = _TargetRepository()
+        runs = _RunRepository()
+        service = DiscoveryService(
+            competitors,
+            targets,
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="PRODUCTS",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=_DiscardsNestedSaleAudit(),
+            robots_source=_RobotsSource(),
+            sitemap_source=_TwoCandidateSitemapSource(),
+            link_source=_LinksSource(),
+            liveness_checker=lambda url: True,
+            snapshot_repository=_HistoryRepository(),
+            change_repository=_HistoryRepository(),
+            run_repository=runs,
+        )
+
+        result = service.discover_and_reconcile(
+            "competitor-1",
+            company_id="company-1",
+            run_id="reconcile-3",
+        )
+
+        active_urls = {target["url"] for target in result.active_after}
+        self.assertEqual(active_urls, {"https://example.com/sale"})
+        self.assertNotIn("https://example.com/men/sale", active_urls)
 
 
 if __name__ == "__main__":

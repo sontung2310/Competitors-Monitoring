@@ -759,12 +759,18 @@ class DiscoveryService:
             suggested_urls = set(self.last_discovered_suggested_urls)
             # The second-pass audit may discard a first-pass suggestion.  Its
             # persisted state is the final decision used by reconciliation.
-            suggested_urls.difference_update(
+            # The discard set is fully materialized before mutating
+            # suggested_urls: passing a generator that still iterates
+            # suggested_urls straight into its own difference_update() raises
+            # "Set changed size during iteration" once anything is actually
+            # removed.
+            discarded_suggested_urls = {
                 url
                 for url in suggested_urls
                 if persisted_by_url.get(url, {}).get("discovery_status")
                 == "DISCARDED"
-            )
+            }
+            suggested_urls.difference_update(discarded_suggested_urls)
 
             for candidate in persisted:
                 if (
