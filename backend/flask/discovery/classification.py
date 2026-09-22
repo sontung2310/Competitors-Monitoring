@@ -13,10 +13,13 @@ from backend.flask.llm_provider import (
     LLMProvider,
     LLMProviderConfigurationError,
     OpenAIProvider,
+    OpenRouterProvider,
     OPENAI_MODEL_ENV_VAR,
+    OPENROUTER_MODEL_ENV_VAR,
+    DEFAULT_OPENROUTER_MODEL,
 )
 
-from .normalization import INDEX_TYPE_VARIANTS
+from .normalization import index_page_type
 
 
 class ClassificationError(ValueError):
@@ -64,8 +67,10 @@ class CandidateClassifier(Protocol):
         """Return exactly one classification result for every input candidate."""
 
 
-DEFAULT_CLASSIFIER_MODEL = "gpt-4o"
+DEFAULT_CLASSIFIER_MODEL = "gpt-5-nano"
 CLASSIFIER_MODEL_ENV_VAR = "DISCOVERY_CLASSIFIER_MODEL"
+CLASSIFIER_PROVIDER_ENV_VAR = "DISCOVERY_CLASSIFIER_PROVIDER"
+DEFAULT_CLASSIFIER_PROVIDER = "openai"
 CLASSIFIER_BATCH_SIZE_ENV_VAR = "DISCOVERY_CLASSIFIER_BATCH_SIZE"
 DEFAULT_CLASSIFIER_BATCH_SIZE = 25
 OPENAI_API_KEY_ENV_VAR = "OPENAI_KEY"
@@ -112,32 +117,30 @@ _OPENAI_RESPONSE_FORMAT = {
     },
 }
 
-_OPENAI_INSTRUCTIONS = """You classify unresolved Layer 1 website candidates for a production competitor-monitoring system.
+_OPENAI_INSTRUCTIONS = """Classify each Layer 1 website candidate for a competitor-monitoring system, using only its URL, title, meta description (optional, may be missing), and discovery source.
 
-Use only the candidate URL, page title, meta description, and discovery source
-as evidence. The meta description is optional and may be missing. Apply the
-index-vs-item distinction strictly. Mark a candidate SUGGESTED only when it
-represents a stable blog, news, press, pricing, product-listing, or durable
-service page that a production monitor should track over time. A durable
-service landing page may be SUGGESTED even when it is a flat slug and is not
-literally under /services. Do not suggest the homepage root URL (path "/") as
-a separate candidate.
+Mark SUGGESTED only for a page that is THE single hub/index a visitor uses to see an entire category of content: BLOG, NEWS, PRESS, PRICING, PRODUCTS, or SERVICES. Test: would this page have many near-identical siblings, each covering one offering? If yes, it is Layer 3 (one item, not the category) -- mark OTHER/DISCARDED, even when the URL or copy sounds durable, category-like, or article-like. This covers:
+- a flat, descriptive slug for one service/product (e.g. "/seo-consultant-melbourne", "/virtual-cmo")
+- a specific named program, package, or numbered offer (e.g. "30-Day SEO Stream", "Analytics & Tracking Stream")
+- an industry/vertical-specific landing page (e.g. "Digital Marketing For Construction Companies")
+- a resource/asset/template library
+- a narrative "what we do" / "our approach" / "about us" page that does not itself list services
+- one blog post, product, press release, case study, person, job, or campaign
 
-Mark a candidate DISCARDED with page_type OTHER when it is an individual item,
-one-off content, campaign, person, job, or any page that is not one of the six
-production types. A flat descriptive slug is not an index merely because its
-words resemble a page category. When the URL does not identify a known
-section/index/listing or durable service and the evidence is ambiguous, choose
-OTHER and DISCARDED rather than guessing. Choose only one of BLOG, NEWS,
-PRICING, PRODUCTS, SERVICES, PRESS, or OTHER; never invent another page type.
-The page type alone does not justify SUGGESTED. Return one classification for
-every candidate and do not invent URLs."""
+Rules: pick exactly one of BLOG, NEWS, PRICING, PRODUCTS, SERVICES, PRESS, OTHER -- never invent another type, and page type alone never justifies SUGGESTED. Never suggest the homepage ("/"). When ambiguous, choose OTHER/DISCARDED. Classify every candidate given; never invent a URL."""
 
 logger = logging.getLogger(__name__)
 
 
 class OpenAIClassifier:
-    """Classify unresolved candidates through the shared LLM provider."""
+    """Classify unresolved candidates through the shared LLM provider.
+
+    ``max_output_tokens`` defaults well above what the visible JSON alone
+    needs: a reasoning model (the default ``gpt-5-nano``) spends part of this
+    budget on internal reasoning tokens before writing any visible output, so
+    a tight limit (e.g. the 2048 that was plenty for gpt-4o) truncates the
+    JSON mid-string on a full-size batch instead of erroring cleanly.
+    """
 
     def __init__(
         self,
@@ -146,7 +149,7 @@ class OpenAIClassifier:
         api_key: str | None = None,
         model: str = DEFAULT_CLASSIFIER_MODEL,
         client: Any | None = None,
-        max_output_tokens: int = 2048,
+        max_output_tokens: int = 8000,
     ) -> None:
         if not isinstance(model, str) or not model.strip():
             raise OpenAIClassifierConfigurationError("classifier model must be non-empty")
@@ -181,13 +184,18 @@ class OpenAIClassifier:
         environ: Mapping[str, str] | None = None,
         *,
         client: Any | None = None,
-        max_output_tokens: int = 2048,
+        max_output_tokens: int = 8000,
     ) -> "OpenAIClassifier":
         """Build the provider from ``.env``/environment configuration.
 
-        Explicit process environment variables win over values in ``.env``.
-        The file is loaded only when this factory is used, so importing the
-        discovery package never requires provider configuration.
+        ``DISCOVERY_CLASSIFIER_PROVIDER`` picks which underlying LLM
+        provider to build ("openai", the default, or "openrouter" -- e.g.
+        for a cheaper model like DeepSeek). Both speak the same
+        ``LLMProvider`` interface, so nothing else in the classifier needs
+        to know which one is in use. Explicit process environment variables
+        win over values in ``.env``. The file is loaded only when this
+        factory is used, so importing the discovery package never requires
+        provider configuration.
         """
 
         if environ is None:
@@ -195,18 +203,40 @@ class OpenAIClassifier:
             values: Mapping[str, str] = os.environ
         else:
             values = environ
-        model = (
-            values.get(CLASSIFIER_MODEL_ENV_VAR)
-            or values.get(OPENAI_MODEL_ENV_VAR)
-            or DEFAULT_CLASSIFIER_MODEL
-        )
+
+        provider_name = (
+            values.get(CLASSIFIER_PROVIDER_ENV_VAR) or DEFAULT_CLASSIFIER_PROVIDER
+        ).strip().lower()
         try:
-            provider = OpenAIProvider.from_env(
-                values,
-                model=model,
-                client=client,
-                max_output_tokens=max_output_tokens,
-            )
+            if provider_name == "openrouter":
+                model = (
+                    values.get(CLASSIFIER_MODEL_ENV_VAR)
+                    or values.get(OPENROUTER_MODEL_ENV_VAR)
+                    or DEFAULT_OPENROUTER_MODEL
+                )
+                provider = OpenRouterProvider.from_env(
+                    values,
+                    model=model,
+                    client=client,
+                    max_output_tokens=max_output_tokens,
+                )
+            elif provider_name == "openai":
+                model = (
+                    values.get(CLASSIFIER_MODEL_ENV_VAR)
+                    or values.get(OPENAI_MODEL_ENV_VAR)
+                    or DEFAULT_CLASSIFIER_MODEL
+                )
+                provider = OpenAIProvider.from_env(
+                    values,
+                    model=model,
+                    client=client,
+                    max_output_tokens=max_output_tokens,
+                )
+            else:
+                raise OpenAIClassifierConfigurationError(
+                    f"{CLASSIFIER_PROVIDER_ENV_VAR} must be 'openai' or "
+                    f"'openrouter', got {provider_name!r}"
+                )
         except LLMProviderConfigurationError as exc:
             raise OpenAIClassifierConfigurationError(str(exc)) from exc
         return cls(provider=provider, model=model, max_output_tokens=max_output_tokens)
@@ -323,24 +353,29 @@ class DeterministicStubClassifier:
 def classify_by_rules(
     candidate: CandidateForClassification,
 ) -> ClassificationResult | None:
-    """Classify only from exact, known URL path variants without an LLM call."""
+    """Classify only from exact, known URL path variants without an LLM call.
+
+    The index/durable-service check is shared with ``discovery_scope`` via
+    ``normalization.index_page_type`` (extension-stripping, locale-prefix
+    tolerance) rather than re-implemented here, so a URL that
+    ``discovery_scope`` already calls ``INDEX`` always resolves here too
+    instead of needlessly falling through to the LLM.
+    """
+
+    page_type = index_page_type(candidate.url)
+    if page_type is not None:
+        return ClassificationResult(
+            url=candidate.url,
+            page_type=page_type,
+            discovery_status="SUGGESTED",
+            classification_method="RULE",
+        )
 
     segments = [
         segment.lower()
         for segment in urlparse(candidate.url).path.split("/")
         if segment
     ]
-    if segments:
-        last_segment = segments[-1]
-        for page_type, variants in INDEX_TYPE_VARIANTS.items():
-            if last_segment in variants:
-                return ClassificationResult(
-                    url=candidate.url,
-                    page_type=page_type,
-                    discovery_status="SUGGESTED",
-                    classification_method="RULE",
-                )
-
     if segments:
         item_page_types = {
             "product": "PRODUCTS",
@@ -405,7 +440,29 @@ def classify_candidates(
             fallback_results.extend(batch_results)
     _validate_fallback_results(unresolved, fallback_results)
     all_results = {**rule_results, **{result.url: result for result in fallback_results}}
-    return tuple(all_results[candidate.url] for candidate in candidates)
+    return tuple(
+        _coerce_other_to_discarded(all_results[candidate.url]) for candidate in candidates
+    )
+
+
+def _coerce_other_to_discarded(result: ClassificationResult) -> ClassificationResult:
+    """Enforce page_type OTHER implies DISCARDED, regardless of classifier.
+
+    The prompt tells the LLM this pairing is required, but nothing stops a
+    model from returning OTHER + SUGGESTED anyway (observed with gpt-5-nano);
+    that combination is meaningless downstream, since OTHER isn't one of the
+    six tracked categories. Correct it here as a data-integrity invariant
+    rather than trusting every classifier implementation to get it right.
+    """
+
+    if result.page_type == "OTHER" and result.discovery_status != "DISCARDED":
+        return ClassificationResult(
+            url=result.url,
+            page_type=result.page_type,
+            discovery_status="DISCARDED",
+            classification_method=result.classification_method,
+        )
+    return result
 
 
 def resolve_classifier_batch_size(

@@ -29,7 +29,20 @@ INDEX_TYPE_VARIANTS: dict[str, frozenset[str]] = {
         }
     ),
     "NEWS": frozenset({"news", "news-posts", "updates"}),
-    "PRESS": frozenset({"press", "press-release", "press-releases"}),
+    "PRESS": frozenset(
+        {
+            "press",
+            "press-release",
+            "press-releases",
+            "media",
+            "media-center",
+            "media-centre",
+            "newsroom",
+            "press-room",
+            "press-center",
+            "press-centre",
+        }
+    ),
     # Production uses one coarse PRODUCTS type for stable product-listing
     # pages. Product/item roots are handled separately below so that
     # /product/<slug> remains an item candidate rather than collapsing to the
@@ -45,6 +58,13 @@ INDEX_TYPE_PATTERNS: tuple[re.Pattern[str], ...] = tuple(
 )
 
 INDEX_PATH_ALIASES = {"service": "services"}
+
+# Enterprise/legacy-CMS sites commonly suffix content pages with a file
+# extension (e.g. kpmg.com/au/en/insights.html, not /insights). Stripping one
+# of these before comparing a segment against INDEX_TYPE_VARIANTS/
+# ITEM_TYPE_PATTERNS is comparison-only -- normalize_url still returns the
+# real segment text, extension included.
+KNOWN_PAGE_EXTENSIONS = frozenset({"html", "htm", "aspx", "asp", "php", "jsp", "cfm"})
 
 # A path under one of these roots describes an independently meaningful item.
 # It is deliberately an allowlist: arbitrary deep paths do not become targets.
@@ -253,6 +273,52 @@ def discovery_scope(url: str, page_type: str | None = None) -> DiscoveryScope:
     return "UNMATCHED"
 
 
+def has_recognized_final_segment(url: str) -> bool:
+    """Whether a URL's last path segment matches a known index/category word
+    (``insights``, ``blog``, ``services``, ...), ignoring what comes before
+    it -- unlike ``discovery_scope``'s INDEX check, no locale-prefix
+    constraint applies here.
+
+    Deliberately weaker than INDEX: this never grants a free RULE approval
+    (``classify_by_rules`` still requires the stricter discovery_scope/
+    index_page_type match) -- it only decides whether an otherwise-UNMATCHED
+    candidate (e.g. ``our-expertise/insights.html``, where "our-expertise"
+    is a company-specific folder name, not a locale) still deserves a
+    bounded chance at LLM judgment instead of being auto-discarded outright.
+    A URL like ``.../what-we-do/industries/healthcare.html`` still gets
+    nothing here, since "healthcare" isn't a recognized word at all.
+    """
+
+    canonical = canonicalize_raw_url(url)
+    segments = [segment for segment in urlsplit(canonical).path.split("/") if segment]
+    if not segments:
+        return False
+    return _matches_pattern(segments[-1], INDEX_TYPE_PATTERNS)
+
+
+def index_page_type(url: str) -> str | None:
+    """Return the ``INDEX_TYPE_VARIANTS`` key an INDEX-scoped URL matches.
+
+    Shares ``discovery_scope``'s matching (extension-stripping, locale
+    tolerance) so a caller that needs the specific page type (BLOG, PRESS,
+    ...) -- not just the yes/no INDEX verdict -- doesn't need its own,
+    separately-maintained copy of the same rule.
+    """
+
+    canonical = canonicalize_raw_url(url)
+    segments = [segment for segment in urlsplit(canonical).path.split("/") if segment]
+    if not segments:
+        return None
+    index = _index_match_position(segments)
+    if index is None:
+        return None
+    matched = strip_known_extension(segments[index].lower())
+    for page_type, variants in INDEX_TYPE_VARIANTS.items():
+        if matched in variants:
+            return page_type
+    return None
+
+
 def is_structural_path(url: str, page_type: str | None = None) -> bool:
     """Whether a URL matches an explicit index/item pattern."""
 
@@ -354,18 +420,43 @@ def _index_match_position(segments: list[str]) -> int | None:
     for index, segment in enumerate(segments):
         if not _matches_pattern(segment, INDEX_TYPE_PATTERNS):
             continue
-        if index == 0 or (index == 1 and _is_locale_segment(segments[0])):
+        # Tolerate up to two leading locale-shaped segments (e.g. a single
+        # "/en/insights" language prefix or a "/au/en/insights.html"
+        # country+language prefix) without opening the match up to arbitrary
+        # deep paths -- every segment ahead of the match must itself look
+        # like a locale, not just the immediate one.
+        prefix = segments[:index]
+        if len(prefix) <= 2 and all(is_locale_segment(s) for s in prefix):
             return index
     return None
 
 
-def _is_locale_segment(segment: str) -> bool:
-    return re.fullmatch(r"[a-z]{2,3}(?:-[a-z]{2})?", segment, flags=re.IGNORECASE) is not None
+def is_locale_segment(segment: str) -> bool:
+    """Whether a path segment looks like a 2-letter country/language code.
+
+    Deliberately exactly 2 letters (plus an optional "-XX" region suffix,
+    e.g. "en-au"): every real locale code seen in production sitemaps (au,
+    en, de, fr, ch, in, es, ...) is 2 letters, while a 3-letter allowance
+    false-matches ordinary words used as sitemap-index section names (e.g.
+    OpenAI's "/api/" sub-sitemap is not a locale).
+    """
+
+    return re.fullmatch(r"[a-z]{2}(?:-[a-z]{2})?", segment, flags=re.IGNORECASE) is not None
 
 
 def _matches_pattern(segment: str, patterns: tuple[re.Pattern[str], ...]) -> bool:
-    value = segment.lower()
+    value = strip_known_extension(segment.lower())
     return any(pattern.fullmatch(value) for pattern in patterns)
+
+
+def strip_known_extension(segment: str) -> str:
+    """Drop a single trailing known page extension, for comparison only."""
+
+    if "." in segment:
+        stem, _, extension = segment.rpartition(".")
+        if stem and extension in KNOWN_PAGE_EXTENSIONS:
+            return stem
+    return segment
 
 
 def _is_item_style(segments: list[str]) -> bool:
