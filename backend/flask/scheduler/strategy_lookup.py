@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from typing import Any, Callable, Mapping, Optional
+from urllib.parse import quote_plus
 
 from backend.flask.database.connection import MongoSettings, connect_database
 from backend.flask.scheduler.sqs_handler import try_normalize_company_url
@@ -26,6 +27,27 @@ DEFAULT_RM_DATABASE_PROD = "rm_pre_release"
 
 class RmMongoConfigurationError(RuntimeError):
     """Raised when the RM database connection cannot be configured."""
+
+
+def _assemble_rm_mongodb_uri_from_parts(values: Mapping[str, str]) -> Optional[str]:
+    """Build an RM Mongo SRV URI from ``DATABASE_HOST``/``_USERNAME``/``_PASSWORD``.
+
+    These are the RM cluster's actual credentials (a different cluster from
+    the one ``MONGODB_URI`` points at for this application's own data), but
+    nothing assembles them into a URI on its own. Without this, an
+    unset ``RM_MONGODB_URI`` falls through to ``MONGODB_URI`` and silently
+    queries the wrong cluster instead of failing loudly.
+    """
+
+    host = values.get("DATABASE_HOST")
+    username = values.get("DATABASE_USERNAME")
+    password = values.get("DATABASE_PASSWORD")
+    if not (host and username and password):
+        return None
+    return (
+        f"mongodb+srv://{quote_plus(username)}:{quote_plus(password)}@{host}/"
+        "?retryWrites=true&w=majority"
+    )
 
 
 def rm_mongo_settings_for_host(
@@ -40,10 +62,15 @@ def rm_mongo_settings_for_host(
     """
 
     values = environ if environ is not None else os.environ
-    uri = values.get("RM_MONGODB_URI") or values.get("MONGODB_URI")
+    uri = (
+        values.get("RM_MONGODB_URI")
+        or _assemble_rm_mongodb_uri_from_parts(values)
+        or values.get("MONGODB_URI")
+    )
     if not uri:
         raise RmMongoConfigurationError(
-            "RM_MONGODB_URI (or MONGODB_URI) is not configured"
+            "RM_MONGODB_URI is not configured, DATABASE_HOST/DATABASE_USERNAME/"
+            "DATABASE_PASSWORD are not all set, and MONGODB_URI is not configured"
         )
     if host == "prod":
         database_name = values.get("RM_MONGODB_DATABASE_PROD") or DEFAULT_RM_DATABASE_PROD
