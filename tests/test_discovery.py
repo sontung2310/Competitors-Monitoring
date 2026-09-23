@@ -9,10 +9,15 @@ from unittest.mock import patch
 
 from backend.flask.discovery.classification import (
     CandidateForClassification,
+    ClassificationError,
+    ClassifierConfigurationError,
     ClassificationResult,
     DeterministicStubClassifier,
+    OpenJevClassifier,
+    OpenJevClassifierConfigurationError,
     OpenAIClassifier,
     OpenAIClassifierConfigurationError,
+    build_classifier_from_env,
     classify_by_rules,
     classify_candidates,
     resolve_classifier_batch_size,
@@ -29,8 +34,10 @@ from backend.flask.discovery.normalization import (
     discovery_scope,
     extract_meta_description,
     extract_page_title,
+    has_recognized_final_segment,
     is_html_candidate_url,
     is_item_type_excluded,
+    is_locale_segment,
     is_system_path,
     normalize_url,
 )
@@ -115,6 +122,19 @@ class _FakeTargetRepository:
                 candidate.update(values)
                 return dict(candidate)
         return None
+
+    def mark_activated(self, candidate_id, *, competitor_id=None, check_interval_minutes=None):
+        updates = {"active": True, "discovery_status": "ACTIVE"}
+        if check_interval_minutes is not None:
+            updates["check_interval_minutes"] = check_interval_minutes
+        return self.update(candidate_id, updates, competitor_id=competitor_id)
+
+    def mark_discarded(self, candidate_id, *, competitor_id=None):
+        return self.update(
+            candidate_id,
+            {"active": False, "discovery_status": "DISCARDED"},
+            competitor_id=competitor_id,
+        )
 
     def discard_discovered_candidates_by_url_patterns(
         self, competitor_id, *, url_patterns
@@ -231,6 +251,19 @@ class _ReviewTargetRepository:
                 return dict(record)
         return None
 
+    def mark_activated(self, candidate_id, *, competitor_id=None, check_interval_minutes=None):
+        updates = {"active": True, "discovery_status": "ACTIVE"}
+        if check_interval_minutes is not None:
+            updates["check_interval_minutes"] = check_interval_minutes
+        return self.update(candidate_id, updates, competitor_id=competitor_id)
+
+    def mark_discarded(self, candidate_id, *, competitor_id=None):
+        return self.update(
+            candidate_id,
+            {"active": False, "discovery_status": "DISCARDED"},
+            competitor_id=competitor_id,
+        )
+
     def delete(self, candidate_id, *, competitor_id=None):
         for index, record in enumerate(self.records):
             if record["id"] == candidate_id and (
@@ -303,6 +336,26 @@ class _FakeOpenAIClient:
         self.responses = _FakeOpenAIResponses(payload)
 
 
+class _FakeChatCompletions:
+    def __init__(self, output: str):
+        self.output = output
+        self.calls = []
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return SimpleNamespace(
+            choices=[SimpleNamespace(message=SimpleNamespace(content=self.output))]
+        )
+
+
+class _FakeChatClient:
+    """OpenRouter-shaped fake client (Chat Completions API)."""
+
+    def __init__(self, output: str):
+        self.completions = _FakeChatCompletions(output)
+        self.chat = SimpleNamespace(completions=self.completions)
+
+
 class _RecordingLLMProvider:
     def __init__(self, payload):
         self.payload = payload
@@ -317,6 +370,57 @@ class _RecordingLLMProvider:
             }
         )
         return self.payload
+
+
+def _open_jev_payload(
+    *,
+    page_type="SERVICES",
+    discovery_status="SUGGESTED",
+    page_type_confidence=0.9,
+    status_confidence=0.9,
+):
+    page_type_labels = ["BLOG", "NEWS", "PRICING", "PRODUCTS", "SERVICES", "PRESS", "OTHER"]
+    page_type_rest = (1 - page_type_confidence) / (len(page_type_labels) - 1)
+    page_type_probabilities = {
+        label: (page_type_confidence if label == page_type else page_type_rest)
+        for label in page_type_labels
+    }
+    status_labels = ["SUGGESTED", "DISCARDED"]
+    status_probabilities = {
+        label: (status_confidence if label == discovery_status else 1 - status_confidence)
+        for label in status_labels
+    }
+    return {
+        "answers": {
+            "page_type": {
+                "type": "choice",
+                "choice": page_type,
+                "probabilities": page_type_probabilities,
+                "confidence": page_type_confidence,
+            },
+            "discovery_status": {
+                "type": "choice",
+                "choice": discovery_status,
+                "probabilities": status_probabilities,
+                "confidence": status_confidence,
+            },
+        }
+    }
+
+
+class _RecordingOpenJevProvider:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def ask(self, state, questions):
+        self.calls.append({"state": state, "questions": questions})
+        return self.payload
+
+
+class _FailingOpenJevProvider:
+    def ask(self, state, questions):
+        raise RuntimeError("Open-Jev unavailable")
 
 
 class _FailingClassifier:
@@ -473,7 +577,7 @@ class DiscoveryTests(unittest.TestCase):
             DiscoveryAuditResult(
                 flagged_redundant=(
                     RedundancyFlag(
-                        "https://example.com/men/services",
+                        "https://example.com/en/services",
                         "Duplicate of the first services entry.",
                     ),
                     RedundancyFlag(
@@ -501,7 +605,7 @@ class DiscoveryTests(unittest.TestCase):
             sitemap_source=_Source(
                 (
                     DiscoveredURL("https://example.com/services", "SITEMAP"),
-                    DiscoveredURL("https://example.com/men/services", "SITEMAP"),
+                    DiscoveredURL("https://example.com/en/services", "SITEMAP"),
                 )
             ),
             link_source=_Source(
@@ -524,7 +628,7 @@ class DiscoveryTests(unittest.TestCase):
             [candidate.url for candidate in audit.calls[0]["candidates"]],
             [
                 "https://example.com/services",
-                "https://example.com/men/services",
+                "https://example.com/en/services",
             ],
         )
         self.assertEqual(
@@ -651,6 +755,54 @@ class DiscoveryTests(unittest.TestCase):
             [row["discovery_status"] for row in persisted],
             ["SUGGESTED", "SUGGESTED"],
         )
+
+    def test_second_pass_audit_discards_extension_only_duplicate(self):
+        # Mirrors marketingeye.com.au/press-releases (a soft-404 that returns
+        # HTTP 200) vs press-releases.html (the real page): same path except
+        # for the extension, so the structural-overlap check must recognize
+        # them as related, and the audit's "appears to" phrasing must not be
+        # treated as a hedge that blocks an otherwise well-evidenced flag.
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        audit = _RecordingAudit(
+            DiscoveryAuditResult(
+                flagged_redundant=(
+                    RedundancyFlag(
+                        "https://example.com/press-releases",
+                        "This page appears to be a duplicate or error page of "
+                        "'https://example.com/press-releases.html', as it lacks "
+                        "unique content.",
+                    ),
+                ),
+            )
+        )
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=DeterministicStubClassifier(
+                page_type="PRESS",
+                discovery_status="SUGGESTED",
+            ),
+            audit_classifier=audit,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL("https://example.com/press-releases", "SITEMAP"),
+                    DiscoveredURL("https://example.com/press-releases.html", "SITEMAP"),
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        statuses = {row["url"]: row["discovery_status"] for row in persisted}
+        self.assertEqual(statuses["https://example.com/press-releases"], "DISCARDED")
+        self.assertEqual(statuses["https://example.com/press-releases.html"], "SUGGESTED")
 
     def test_classifier_batch_size_can_be_configured(self):
         self.assertEqual(resolve_classifier_batch_size(environ={}), 25)
@@ -788,6 +940,69 @@ class DiscoveryTests(unittest.TestCase):
             "UNMATCHED",
         )
 
+    def test_extensioned_and_locale_prefixed_variants_still_match_index_scope(self):
+        # Enterprise/legacy-CMS sites commonly suffix content pages with a
+        # file extension and prefix them with a country+language path (e.g.
+        # kpmg.com/ch/en/insights.html), rather than a clean /insights.
+        self.assertEqual(
+            discovery_scope("https://kpmg.com/ch/en/insights.html"),
+            "INDEX",
+        )
+        self.assertEqual(
+            discovery_scope("https://kpmg.com/au/en/services.html"),
+            "INDEX",
+        )
+        # A single real locale segment continues to work, extension or not.
+        self.assertEqual(
+            discovery_scope("https://example.com/en/insights.html"),
+            "INDEX",
+        )
+        # An extensioned leaf that doesn't match any known variant is still
+        # correctly rejected -- extension-stripping doesn't loosen precision.
+        self.assertEqual(
+            discovery_scope("https://example.com/au/en/leadership-team.html"),
+            "UNMATCHED",
+        )
+        # A non-locale two-segment prefix must still fail, extension or not
+        # -- only genuine locale-shaped segments extend the match window.
+        self.assertEqual(
+            discovery_scope("https://example.com/opaque/insights.html"),
+            "UNMATCHED",
+        )
+
+    def test_is_locale_segment_requires_exactly_two_letters(self):
+        # Real locale codes seen in production sitemaps are all 2 letters.
+        for code in ("au", "en", "de", "fr", "ch", "in", "es", "en-au"):
+            with self.subTest(code=code):
+                self.assertTrue(is_locale_segment(code))
+        # 3-letter words are ordinary content-section names, not locales --
+        # "api" (openai.com's API sitemap) and "men" (a gendered product
+        # section) both false-matched the old 2-3 letter regex.
+        for word in ("api", "men", "faq", "opaque"):
+            with self.subTest(word=word):
+                self.assertFalse(is_locale_segment(word))
+
+    def test_has_recognized_final_segment_ignores_prefix(self):
+        # A recognized final word counts regardless of what precedes it --
+        # unlike discovery_scope's INDEX check, no locale constraint here.
+        for url in (
+            "https://www.oliverwyman.com/our-expertise/insights.html",
+            "https://example.com/blog",
+            "https://kpmg.com/au/en/media.html",
+        ):
+            with self.subTest(url=url):
+                self.assertTrue(has_recognized_final_segment(url))
+        # An unrecognized final word never counts, no matter the prefix --
+        # this is what keeps KPMG's flood of /industries/healthcare.html,
+        # /services/tax.html-shaped pages excluded.
+        for url in (
+            "https://kpmg.com/xx/en/what-we-do/industries/healthcare.html",
+            "https://kpmg.com/xx/en/what-we-do/services/tax.html",
+            "https://example.com/about-us",
+        ):
+            with self.subTest(url=url):
+                self.assertFalse(has_recognized_final_segment(url))
+
     def test_universal_candidate_filters_reject_assets_and_system_paths(self):
         self.assertFalse(is_html_candidate_url("https://example.com/logo.png"))
         self.assertTrue(is_html_candidate_url("https://example.com/pricing?page=2"))
@@ -821,7 +1036,10 @@ class DiscoveryTests(unittest.TestCase):
                     200,
                     '<a href="/blog">Blog</a><a href="https://other.example/pricing">No</a>',
                     {},
-                )
+                ),
+                "https://example.com/blog": FetchResponse(
+                    "https://example.com/blog", 404, "", {}
+                ),
             }
         )
         links = InternalLinkSource(fetcher).discover("https://example.com")
@@ -838,7 +1056,16 @@ class DiscoveryTests(unittest.TestCase):
                     "<footer><a href='/footer-page'>Footer</a></footer>"
                     "<header><nav><a href='/services'>Services</a></nav></header>",
                     {},
-                )
+                ),
+                "https://example.com/body-page": FetchResponse(
+                    "https://example.com/body-page", 404, "", {}
+                ),
+                "https://example.com/footer-page": FetchResponse(
+                    "https://example.com/footer-page", 404, "", {}
+                ),
+                "https://example.com/services": FetchResponse(
+                    "https://example.com/services", 404, "", {}
+                ),
             }
         )
 
@@ -850,6 +1077,75 @@ class DiscoveryTests(unittest.TestCase):
                 "https://example.com/footer-page",
                 "https://example.com/body-page",
             ],
+        )
+
+    def test_link_source_crawls_to_max_depth_and_stops(self):
+        # homepage (depth 0) -> /level1 (depth 1, fetched) -> /level2
+        # (depth 2, fetched) -> /level3 (depth 3, collected but NOT fetched,
+        # so /level3's own link to /level4 must never appear).
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/": FetchResponse(
+                    "https://example.com/", 200, '<a href="/level1">L1</a>', {}
+                ),
+                "https://example.com/level1": FetchResponse(
+                    "https://example.com/level1", 200, '<a href="/level2">L2</a>', {}
+                ),
+                "https://example.com/level2": FetchResponse(
+                    "https://example.com/level2", 200, '<a href="/level3">L3</a>', {}
+                ),
+                "https://example.com/level3": FetchResponse(
+                    "https://example.com/level3", 200, '<a href="/level4">L4</a>', {}
+                ),
+            }
+        )
+
+        links = InternalLinkSource(fetcher, max_depth=3, max_pages=100).discover(
+            "https://example.com"
+        )
+
+        urls = {link.raw_url for link in links}
+        self.assertEqual(
+            urls,
+            {
+                "https://example.com/level1",
+                "https://example.com/level2",
+                "https://example.com/level3",
+            },
+        )
+        self.assertNotIn("https://example.com/level4", urls)
+
+    def test_link_source_stops_at_max_pages(self):
+        # Ten pages are each fetchable and each link to the next, but the
+        # crawl must stop after fetching exactly max_pages of them.
+        responses = {
+            "https://example.com/": FetchResponse(
+                "https://example.com/", 200, '<a href="/page-1">P1</a>', {}
+            )
+        }
+        for i in range(1, 10):
+            responses[f"https://example.com/page-{i}"] = FetchResponse(
+                f"https://example.com/page-{i}",
+                200,
+                f'<a href="/page-{i + 1}">next</a>',
+                {},
+            )
+        fetcher = _StaticFetcher(responses)
+
+        source = InternalLinkSource(fetcher, max_depth=10, max_pages=3)
+        links = source.discover("https://example.com")
+
+        # max_pages=3 fetches homepage, page-1, page-2 -- collecting
+        # page-1 (depth 1), page-2 (depth 2), page-3 (depth 3, collected off
+        # page-2 but never itself fetched).
+        urls = {link.raw_url for link in links}
+        self.assertEqual(
+            urls,
+            {
+                "https://example.com/page-1",
+                "https://example.com/page-2",
+                "https://example.com/page-3",
+            },
         )
 
     def test_sitemap_index_is_collected_recursively(self):
@@ -876,6 +1172,117 @@ class DiscoveryTests(unittest.TestCase):
         )
         results = SitemapSource(fetcher).discover("https://example.com")
         self.assertEqual([result.raw_url for result in results], ["https://example.com/about"])
+
+    def test_sitemap_index_prefers_au_sub_sitemap(self):
+        # Mirrors kpmg.com/sitemap-index.xml: dozens of per-country
+        # sub-sitemaps, one of which is the Australian one. The German and
+        # French sub-sitemaps are deliberately *not* registered with the
+        # fetcher -- fetching them would raise KeyError, proving they were
+        # skipped rather than merely unused in the assertion.
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/sitemap.xml": FetchResponse(
+                    "https://example.com/sitemap.xml",
+                    200,
+                    '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<sitemap><loc>https://example.com/de/sitemap.xml</loc></sitemap>"
+                    "<sitemap><loc>https://example.com/au/sitemap.xml</loc></sitemap>"
+                    "<sitemap><loc>https://example.com/fr/sitemap.xml</loc></sitemap>"
+                    "</sitemapindex>",
+                    {},
+                ),
+                "https://example.com/sitemap_index.xml": FetchResponse(
+                    "https://example.com/sitemap_index.xml", 404, "", {}
+                ),
+                "https://example.com/au/sitemap.xml": FetchResponse(
+                    "https://example.com/au/sitemap.xml",
+                    200,
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<url><loc>https://example.com/au/insights.html</loc></url></urlset>",
+                    {},
+                ),
+            }
+        )
+        results = SitemapSource(fetcher).discover("https://example.com")
+        self.assertEqual(
+            [result.raw_url for result in results],
+            ["https://example.com/au/insights.html"],
+        )
+
+    def test_sitemap_index_falls_back_to_locale_free_default_without_au(self):
+        # Mirrors oliverwyman.com/sitemap.xml: no Australian sub-sitemap, but
+        # a clear multi-region split (India, Spain) alongside a locale-free
+        # default. India/Spain are not registered with the fetcher, so
+        # fetching them would raise KeyError.
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/sitemap.xml": FetchResponse(
+                    "https://example.com/sitemap.xml",
+                    200,
+                    '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<sitemap><loc>https://example.com/in/sitemap.xml</loc></sitemap>"
+                    "<sitemap><loc>https://example.com/es/sitemap.xml</loc></sitemap>"
+                    "<sitemap><loc>https://example.com/global-sitemap.xml</loc></sitemap>"
+                    "</sitemapindex>",
+                    {},
+                ),
+                "https://example.com/sitemap_index.xml": FetchResponse(
+                    "https://example.com/sitemap_index.xml", 404, "", {}
+                ),
+                "https://example.com/global-sitemap.xml": FetchResponse(
+                    "https://example.com/global-sitemap.xml",
+                    200,
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<url><loc>https://example.com/insights.html</loc></url></urlset>",
+                    {},
+                ),
+            }
+        )
+        results = SitemapSource(fetcher).discover("https://example.com")
+        self.assertEqual(
+            [result.raw_url for result in results],
+            ["https://example.com/insights.html"],
+        )
+
+    def test_sitemap_index_with_content_taxonomy_names_crawls_everything(self):
+        # Mirrors openai.com/sitemap.xml: split by content category (api,
+        # chatgpt, company), not by country. None of these are locale-shaped,
+        # so the region filter must leave the full set untouched.
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/sitemap.xml": FetchResponse(
+                    "https://example.com/sitemap.xml",
+                    200,
+                    '<sitemapindex xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<sitemap><loc>https://example.com/api-sitemap.xml</loc></sitemap>"
+                    "<sitemap><loc>https://example.com/company-sitemap.xml</loc></sitemap>"
+                    "</sitemapindex>",
+                    {},
+                ),
+                "https://example.com/sitemap_index.xml": FetchResponse(
+                    "https://example.com/sitemap_index.xml", 404, "", {}
+                ),
+                "https://example.com/api-sitemap.xml": FetchResponse(
+                    "https://example.com/api-sitemap.xml",
+                    200,
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<url><loc>https://example.com/api/docs</loc></url></urlset>",
+                    {},
+                ),
+                "https://example.com/company-sitemap.xml": FetchResponse(
+                    "https://example.com/company-sitemap.xml",
+                    200,
+                    '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+                    "<url><loc>https://example.com/company/about</loc></url></urlset>",
+                    {},
+                ),
+            }
+        )
+        results = SitemapSource(fetcher).discover("https://example.com")
+        self.assertEqual(
+            sorted(result.raw_url for result in results),
+            ["https://example.com/api/docs", "https://example.com/company/about"],
+        )
 
     def test_sitemap_emits_inferred_parent_for_liveness_gate(self):
         article_url = (
@@ -957,6 +1364,93 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(source.last_stats.raw_count, 8)
         self.assertEqual(source.last_stats.sampled_count, 2)
         self.assertEqual(len(results), 5)
+
+    def test_large_sitemap_prefers_recent_lastmod_when_every_url_declares_one(self):
+        # Every <url> declares <lastmod> -- the "current type of sitemap" the
+        # feature is scoped to. The most-recently-modified opaque URLs must
+        # be kept even when even-spaced sampling would have picked others.
+        entries = (
+            ("https://example.com/opaque/one", "2020-01-01"),
+            ("https://example.com/opaque/two", "2023-06-01"),
+            ("https://example.com/opaque/three", "2021-01-01"),
+            ("https://example.com/opaque/four", "2022-06-01"),
+        )
+        xml = '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">' + "".join(
+            f"<url><loc>{loc}</loc><lastmod>{lastmod}</lastmod></url>"
+            for loc, lastmod in entries
+        ) + "</urlset>"
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/sitemap.xml": FetchResponse(
+                    "https://example.com/sitemap.xml", 404, "", {}
+                ),
+                "https://example.com/sitemap_index.xml": FetchResponse(
+                    "https://example.com/sitemap_index.xml", 404, "", {}
+                ),
+                "https://example.com/content.xml": FetchResponse(
+                    "https://example.com/content.xml", 200, xml, {}
+                ),
+            }
+        )
+
+        source = SitemapSource(
+            fetcher,
+            large_sitemap_threshold=3,
+            sample_urls_per_large_sitemap=2,
+            recency_sample_limit=2,
+        )
+        results = source.discover(
+            "https://example.com",
+            ("https://example.com/content.xml",),
+        )
+
+        urls = {result.raw_url for result in results}
+        self.assertEqual(urls, {"https://example.com/opaque/two", "https://example.com/opaque/four"})
+
+    def test_large_sitemap_falls_back_to_even_sampling_when_lastmod_is_incomplete(self):
+        # Same shape as above, but one <url> is missing <lastmod> -- the
+        # schema isn't fully supported, so this must fall back to the
+        # existing even-spaced sampling rather than guess at the missing date.
+        xml = (
+            '<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">'
+            "<url><loc>https://example.com/opaque/one</loc>"
+            "<lastmod>2020-01-01</lastmod></url>"
+            "<url><loc>https://example.com/opaque/two</loc>"
+            "<lastmod>2023-06-01</lastmod></url>"
+            "<url><loc>https://example.com/opaque/three</loc></url>"
+            "<url><loc>https://example.com/opaque/four</loc>"
+            "<lastmod>2022-06-01</lastmod></url>"
+            "</urlset>"
+        )
+        fetcher = _StaticFetcher(
+            {
+                "https://example.com/sitemap.xml": FetchResponse(
+                    "https://example.com/sitemap.xml", 404, "", {}
+                ),
+                "https://example.com/sitemap_index.xml": FetchResponse(
+                    "https://example.com/sitemap_index.xml", 404, "", {}
+                ),
+                "https://example.com/content.xml": FetchResponse(
+                    "https://example.com/content.xml", 200, xml, {}
+                ),
+            }
+        )
+
+        source = SitemapSource(
+            fetcher,
+            large_sitemap_threshold=3,
+            sample_urls_per_large_sitemap=2,
+            recency_sample_limit=2,
+        )
+        results = source.discover(
+            "https://example.com",
+            ("https://example.com/content.xml",),
+        )
+
+        # Even-spacing over 4 opaque URLs with a cap of 2 picks positions 0
+        # and 3 (one, four) -- not the recency-based {two, four}.
+        urls = {result.raw_url for result in results}
+        self.assertEqual(urls, {"https://example.com/opaque/one", "https://example.com/opaque/four"})
 
     def test_classification_batches_only_unresolved_candidates(self):
         candidates = (
@@ -1092,6 +1586,69 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(results[0].discovery_status, "DISCARDED")
         self.assertEqual(results[0].classification_method, "RULE")
 
+    def test_other_page_type_is_coerced_to_discarded(self):
+        # Observed with gpt-5-nano: a classifier can return page_type=OTHER
+        # with discovery_status=SUGGESTED, a combination our own prompt says
+        # is invalid ("mark DISCARDED with page_type OTHER"). classify_
+        # candidates must not trust that pairing from any classifier.
+        class _InconsistentClassifier:
+            def classify(self, candidates):
+                return tuple(
+                    ClassificationResult(
+                        url=candidate.url,
+                        page_type="OTHER",
+                        discovery_status="SUGGESTED",
+                        classification_method="LLM",
+                    )
+                    for candidate in candidates
+                )
+
+        results = classify_candidates(
+            (
+                CandidateForClassification(
+                    "https://example.com/opaque", "https://example.com/opaque"
+                ),
+            ),
+            _InconsistentClassifier(),
+        )
+        self.assertEqual(results[0].page_type, "OTHER")
+        self.assertEqual(results[0].discovery_status, "DISCARDED")
+
+    def test_classify_by_rules_resolves_extensioned_locale_prefixed_urls(self):
+        # kpmg.com/au/en/insights.html: discovery_scope already calls this
+        # INDEX (extension-stripping + locale-prefix tolerance); classify_by_
+        # rules must resolve it the same way instead of falling through to
+        # the LLM for something already resolvable for free.
+        result = classify_by_rules(
+            CandidateForClassification(
+                "https://kpmg.com/au/en/insights.html",
+                "https://kpmg.com/au/en/insights.html",
+            )
+        )
+        self.assertIsNotNone(result)
+        self.assertEqual(result.page_type, "BLOG")
+        self.assertEqual(result.discovery_status, "SUGGESTED")
+        self.assertEqual(result.classification_method, "RULE")
+
+    def test_classify_by_rules_recognizes_expanded_press_vocabulary(self):
+        for path, expected_type in (
+            ("/media", "PRESS"),
+            ("/media-center", "PRESS"),
+            ("/media-centre", "PRESS"),
+            ("/newsroom", "PRESS"),
+            ("/press-room", "PRESS"),
+        ):
+            with self.subTest(path=path):
+                result = classify_by_rules(
+                    CandidateForClassification(
+                        f"https://example.com{path}",
+                        f"https://example.com{path}",
+                    )
+                )
+                self.assertIsNotNone(result)
+                self.assertEqual(result.page_type, expected_type)
+                self.assertEqual(discovery_scope(f"https://example.com{path}"), "INDEX")
+
     def test_deterministic_stub_returns_structured_fallback_results(self):
         candidates = (
             CandidateForClassification("raw", "https://example.com/opaque"),
@@ -1100,6 +1657,168 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result.page_type, "OTHER")
         self.assertEqual(result.discovery_status, "DISCARDED")
         self.assertEqual(result.classification_method, "LLM")
+
+    def test_open_jev_classifier_parses_typed_choices_and_sends_candidate_state(self):
+        candidate = CandidateForClassification(
+            "https://example.com/raw-services",
+            "https://example.com/services",
+            title="Services",
+            meta_description="Our service categories",
+            sources=("SITEMAP", "LINKS"),
+        )
+        provider = _RecordingOpenJevProvider(_open_jev_payload())
+
+        result = OpenJevClassifier(provider=provider).classify((candidate,))[0]
+
+        self.assertEqual(result.page_type, "SERVICES")
+        self.assertEqual(result.discovery_status, "SUGGESTED")
+        self.assertEqual(result.classification_method, "JEV")
+        self.assertEqual(
+            provider.calls[0]["state"],
+            {
+                "url": "https://example.com/services",
+                "title": "Services",
+                "meta_description": "Our service categories",
+                "discovery_sources": ["SITEMAP", "LINKS"],
+            },
+        )
+        self.assertEqual(
+            set(provider.calls[0]["questions"]),
+            {"page_type", "discovery_status"},
+        )
+        self.assertTrue(
+            all(
+                question["type"] == "choice"
+                for question in provider.calls[0]["questions"].values()
+            )
+        )
+
+    def test_open_jev_confidence_gate_is_inclusive_at_threshold(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        for confidence, expected_status in (
+            (0.74, "DISCARDED"),
+            (0.75, "SUGGESTED"),
+            (0.76, "SUGGESTED"),
+        ):
+            with self.subTest(confidence=confidence):
+                classifier = OpenJevClassifier(
+                    provider=_RecordingOpenJevProvider(
+                        _open_jev_payload(
+                            page_type_confidence=confidence,
+                            status_confidence=confidence,
+                        )
+                    )
+                )
+                result = classifier.classify((candidate,))[0]
+                self.assertEqual(result.discovery_status, expected_status)
+                self.assertEqual(result.classification_method, "JEV")
+
+    def test_open_jev_other_is_always_discarded(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        result = OpenJevClassifier(
+            provider=_RecordingOpenJevProvider(
+                _open_jev_payload(
+                    page_type="OTHER",
+                    discovery_status="SUGGESTED",
+                    page_type_confidence=0.99,
+                    status_confidence=0.99,
+                )
+            )
+        ).classify((candidate,))[0]
+
+        self.assertEqual(result.page_type, "OTHER")
+        self.assertEqual(result.discovery_status, "DISCARDED")
+        self.assertEqual(result.classification_method, "JEV")
+
+    def test_open_jev_rejects_malformed_incomplete_and_unexpected_answers(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        malformed_payloads = []
+
+        missing_answer = _open_jev_payload()
+        del missing_answer["answers"]["page_type"]
+        malformed_payloads.append(missing_answer)
+
+        extra_answer = _open_jev_payload()
+        extra_answer["answers"]["unexpected"] = {}
+        malformed_payloads.append(extra_answer)
+
+        wrong_type = _open_jev_payload()
+        wrong_type["answers"]["page_type"]["type"] = "text"
+        malformed_payloads.append(wrong_type)
+
+        invalid_choice = _open_jev_payload()
+        invalid_choice["answers"]["page_type"]["choice"] = "CAREERS"
+        malformed_payloads.append(invalid_choice)
+
+        missing_probability = _open_jev_payload()
+        del missing_probability["answers"]["page_type"]["probabilities"]["OTHER"]
+        malformed_payloads.append(missing_probability)
+
+        out_of_range_probability = _open_jev_payload()
+        out_of_range_probability["answers"]["page_type"]["probabilities"]["SERVICES"] = 1.1
+        malformed_payloads.append(out_of_range_probability)
+
+        invalid_confidence = _open_jev_payload()
+        invalid_confidence["answers"]["discovery_status"]["confidence"] = -0.01
+        malformed_payloads.append(invalid_confidence)
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ClassificationError):
+                OpenJevClassifier(
+                    provider=_RecordingOpenJevProvider(payload)
+                ).classify((candidate,))
+
+    def test_classifier_factory_selects_open_jev_and_validates_configuration(self):
+        classifier = build_classifier_from_env(
+            {
+                "DISCOVERY_CLASSIFIER_PROVIDER": "open-jev",
+                "OPEN_JEV_ENDPOINT": "http://jev.test/v1/systemone",
+                "OPEN_JEV_MODEL": "jev-test",
+                "OPEN_JEV_TIMEOUT_SECONDS": "4.5",
+                "DISCOVERY_JEV_MIN_CONFIDENCE": "0.76",
+            },
+            opener=lambda request, timeout: None,
+        )
+
+        self.assertIsInstance(classifier, OpenJevClassifier)
+        self.assertEqual(classifier.endpoint, "http://jev.test/v1/systemone")
+        self.assertEqual(classifier.model, "jev-test")
+        self.assertEqual(classifier.timeout_seconds, 4.5)
+        self.assertEqual(classifier.min_confidence, 0.76)
+
+        with self.assertRaises(ClassifierConfigurationError):
+            build_classifier_from_env({"DISCOVERY_CLASSIFIER_PROVIDER": "anthropic"})
+        with self.assertRaises(OpenJevClassifierConfigurationError):
+            build_classifier_from_env(
+                {
+                    "DISCOVERY_CLASSIFIER_PROVIDER": "open-jev",
+                    "DISCOVERY_JEV_MIN_CONFIDENCE": "1.1",
+                },
+                opener=lambda request, timeout: None,
+            )
+
+    def test_classifier_factory_keeps_openai_as_default(self):
+        classifier = build_classifier_from_env(
+            {"OPENAI_KEY": "test-key-not-used"},
+            client=_FakeOpenAIClient({"classifications": []}),
+        )
+        self.assertIsInstance(classifier, OpenAIClassifier)
+
+    def test_classifier_factory_selects_openrouter_without_changing_llm_contract(self):
+        classifier = build_classifier_from_env(
+            {
+                "DISCOVERY_CLASSIFIER_PROVIDER": "openrouter",
+                "OPENROUTER_API_KEY": "test-key-not-used",
+            },
+            client=_FakeChatClient(
+                json.dumps(
+                    {
+                        "classifications": [],
+                    }
+                )
+            ),
+        )
+        self.assertIsInstance(classifier, OpenAIClassifier)
 
     def test_openai_classifier_uses_configured_model_and_structured_batch(self):
         candidates = (
@@ -1177,13 +1896,13 @@ class DiscoveryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(classifier.model, "gpt-4o")
+        self.assertEqual(classifier.model, "gpt-5-nano")
         self.assertIs(classifier.provider, provider)
         self.assertEqual(len(provider.calls), 1)
         self.assertEqual(result[0].classification_method, "LLM")
         self.assertEqual(classifier.last_results, result)
 
-    def test_openai_classifier_prompt_requires_index_item_distinction(self):
+    def test_openai_classifier_prompt_requires_layer2_layer3_distinction(self):
         provider = _RecordingLLMProvider(
             {
                 "classifications": [
@@ -1207,15 +1926,24 @@ class DiscoveryTests(unittest.TestCase):
         )
 
         instructions = " ".join(provider.calls[0]["instructions"].split())
-        self.assertIn("index-vs-item distinction strictly", instructions)
+        self.assertIn("Layer 3", instructions)
         self.assertIn("meta description", instructions)
-        self.assertIn("individual item", instructions)
-        self.assertIn("flat descriptive slug is not an index merely", instructions)
-        self.assertIn("durable service page", instructions)
-        self.assertIn('homepage root URL (path "/")', instructions)
-        self.assertIn("choose OTHER and DISCARDED rather than guessing", instructions)
+        self.assertIn("near-identical siblings", instructions)
         self.assertIn(
-            "BLOG, NEWS, PRICING, PRODUCTS, SERVICES, PRESS, or OTHER",
+            'a flat, descriptive slug for one service/product (e.g. "/seo-consultant-melbourne"',
+            instructions,
+        )
+        self.assertIn(
+            'a specific named program, package, or numbered offer (e.g. "30-Day SEO Stream"',
+            instructions,
+        )
+        self.assertIn("an industry/vertical-specific landing page", instructions)
+        self.assertIn("a resource/asset/template library", instructions)
+        self.assertIn('"what we do" / "our approach" / "about us" page', instructions)
+        self.assertIn('Never suggest the homepage ("/")', instructions)
+        self.assertIn("When ambiguous, choose OTHER/DISCARDED", instructions)
+        self.assertIn(
+            "BLOG, NEWS, PRICING, PRODUCTS, SERVICES, PRESS, OTHER",
             instructions,
         )
         for removed_type in (
@@ -1244,7 +1972,7 @@ class DiscoveryTests(unittest.TestCase):
             ["BLOG", "NEWS", "PRICING", "PRODUCTS", "SERVICES", "PRESS", "OTHER"],
         )
 
-    def test_openai_classifier_sends_default_gpt4o_to_shared_provider(self):
+    def test_openai_classifier_sends_default_gpt5_nano_to_shared_provider(self):
         client = _FakeOpenAIClient(
             {
                 "classifications": [
@@ -1270,7 +1998,49 @@ class DiscoveryTests(unittest.TestCase):
             )
         )
 
-        self.assertEqual(client.responses.calls[0]["model"], "gpt-4o")
+        self.assertEqual(client.responses.calls[0]["model"], "gpt-5-nano")
+
+    def test_openai_classifier_switches_to_openrouter_via_provider_flag(self):
+        client = _FakeChatClient(
+            json.dumps(
+                {
+                    "classifications": [
+                        {
+                            "url": "https://example.com/ambiguous",
+                            "page_type": "OTHER",
+                            "discovery_status": "DISCARDED",
+                        }
+                    ]
+                }
+            )
+        )
+        classifier = OpenAIClassifier.from_env(
+            {
+                "DISCOVERY_CLASSIFIER_PROVIDER": "openrouter",
+                "OPENROUTER_API_KEY": "test-key-not-used",
+            },
+            client=client,
+        )
+
+        classifier.classify(
+            (
+                CandidateForClassification(
+                    "https://example.com/ambiguous",
+                    "https://example.com/ambiguous",
+                ),
+            )
+        )
+
+        self.assertEqual(
+            client.completions.calls[0]["model"], "deepseek/deepseek-v4-flash-0731"
+        )
+
+    def test_openai_classifier_rejects_unknown_provider_flag(self):
+        with self.assertRaisesRegex(OpenAIClassifierConfigurationError, "openai.*openrouter"):
+            OpenAIClassifier.from_env(
+                {"DISCOVERY_CLASSIFIER_PROVIDER": "anthropic"},
+                client=_FakeOpenAIClient({"classifications": []}),
+            )
 
     def test_rule_match_never_calls_real_classifier(self):
         provider = _RecordingLLMProvider({"classifications": []})
@@ -1306,7 +2076,21 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(classifier.calls, 1)
         self.assertEqual(results[0].page_type, "OTHER")
         self.assertEqual(results[0].discovery_status, "DISCARDED")
-        self.assertEqual(results[0].classification_method, "LLM")
+        self.assertEqual(results[0].classification_method, "FALLBACK")
+
+    def test_open_jev_failure_degrades_to_fallback_without_a_second_provider(self):
+        classifier = OpenJevClassifier(provider=_FailingOpenJevProvider())
+        candidate = CandidateForClassification(
+            "https://example.com/opaque",
+            "https://example.com/opaque",
+        )
+
+        results = classify_candidates((candidate,), classifier)
+
+        self.assertEqual(classifier.call_count, 1)
+        self.assertEqual(results[0].page_type, "OTHER")
+        self.assertEqual(results[0].discovery_status, "DISCARDED")
+        self.assertEqual(results[0].classification_method, "FALLBACK")
 
     def test_discovery_continues_after_one_failed_classifier_batch(self):
         target_repository = _FakeTargetRepository()
@@ -1382,6 +2166,114 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(len(classifier.batches), 1)
         self.assertEqual(len(target_repository.saved), 2)
         self.assertNotIn("SEARCH", service.last_summary.source_breakdown)
+
+    def test_unmatched_candidate_with_no_recognized_word_stays_force_discarded(self):
+        # Mirrors kpmg.com/xx/en/what-we-do/industries/healthcare.html --
+        # none of its segments (xx, en, what-we-do, industries, healthcare)
+        # match any known vocabulary word, so it must still be auto-discarded
+        # before classification. This is the regression guard against
+        # reopening the KPMG "30 pages flooded in" problem: only URLs whose
+        # *last* segment is a recognized word (see the next test) get a
+        # bounded second chance -- an unrecognized word anywhere doesn't.
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        classifier = _RecordingClassifier()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=classifier,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (
+                    DiscoveredURL(
+                        "https://example.com/what-we-do/industries/healthcare",
+                        "SITEMAP",
+                    ),
+                )
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        results = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(classifier.batches), 0)
+        self.assertEqual([r["discovery_status"] for r in results], ["DISCARDED"])
+
+    def test_unmatched_candidate_with_recognized_final_segment_reaches_classification(self):
+        # Mirrors oliverwyman.com/our-expertise/insights.html: "our-expertise"
+        # isn't a locale, so this stays UNMATCHED -- but the last segment
+        # ("insights") is a recognized word, so it should now get a bounded
+        # chance at LLM judgment instead of being auto-discarded outright.
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        classifier = _RecordingClassifier()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=classifier,
+            robots_source=_Robots(),
+            sitemap_source=_Source(
+                (DiscoveredURL("https://example.com/our-expertise/insights", "SITEMAP"),)
+            ),
+            link_source=_Source(),
+            liveness_checker=lambda url: True,
+        )
+
+        service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(classifier.batches), 1)
+        self.assertEqual(
+            [c.url for c in classifier.batches[0]],
+            ["https://example.com/our-expertise/insights"],
+        )
+
+    def test_links_body_link_with_recognized_final_segment_reaches_classification(self):
+        # LINKS candidates have a *second*, separate force-discard gate (low-
+        # priority body links that aren't structural) -- this is what
+        # actually caught oliverwyman.com/our-expertise/insights.html in
+        # production, since it was found as a body link (priority 3, inside
+        # a <div>-based footer menu, not a semantic <nav>/<header>/<footer>
+        # tag) rather than via SITEMAP. That gate must also exempt a
+        # recognized final segment, the same as the main gate does.
+        competitor = {
+            "id": "competitor-1",
+            "user_id": "company-a",
+            "website_url": "https://example.com",
+        }
+        classifier = _RecordingClassifier()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(competitor),
+            _FakeTargetRepository(),
+            fallback_classifier=classifier,
+            robots_source=_Robots(),
+            sitemap_source=_Source(),
+            link_source=_Source(
+                (
+                    DiscoveredURL(
+                        "https://example.com/our-expertise/insights",
+                        "LINKS",
+                        "Insights",
+                        priority=3,
+                    ),
+                )
+            ),
+            liveness_checker=lambda url: True,
+        )
+
+        service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(len(classifier.batches), 1)
+        self.assertEqual(
+            [c.url for c in classifier.batches[0]],
+            ["https://example.com/our-expertise/insights"],
+        )
 
     def test_discovery_run_status_tracks_success_even_when_zero_candidates_persisted(self):
         run_tracker = _FakeDiscoveryRunTracker()
@@ -1536,13 +2428,13 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(persisted[0]["url"], "https://example.com/ambiguous")
         self.assertEqual(persisted[0]["page_type"], "OTHER")
         self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
-        self.assertEqual(persisted[0]["classification_method"], "LLM")
+        self.assertEqual(persisted[0]["classification_method"], "FALLBACK")
 
     def test_discovery_service_defaults_to_stub_when_provider_is_unconfigured(self):
         target_repository = _FakeTargetRepository()
         with patch(
-            "backend.flask.discovery.service.OpenAIClassifier.from_env",
-            side_effect=OpenAIClassifierConfigurationError("OPENAI_KEY is not configured"),
+            "backend.flask.discovery.service.build_classifier_from_env",
+            side_effect=ClassifierConfigurationError("OPENAI_KEY is not configured"),
         ):
             service = DiscoveryService(
                 _FakeCompetitorRepository(
@@ -1615,6 +2507,51 @@ class DiscoveryTests(unittest.TestCase):
             ],
         )
         self.assertEqual(persisted[0]["url"], "https://elevationmarketing.au/blog-posts")
+        self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
+        self.assertEqual(persisted[0]["classification_method"], "RULE")
+
+    def test_liveness_gate_discards_soft_404_via_page_title(self):
+        # Mirrors marketingeye.com.au/press-releases: returns HTTP 200 (so a
+        # status-code-only liveness check sees it as "alive"), but the site
+        # redirected it to a real error page titled "Page Not Found". Only
+        # inspecting the fetched content catches this.
+        press_releases_url = "https://example.com/press-releases"
+        liveness_calls = []
+
+        def soft_404_liveness(url):
+            liveness_calls.append(url)
+            return fetch_page(
+                url,
+                http_fetcher=lambda _: HttpResponse(
+                    "<html><head><title>Page Not Found - Example</title></head>"
+                    "<body>We can't find that page.</body></html>",
+                    200,
+                    {"Content-Type": "text/html"},
+                ),
+            )
+
+        target_repository = _FakeTargetRepository()
+        service = DiscoveryService(
+            _FakeCompetitorRepository(
+                {
+                    "id": "competitor-1",
+                    "user_id": "company-a",
+                    "website_url": "https://example.com",
+                }
+            ),
+            target_repository,
+            fallback_classifier=DeterministicStubClassifier(),
+            robots_source=_Robots(),
+            sitemap_source=_Source((DiscoveredURL(press_releases_url, "SITEMAP"),)),
+            link_source=_Source(),
+            liveness_checker=soft_404_liveness,
+            liveness_sleep=lambda _: None,
+        )
+
+        persisted = service.discover_website("competitor-1", user_id="company-a")
+
+        self.assertEqual(liveness_calls, [press_releases_url])
+        self.assertEqual(persisted[0]["url"], press_releases_url)
         self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
         self.assertEqual(persisted[0]["classification_method"], "RULE")
 

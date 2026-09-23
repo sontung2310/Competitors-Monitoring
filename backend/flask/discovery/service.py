@@ -30,9 +30,9 @@ from .audit import (
 from .classification import (
     CandidateClassifier,
     CandidateForClassification,
+    ClassifierConfigurationError,
     DeterministicStubClassifier,
-    OpenAIClassifier,
-    OpenAIClassifierConfigurationError,
+    build_classifier_from_env,
     classify_by_rules,
     classify_candidates,
     resolve_classifier_batch_size,
@@ -41,13 +41,16 @@ from .normalization import (
     ITEM_TYPE_EXCLUSION_PATTERNS,
     canonicalize_raw_url,
     discovery_scope,
+    has_recognized_final_segment,
     is_html_candidate_url,
     is_item_type_excluded,
     is_same_site,
     is_system_path,
     is_structural_path,
     extract_meta_description,
+    extract_page_title,
     normalize_url,
+    strip_known_extension,
 )
 from .sources import (
     DiscoveredURL,
@@ -355,19 +358,14 @@ class DiscoveryService:
         if candidate.get("active") and candidate.get("discovery_status") == "ACTIVE":
             return candidate
 
-        activation_updates = {
-            "active": True,
-            "discovery_status": "ACTIVE",
-        }
+        check_interval_minutes = None
         if not _has_positive_interval(candidate.get("check_interval_minutes")):
-            activation_updates["check_interval_minutes"] = (
-                default_check_interval_minutes(candidate.get("page_type"))
-            )
+            check_interval_minutes = default_check_interval_minutes(candidate.get("page_type"))
 
-        updated = self.monitoring_target_repository.update(
+        updated = self.monitoring_target_repository.mark_activated(
             candidate_id,
-            activation_updates,
             competitor_id=candidate.get("competitor_id"),
+            check_interval_minutes=check_interval_minutes,
         )
         if updated is None:
             raise DiscoveryError(f"candidate {candidate_id!r} could not be activated")
@@ -543,9 +541,8 @@ class DiscoveryService:
             )
         if candidate.get("discovery_status") == "DISCARDED":
             return candidate
-        updated = self.monitoring_target_repository.update(
+        updated = self.monitoring_target_repository.mark_discarded(
             candidate_id,
-            {"active": False, "discovery_status": "DISCARDED"},
             competitor_id=candidate.get("competitor_id"),
         )
         if updated is None:
@@ -765,12 +762,18 @@ class DiscoveryService:
             suggested_urls = set(self.last_discovered_suggested_urls)
             # The second-pass audit may discard a first-pass suggestion.  Its
             # persisted state is the final decision used by reconciliation.
-            suggested_urls.difference_update(
+            # The discard set is fully materialized before mutating
+            # suggested_urls: passing a generator that still iterates
+            # suggested_urls straight into its own difference_update() raises
+            # "Set changed size during iteration" once anything is actually
+            # removed.
+            discarded_suggested_urls = {
                 url
                 for url in suggested_urls
                 if persisted_by_url.get(url, {}).get("discovery_status")
                 == "DISCARDED"
-            )
+            }
+            suggested_urls.difference_update(discarded_suggested_urls)
 
             for candidate in persisted:
                 if (
@@ -886,17 +889,21 @@ class DiscoveryService:
         )
 
         fetched_meta_descriptions: dict[str, str | None] = {}
+        soft_404_urls: set[str] = set()
 
         def liveness_checker(url: str) -> FetchResult | bool:
             result = self.liveness_checker(url)
             if isinstance(result, FetchResult):
                 fetched_meta_descriptions[url] = extract_meta_description(result.content)
+                if _looks_like_error_page(result.content):
+                    soft_404_urls.add(url)
             return result
 
         normalized = [
             replace(
                 candidate,
                 meta_description=fetched_meta_descriptions.get(candidate.url),
+                force_discarded=candidate.force_discarded or candidate.url in soft_404_urls,
             )
             for candidate in _apply_liveness_gate(
                 normalized,
@@ -1209,7 +1216,7 @@ def _normalize_candidate_status(status: str) -> str:
 
 
 def _default_classifier() -> CandidateClassifier:
-    """Use configured OpenAI classification without making configuration fatal.
+    """Use the configured candidate classifier without making configuration fatal.
 
     Discovery remains usable in environments without an API key. Runtime
     provider failures are handled by ``classify_candidates``; configuration
@@ -1217,14 +1224,14 @@ def _default_classifier() -> CandidateClassifier:
     """
 
     try:
-        return OpenAIClassifier.from_env()
-    except OpenAIClassifierConfigurationError as exc:
+        return build_classifier_from_env()
+    except ClassifierConfigurationError as exc:
         logger.warning(
-            "OpenAI candidate classifier is unavailable; using deterministic "
+            "candidate classifier is unavailable; using deterministic "
             "discarded fallback: %s",
             exc,
         )
-        return DeterministicStubClassifier()
+        return DeterministicStubClassifier(classification_method="FALLBACK")
 
 
 def _default_discovery_audit() -> DiscoveryAuditClassifier:
@@ -1288,9 +1295,13 @@ _REDUNDANCY_HEDGE_TERMS = (
     "could be",
     "might be",
     "may be",
-    "appears to",
     "unless",
 )
+# Deliberately excludes "appears to": it's common phrasing for a confidently
+# reasoned conclusion (e.g. "appears to be a duplicate/error page, as it
+# lacks unique content"), not necessarily genuine uncertainty like the terms
+# above -- treating it as a hedge was rejecting well-evidenced redundancy
+# flags (e.g. a soft-404 duplicate) for the wrong reason.
 
 
 def _is_high_confidence_redundancy(reason: str) -> bool:
@@ -1323,6 +1334,14 @@ def _has_structural_redundancy(
             continue
         if candidate.path == other.path and candidate.query != other.query:
             return True
+        # Same page, different extension convention (e.g. /press-releases vs
+        # /press-releases.html) -- an extension-stripped exact match is a
+        # strong, narrow structural signal, not the "same segment count"
+        # coincidence the flat-vs-hub check below deliberately excludes.
+        if _path_without_known_extension(candidate.path) == _path_without_known_extension(
+            other.path
+        ):
+            return True
         other_path = [part for part in other.path.split("/") if part]
         if not candidate_path or not other_path or len(candidate_path) == len(other_path):
             continue
@@ -1334,6 +1353,15 @@ def _has_structural_redundancy(
         if longer[: len(shorter)] == shorter or longer[-len(shorter) :] == shorter:
             return True
     return False
+
+
+def _path_without_known_extension(path: str) -> str:
+    """A URL path with a known page extension stripped from its last segment."""
+
+    segments = path.split("/")
+    if segments:
+        segments[-1] = strip_known_extension(segments[-1].lower())
+    return "/".join(segments)
 
 
 def _candidate_url_for_competitor(url: str, competitor_url: str) -> str:
@@ -1392,13 +1420,17 @@ def _normalize_and_dedupe(
                 continue
             force_discarded = (
                 candidate.force_discarded
-                or discovery_scope(raw_url) == "UNMATCHED"
+                or (
+                    discovery_scope(raw_url) == "UNMATCHED"
+                    and not has_recognized_final_segment(raw_url)
+                )
                 or is_item_type_excluded(raw_url)
             )
             if (
                 candidate.source == "LINKS"
                 and candidate.priority >= 2
                 and not is_structural_path(raw_url)
+                and not has_recognized_final_segment(raw_url)
             ):
                 force_discarded = True
             url = normalize_url(raw_url)
@@ -1558,6 +1590,34 @@ def _confirm_liveness(
 
 def _is_confirmable_dead_status(status: Any) -> bool:
     return isinstance(status, int) and status in {404, 410}
+
+
+_ERROR_PAGE_TITLE_PATTERNS = (
+    "page not found",
+    "404",
+    "not found",
+    "page doesn't exist",
+    "page does not exist",
+    "cannot be found",
+    "can't be found",
+)
+
+
+def _looks_like_error_page(html: str) -> bool:
+    """Deterministic "soft 404" detection: some sites redirect a dead link to
+    a real page that still returns HTTP 200 (e.g.
+    marketingeye.com.au/press-releases -> /404.html, titled "Page Not Found -
+    Marketing Eye"), so a status-code-only liveness check can never catch it.
+    The title is a curated, low-noise signal for this -- checking the full
+    body for "404" would false-positive on ordinary street addresses, SKUs,
+    or an article genuinely about HTTP status codes.
+    """
+
+    title = extract_page_title(html)
+    if not title:
+        return False
+    normalized = title.casefold()
+    return any(pattern in normalized for pattern in _ERROR_PAGE_TITLE_PATTERNS)
 
 
 def _canonicalize_for_site(url: str, site_url: str) -> str:

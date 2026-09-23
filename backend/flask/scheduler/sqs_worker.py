@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import os
 from collections.abc import Mapping
@@ -13,6 +14,7 @@ from typing import Any, Callable
 from backend.flask.database.base_repository import utc_now
 
 from .sqs_handler import MessageValidationError, handle_message, parse_message
+from .strategy_lookup import StrategyLookupService
 
 
 WAIT_TIME_SECONDS = 20
@@ -214,21 +216,55 @@ def run_worker_forever(
             event.wait(1.0)
 
 
+@dataclass(frozen=True)
+class SqsQueuePublisher:
+    """Re-publishes a message onto the same production queue (multi-competitor fan-out)."""
+
+    sqs_client: Any
+    queue_url: str
+
+    def publish(self, message: Mapping[str, Any]) -> None:
+        self.sqs_client.send_message(
+            QueueUrl=self.queue_url,
+            MessageBody=json.dumps(dict(message), sort_keys=True),
+        )
+
+
 def build_application_services() -> Mapping[str, Any]:
-    """Build the normal repository-backed service graph for the process entry point."""
+    """Build the production service graph for the process entry point.
 
-    from backend.flask.app import create_app
+    Per docs/production-plan.md section 5: monitoring_targets/snapshots come
+    from DynamoDB and changes from the external RM MongoDB database, while
+    companies/competitors/monitoring_runs/discovery_runs are unaffected and
+    still come from this application's own MongoDB database (see
+    ``production_services.build_production_services``). ``strategy_lookup``
+    is added on top (a pure MongoDB read, safe to construct without AWS
+    credentials). ``queue_publisher`` is deliberately not included here since
+    it needs a live SQS client/queue URL; see ``build_worker_services``.
+    """
 
-    app = create_app()
-    return app.extensions["api_services"]
+    from .production_services import build_production_services
+
+    services = dict(build_production_services())
+    services["strategy_lookup"] = StrategyLookupService()
+    return services
+
+
+def build_worker_services(sqs_client: Any, queue_url: str) -> Mapping[str, Any]:
+    """Build the full service graph the SQS worker process needs, publisher included."""
+
+    services = dict(build_application_services())
+    services["queue_publisher"] = SqsQueuePublisher(sqs_client, queue_url)
+    return services
 
 
 def main() -> int:
     config = load_worker_config()
+    sqs_client = create_sqs_client(config)
     run_worker_forever(
-        build_application_services(),
+        build_worker_services(sqs_client, config.queue_url),
         config=config,
-        sqs_client=create_sqs_client(config),
+        sqs_client=sqs_client,
     )
     return 0
 
@@ -247,8 +283,10 @@ __all__ = [
     "RecordResult",
     "SQSConfigurationError",
     "SQSWorkerConfig",
+    "SqsQueuePublisher",
     "WAIT_TIME_SECONDS",
     "build_application_services",
+    "build_worker_services",
     "create_sqs_client",
     "load_worker_config",
     "main",

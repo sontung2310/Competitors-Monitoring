@@ -348,6 +348,39 @@ class MonitoringTargetRepository(BaseMongoRepository):
             query["competitor_id"] = to_object_id(competitor_id)
         return self._deleted(self.collection.delete_one(query))
 
+    def mark_activated(
+        self,
+        target_id: Any,
+        *,
+        competitor_id: Optional[Any] = None,
+        check_interval_minutes: Optional[int] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Thin wrapper so ``discovery.service.activate_candidate`` can call an
+        explicit lifecycle transition instead of a raw field update — kept
+        here, rather than folded into ``update()``, so a DynamoDB-backed
+        repository can give the same call a completely different meaning
+        (see ``website_monitoring/dynamodb_repository.py``)."""
+
+        updates: dict[str, Any] = {"active": True, "discovery_status": "ACTIVE"}
+        if check_interval_minutes is not None:
+            updates["check_interval_minutes"] = check_interval_minutes
+        return self.update(target_id, updates, competitor_id=competitor_id)
+
+    def mark_discarded(
+        self,
+        target_id: Any,
+        *,
+        competitor_id: Optional[Any] = None,
+    ) -> Optional[dict[str, Any]]:
+        """Thin wrapper so ``discovery.service.discard_candidate`` can call an
+        explicit lifecycle transition instead of a raw field update."""
+
+        return self.update(
+            target_id,
+            {"active": False, "discovery_status": "DISCARDED"},
+            competitor_id=competitor_id,
+        )
+
 
 class MonitoringRunRepository(BaseMongoRepository):
     """Persistence operations for the ``monitoring_runs`` collection."""

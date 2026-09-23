@@ -19,7 +19,9 @@ from xml.etree import ElementTree
 from .normalization import (
     canonicalize_raw_url,
     discovery_scope,
+    has_recognized_final_segment,
     is_html_candidate_url,
+    is_locale_segment,
     is_same_site,
     is_structural_path,
     extract_meta_description,
@@ -151,15 +153,21 @@ class SitemapSource:
         max_sitemaps: int = 50,
         max_depth: int = 2,
         large_sitemap_threshold: int = 50,
-        sample_urls_per_large_sitemap: int = 5,
+        sample_urls_per_large_sitemap: int = 20,
+        recency_sample_limit: int = 50,
     ):
-        if large_sitemap_threshold < 1 or sample_urls_per_large_sitemap < 1:
+        if (
+            large_sitemap_threshold < 1
+            or sample_urls_per_large_sitemap < 1
+            or recency_sample_limit < 1
+        ):
             raise ValueError("sitemap sampling settings must be positive")
         self.fetcher = fetcher
         self.max_sitemaps = max_sitemaps
         self.max_depth = max_depth
         self.large_sitemap_threshold = large_sitemap_threshold
         self.sample_urls_per_large_sitemap = sample_urls_per_large_sitemap
+        self.recency_sample_limit = recency_sample_limit
         self.last_stats = SourceStats("SITEMAP", 0, 0)
 
     def discover(
@@ -195,13 +203,19 @@ class SitemapSource:
                 continue
             kind, locations = parse_sitemap(response.text)
             if kind == "sitemapindex" and depth < self.max_depth:
+                absolute_locations = tuple(
+                    urljoin(response.url, location) for location in locations
+                )
                 queue.extend(
-                    (urljoin(response.url, location), depth + 1)
-                    for location in locations
+                    (location, depth + 1)
+                    for location in _select_region_preferred_locations(absolute_locations)
                 )
                 continue
+            lastmods = parse_sitemap_lastmods(response.text) if kind == "urlset" else {}
             sitemap_candidates, sitemap_raw_urls, sitemap_sampled_count = (
-                self._normalize_sitemap_locations(website_url, response.url, locations)
+                self._normalize_sitemap_locations(
+                    website_url, response.url, locations, lastmods
+                )
             )
             candidates.extend(sitemap_candidates)
             raw_urls.update(sitemap_raw_urls)
@@ -220,9 +234,11 @@ class SitemapSource:
         website_url: str,
         response_url: str,
         locations: Sequence[str],
+        lastmods: Mapping[str, str] = {},
     ) -> tuple[list[DiscoveredURL], set[str], int]:
         structural_urls: dict[str, str] = {}
         unmatched_urls: dict[str, str] = {}
+        unmatched_lastmods: dict[str, str] = {}
         raw_urls: set[str] = set()
         for location in locations:
             try:
@@ -241,6 +257,8 @@ class SitemapSource:
                 else structural_urls
             )
             target.setdefault(raw_url, raw_url)
+            if target is unmatched_urls and location in lastmods:
+                unmatched_lastmods.setdefault(raw_url, lastmods[location])
 
         # Sampling happens on raw sitemap locations, before normalization. Every
         # candidate emitted below is therefore normalized and classified by the
@@ -249,10 +267,22 @@ class SitemapSource:
         sampled_raw_urls = list(unmatched_urls.values())
         sampled_count = 0
         if len(locations) > self.large_sitemap_threshold:
-            sampled_raw_urls = _evenly_sample(
-                sampled_raw_urls,
-                self.sample_urls_per_large_sitemap,
-            )
+            if len(unmatched_lastmods) == len(unmatched_urls) and unmatched_urls:
+                # Every uncertain URL in this file declares <lastmod> --
+                # prefer the freshest content over an arbitrary even spread.
+                # Deliberately conservative: any file that doesn't fully
+                # follow this schema falls through to even-sampling instead,
+                # rather than guessing at missing dates.
+                sampled_raw_urls = sorted(
+                    unmatched_urls.values(),
+                    key=lambda url: unmatched_lastmods[url],
+                    reverse=True,
+                )[: self.recency_sample_limit]
+            else:
+                sampled_raw_urls = _evenly_sample(
+                    sampled_raw_urls,
+                    self.sample_urls_per_large_sitemap,
+                )
             sampled_count = len(sampled_raw_urls)
 
         candidates: list[DiscoveredURL] = []
@@ -267,6 +297,7 @@ class SitemapSource:
                     source="SITEMAP",
                     force_discarded=(
                         discovery_scope(raw_url) == "UNMATCHED"
+                        and not has_recognized_final_segment(raw_url)
                     ),
                     priority=1,
                 )
@@ -292,15 +323,64 @@ def parse_sitemap(text: str) -> tuple[str, tuple[str, ...]]:
     return kind, locations
 
 
-class InternalLinkSource:
-    """Collect same-site links from the homepage at depth 1.
+def parse_sitemap_lastmods(text: str) -> dict[str, str]:
+    """Map each ``<loc>`` to its sibling ``<lastmod>`` in a ``urlset`` document.
 
-    Links in navigation/header/footer are returned before body links. No child
-    pages are fetched by this source, keeping Layer 1 discovery shallow.
+    Only ``<url>`` entries that declare both are included -- a caller that
+    needs "does every location in this file have a lastmod" gets that by
+    comparing the returned mapping's size against the location count itself,
+    rather than this function silently guessing or filling gaps. A
+    ``sitemapindex`` document (which lists other sitemaps, not pages) never
+    populates anything here.
     """
 
-    def __init__(self, fetcher: Fetcher):
+    try:
+        root = ElementTree.fromstring(text)
+    except ElementTree.ParseError:
+        return {}
+    if _local_name(root.tag) != "urlset":
+        return {}
+    lastmods: dict[str, str] = {}
+    for url_element in root:
+        if _local_name(url_element.tag) != "url":
+            continue
+        loc: str | None = None
+        lastmod: str | None = None
+        for child in url_element:
+            name = _local_name(child.tag)
+            if name == "loc" and child.text and child.text.strip():
+                loc = child.text.strip()
+            elif name == "lastmod" and child.text and child.text.strip():
+                lastmod = child.text.strip()
+        if loc and lastmod:
+            lastmods[loc] = lastmod
+    return lastmods
+
+
+class InternalLinkSource:
+    """Breadth-first crawl of same-site links, starting from the homepage.
+
+    Links in navigation/header/footer are prioritized over body links (see
+    ``_LinkParser``). Bounded two ways: ``max_depth`` (a link found on a page
+    at depth N is collected as a level-(N+1) candidate, and that page itself
+    is only fetched for its own links if N+1 is still below max_depth -- so
+    max_depth=3 fetches pages through depth 2 and collects candidates through
+    depth 3) and ``max_pages`` (a hard cap on how many pages this source
+    ever fetches, checked before every fetch -- the actual cost control).
+    """
+
+    def __init__(
+        self,
+        fetcher: Fetcher,
+        *,
+        max_depth: int = 3,
+        max_pages: int = 100,
+    ):
+        if max_depth < 1 or max_pages < 1:
+            raise ValueError("link crawl settings must be positive")
         self.fetcher = fetcher
+        self.max_depth = max_depth
+        self.max_pages = max_pages
         self.last_stats = SourceStats("LINKS", 0, 0)
         self.last_homepage_metadata: dict[str, str | None] = {
             "title": None,
@@ -310,43 +390,62 @@ class InternalLinkSource:
     def discover(self, website_url: str) -> tuple[DiscoveredURL, ...]:
         homepage = _root_resource_url(website_url, "")
         self.last_homepage_metadata = {"title": None, "meta_description": None}
-        try:
-            response = self.fetcher.fetch(homepage)
-        except DiscoveryFetchError:
-            self.last_stats = SourceStats("LINKS", 0, 0)
-            return ()
-        if response.status >= 400:
-            self.last_stats = SourceStats("LINKS", 0, 0)
-            return ()
 
-        self.last_homepage_metadata = {
-            "title": extract_page_title(response.text),
-            "meta_description": extract_meta_description(response.text),
-        }
+        visited: set[str] = set()
+        candidates_by_url: dict[str, DiscoveredURL] = {}
+        queue: list[tuple[str, int]] = [(homepage, 0)]
+        fetched_count = 0
 
-        parser = _LinkParser()
-        parser.feed(response.text)
-        candidates: list[DiscoveredURL] = []
-        canonical_homepage = canonicalize_raw_url(response.url)
-        for href, title, priority in parser.links:
+        while queue and fetched_count < self.max_pages:
+            url, depth = queue.pop(0)
             try:
-                candidate_url = canonicalize_raw_url(urljoin(response.url, href))
+                canonical_url = canonicalize_raw_url(url)
             except ValueError:
                 continue
-            if (
-                is_same_site(website_url, candidate_url)
-                and candidate_url != canonical_homepage
-                and is_html_candidate_url(candidate_url)
-            ):
-                candidates.append(
-                    DiscoveredURL(
+            if canonical_url in visited:
+                continue
+            visited.add(canonical_url)
+
+            try:
+                response = self.fetcher.fetch(url)
+            except DiscoveryFetchError:
+                continue
+            fetched_count += 1
+            if response.status >= 400:
+                continue
+
+            if depth == 0:
+                self.last_homepage_metadata = {
+                    "title": extract_page_title(response.text),
+                    "meta_description": extract_meta_description(response.text),
+                }
+
+            parser = _LinkParser()
+            parser.feed(response.text)
+            canonical_page = canonicalize_raw_url(response.url)
+            for href, title, priority in parser.links:
+                try:
+                    candidate_url = canonicalize_raw_url(urljoin(response.url, href))
+                except ValueError:
+                    continue
+                if not (
+                    is_same_site(website_url, candidate_url)
+                    and candidate_url != canonical_page
+                    and is_html_candidate_url(candidate_url)
+                ):
+                    continue
+                existing = candidates_by_url.get(candidate_url)
+                if existing is None or priority < existing.priority:
+                    candidates_by_url[candidate_url] = DiscoveredURL(
                         candidate_url,
                         "LINKS",
                         title or None,
                         priority=priority,
                     )
-                )
-        normalized_candidates = dedupe_discovered_urls(candidates)
+                if depth + 1 < self.max_depth and candidate_url not in visited:
+                    queue.append((candidate_url, depth + 1))
+
+        normalized_candidates = dedupe_discovered_urls(list(candidates_by_url.values()))
         normalized_candidates.sort(key=lambda candidate: candidate.priority)
         normalized_urls = set()
         for candidate in normalized_candidates:
@@ -478,6 +577,63 @@ def _dedupe_strings(values: Sequence[str]) -> tuple[str, ...]:
             seen.add(value)
             result.append(value)
     return tuple(result)
+
+
+def _select_region_preferred_locations(
+    locations: Sequence[str],
+) -> Sequence[str]:
+    """Prefer an Australia-specific sub-sitemap in a multi-region sitemap
+    index, so per-file candidate sampling (see ``_normalize_sitemap_locations``)
+    isn't diluted across dozens of irrelevant countries.
+
+    - Any location with an "au" locale token (``kpmg.com/au/en/sitemap.xml``)
+      -> only those are followed.
+    - Else, only when at least two sibling locations look locale-tagged at
+      all (a deliberate margin above "at least one", so a single incidental
+      2-letter word can't misfire) -> prefer the locale-free location(s)
+      (``oliverwyman.com/en-sitemap.xml`` versus its ``in/en-in-sitemap.xml``).
+    - Else (no real locale split -- either a single-market site, or a
+      content-taxonomy index like openai.com's ``/api/``, ``/chatgpt/``,
+      ``/company/``) -> every location is followed, unchanged.
+    - If neither an AU match nor a locale-free default exists (every
+      location is some other locale, e.g. Oliver Wyman has no AU
+      sub-sitemap and even its "default" filename carries a language
+      prefix), fall back to the full, unfiltered list rather than crawling
+      nothing.
+    """
+
+    tokens_by_location = {location: _locale_tokens(location) for location in locations}
+
+    au_matches = [
+        location
+        for location, tokens in tokens_by_location.items()
+        if "au" in tokens
+    ]
+    if au_matches:
+        return au_matches
+
+    locale_like_count = sum(1 for tokens in tokens_by_location.values() if tokens)
+    if locale_like_count < 2:
+        return locations
+
+    defaults = [location for location, tokens in tokens_by_location.items() if not tokens]
+    return defaults or locations
+
+
+def _locale_tokens(location: str) -> tuple[str, ...]:
+    """Locale-shaped tokens (see ``normalization.is_locale_segment``) found
+    in a sitemap location's path segments and hyphen-separated filename."""
+
+    path = urlsplit(location).path
+    tokens: list[str] = []
+    for segment in path.split("/"):
+        if not segment:
+            continue
+        stem = segment.rsplit(".", 1)[0] if "." in segment else segment
+        for token in stem.split("-"):
+            if token and is_locale_segment(token):
+                tokens.append(token.lower())
+    return tuple(tokens)
 
 
 def _is_non_content_sitemap(sitemap_url: str) -> bool:

@@ -27,6 +27,7 @@ checked-off roadmap item. This is process tooling, not a roadmap feature.
   - [x] LLM classification fallback for unresolved candidates only — batched per competitor, structured JSON output, cheap model (gpt-5-nano)
   - [x] persist candidates with discovery_status (SUGGESTED/DISCARDED) and classification_method (RULE/LLM)
   - [x] 1.2b real OpenAI CandidateClassifier fallback (TON-25; the original gpt-5-nano placeholder is superseded by configurable OpenAI gpt-4o via the shared provider; provider failures retain deterministic DISCARDED fallback behavior)
+  - [x] 1.2c Open-Jev discovery-classifier provider (TON-46; configurable HTTP adapter, typed-choice validation, confidence gating, JEV/FALLBACK persistence, and regression coverage)
 - [x] 1.3 Layer 1 UX support (backend service): expose SUGGESTED candidates for review; keep DISCARDED accessible, not deleted
 - [x] 1.3b Candidate CRUD service operations: activate suggested candidate, manually add/edit/remove through the normal repository layer (HTTP endpoints are wired in Step 2.3)
 - [x] 1.3c Reactivate discarded candidates in the review UI and sort Suggested/Active/Discarded lists by most-recently-changed (`updated_at`) (TON-32; reactivation reuses the existing liveness-gated manual-target promotion path)

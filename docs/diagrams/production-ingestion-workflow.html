@@ -1,0 +1,452 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Production ingestion workflow</title>
+  <link href="https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Geist:wght@400;500;600&family=Geist+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    :root {
+      --color-paper:   #f5f5f5;
+      --color-ink:     #2d3142;
+      --color-muted:   #4f5d75;
+      --color-soft:    #7a8399;
+      --color-accent:  #eb6c36;
+      --color-link:    #2e5aa8;
+      --font-sans:     'Geist', system-ui, sans-serif;
+      --font-serif:    'Instrument Serif', serif;
+      --font-mono:     'Geist Mono', ui-monospace, monospace;
+    }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--color-paper);
+      color: var(--color-ink);
+      min-height: 100vh;
+      display: flex;
+      align-items: flex-start;
+      justify-content: center;
+      padding: 3rem 2rem 4rem;
+    }
+
+    .frame { max-width: 1680px; width: 100%; }
+
+    .eyebrow {
+      font-family: var(--font-mono);
+      font-size: 0.66rem;
+      font-weight: 500;
+      letter-spacing: 0.18em;
+      text-transform: uppercase;
+      color: var(--color-muted);
+      margin-bottom: 0.5rem;
+    }
+
+    h1 {
+      font-family: var(--font-serif);
+      font-size: clamp(1.5rem, 2.4vw + 0.75rem, 2rem);
+      font-weight: 400;
+      letter-spacing: -0.02em;
+      line-height: 1.15;
+      color: var(--color-ink);
+      margin-bottom: 0.5rem;
+    }
+
+    .subtitle {
+      font-size: 0.95rem;
+      color: var(--color-muted);
+      margin-bottom: 1.5rem;
+      max-width: 54rem;
+      line-height: 1.45;
+    }
+
+    .subtitle code {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--color-ink);
+    }
+
+    .diagram-scroll {
+      width: 100%;
+      overflow-x: auto;
+      border: 1px solid rgba(45,49,66,0.10);
+      border-radius: 8px;
+      background: #f5f5f5;
+    }
+
+    svg { width: 1680px; max-width: none; display: block; }
+
+    .cards {
+      display: grid;
+      grid-template-columns: 1.15fr 1fr 1fr 0.9fr;
+      gap: 1rem;
+      margin-top: 1.75rem;
+    }
+
+    .card pre {
+      font-family: var(--font-mono);
+      font-size: 0.72rem;
+      line-height: 1.45;
+      color: var(--color-ink);
+      background: rgba(45,49,66,0.04);
+      border-radius: 6px;
+      padding: 0.65rem 0.75rem;
+      margin-top: 0.5rem;
+      overflow-x: auto;
+      white-space: pre;
+    }
+
+    .card {
+      border: 1px solid rgba(45,49,66,0.12);
+      border-radius: 8px;
+      padding: 1rem 1.1rem;
+      background: #fff;
+    }
+
+    .card .eyebrow { margin-bottom: 0.4rem; }
+
+    .card h3 {
+      font-size: 1rem;
+      font-weight: 600;
+      margin-bottom: 0.45rem;
+    }
+
+    .card p {
+      font-size: 0.88rem;
+      color: var(--color-muted);
+      line-height: 1.45;
+    }
+
+    .card.focal {
+      border-color: var(--color-accent);
+      background: rgba(235,108,54,0.06);
+    }
+
+    .card code {
+      font-family: var(--font-mono);
+      font-size: 0.78rem;
+      color: var(--color-ink);
+    }
+
+    footer {
+      margin-top: 1.75rem;
+      padding-top: 0.85rem;
+      border-top: 1px solid rgba(45,49,66,0.12);
+      font-family: var(--font-mono);
+      font-size: 0.7rem;
+      color: var(--color-soft);
+      letter-spacing: 0.04em;
+    }
+  </style>
+</head>
+<body>
+  <div class="frame">
+    <p class="eyebrow">Architecture · Diagram Design</p>
+    <h1>Production competitor ingestion</h1>
+    <p class="subtitle">
+      Two resolution paths after the worker reads the message:
+      <code>competitor_lst</code> empty (Case A) vs filled (Case B).
+      Both paths reunite on a URL set, then fan out or process one competitor.
+    </p>
+
+    <div class="diagram-scroll">
+    <svg viewBox="0 0 1680 960" xmlns="http://www.w3.org/2000/svg" role="img" aria-labelledby="prod-ingest-title prod-ingest-desc">
+      <title id="prod-ingest-title">Production competitor ingestion — empty vs filled competitor_lst</title>
+      <desc id="prod-ingest-desc">
+        Spacious horizontal workflow with Case A empty-list RM lookup and Case B filled-list filtering,
+        merging into route and storage blocks with clear gaps between every zone and label.
+      </desc>
+
+      <defs>
+        <marker id="arrow" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#4f5d75"/>
+        </marker>
+        <marker id="arrow-accent" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#eb6c36"/>
+        </marker>
+        <marker id="arrow-link" markerWidth="8" markerHeight="6" refX="7" refY="3" orient="auto">
+          <polygon points="0 0, 8 3, 0 6" fill="#2e5aa8"/>
+        </marker>
+      </defs>
+
+      <rect width="100%" height="100%" fill="#f5f5f5"/>
+
+      <!-- INPUT SCHEMA panel (above INGEST) -->
+      <rect x="40" y="40" width="300" height="280" rx="8"
+            fill="#ffffff" stroke="rgba(45,49,66,0.18)" stroke-width="1"/>
+      <rect x="128" y="48" width="100" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="178" y="57" fill="rgba(45,49,66,0.45)" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">INPUT SCHEMA</text>
+
+      <text x="56" y="88" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif">SQS message body</text>
+      <text x="56" y="108" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace">JSON · three fields</text>
+
+      <rect x="56" y="124" width="268" height="176" rx="6"
+            fill="rgba(45,49,66,0.04)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="68" y="148" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">{</text>
+      <text x="80" y="168" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">"company_domain_id": "…",</text>
+      <text x="80" y="188" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">"competitor_lst": [ … ] | null,</text>
+      <text x="80" y="208" fill="#2d3142" font-size="10" font-family="'Geist Mono', monospace">"host": "dev" | "prod"</text>
+      <text x="68" y="228" fill="#4f5d75" font-size="10" font-family="'Geist Mono', monospace">}</text>
+      <text x="68" y="256" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">domain = client tenant</text>
+      <text x="68" y="272" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">list empty → Case A · else Case B</text>
+      <text x="68" y="288" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace">host omitted → defaults to "dev"</text>
+
+      <!-- Schema → External -->
+      <path d="M 190,320 V 348 Q 190,356 190,360 V 428"
+            fill="none" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <rect x="148" y="332" width="84" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="190" y="341" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MESSAGE BODY</text>
+
+      <!-- Zones with 80px+ gutters between blocks -->
+      <rect x="40" y="360" width="300" height="200" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="156" y="368" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="180" y="377" fill="rgba(45,49,66,0.40)" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">INGEST</text>
+
+      <rect x="420" y="40" width="400" height="240" rx="8"
+            fill="rgba(235,108,54,0.04)" stroke="rgba(235,108,54,0.35)" stroke-width="0.8"/>
+      <rect x="540" y="48" width="140" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="610" y="57" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">CASE A · LIST EMPTY</text>
+
+      <rect x="420" y="640" width="400" height="240" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="536" y="648" width="148" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="610" y="657" fill="rgba(45,49,66,0.45)" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">CASE B · LIST FILLED</text>
+
+      <rect x="900" y="280" width="320" height="360" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="1024" y="288" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1048" y="297" fill="rgba(45,49,66,0.40)" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">ROUTE</text>
+
+      <rect x="1300" y="220" width="340" height="480" rx="8"
+            fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <rect x="1436" y="228" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1468" y="237" fill="rgba(45,49,66,0.40)" font-size="7" font-family="'Geist Mono', monospace"
+            text-anchor="middle" letter-spacing="0.14em">STORAGE</text>
+
+      <!-- Connectors -->
+      <line x1="212" y1="460" x2="252" y2="460" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+      <path d="M 340,440 V 160 Q 340,152 348,152 H 452"
+            fill="none" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <path d="M 340,480 V 760 Q 340,768 348,768 H 452"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <line x1="620" y1="160" x2="668" y2="160" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+      <line x1="620" y1="768" x2="668" y2="768" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <path d="M 820,160 H 860 Q 868,160 868,168 V 420 Q 868,428 876,428 H 940"
+            fill="none" stroke="#eb6c36" stroke-width="1.4" marker-end="url(#arrow-accent)"/>
+      <path d="M 820,768 H 860 Q 868,768 868,760 V 484 Q 868,476 876,476 H 940"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <path d="M 1012,428 V 360 Q 1012,352 1020,352 H 1044"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <line x1="1084" y1="452" x2="1120" y2="452" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+
+      <path d="M 1044,352 H 180 Q 172,352 172,360 V 428"
+            fill="none" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow)"/>
+
+      <path d="M 1264,452 H 1290 Q 1298,452 1298,444 V 320 Q 1298,312 1306,312 H 1340"
+            fill="none" stroke="#4f5d75" stroke-width="1.2" marker-end="url(#arrow)"/>
+      <path d="M 1264,476 H 1290 Q 1298,476 1298,484 V 560 Q 1298,568 1306,568 H 1340"
+            fill="none" stroke="#2e5aa8" stroke-width="1.2" marker-end="url(#arrow-link)"/>
+
+      <path d="M 748,120 V 16 H 1470 Q 1478,16 1478,24 V 548"
+            fill="none" stroke="#2e5aa8" stroke-width="1" stroke-dasharray="4,3" marker-end="url(#arrow-link)"/>
+
+      <!-- Labels in open gutters only -->
+      <rect x="220" y="436" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="240" y="445" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">PUBLISH</text>
+
+      <rect x="348" y="220" width="56" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="376" y="229" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">EMPTY/NULL</text>
+
+      <rect x="352" y="700" width="48" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="376" y="709" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">HAS URLS</text>
+
+      <rect x="628" y="136" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="648" y="145" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">LOOKUP</text>
+
+      <rect x="628" y="744" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="648" y="753" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">USE LIST</text>
+
+      <rect x="876" y="380" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="896" y="389" fill="#eb6c36" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">MERGE</text>
+
+      <rect x="1016" y="328" width="36" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1034" y="337" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">2+ URLS</text>
+
+      <rect x="1088" y="428" width="28" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1102" y="437" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">1 URL</text>
+
+      <rect x="480" y="332" width="64" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="512" y="341" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">REPUBLISH</text>
+
+      <rect x="1296" y="288" width="40" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1316" y="297" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">WRITE</text>
+
+      <rect x="1296" y="536" width="52" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1322" y="545" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">CHANGES</text>
+
+      <rect x="980" y="0" width="100" height="12" rx="2" fill="#f5f5f5"/>
+      <text x="1030" y="9" fill="#2e5aa8" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.06em">READ RM BY HOST</text>
+
+      <!-- INGEST nodes -->
+      <rect x="56" y="428" width="156" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="56" y="428" width="156" height="64" rx="6" fill="rgba(79,93,117,0.10)" stroke="#7a8399" stroke-width="1"/>
+      <rect x="64" y="436" width="28" height="12" rx="2" fill="transparent" stroke="rgba(122,131,153,0.40)" stroke-width="0.8"/>
+      <text x="78" y="445" fill="#7a8399" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">EXT</text>
+      <text x="134" y="464" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">External</text>
+      <text x="134" y="480" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">publish JSON</text>
+
+      <rect x="252" y="428" width="156" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="252" y="428" width="156" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.4"/>
+      <rect x="260" y="436" width="40" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="280" y="445" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">WORKER</text>
+      <text x="330" y="464" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">SQS + worker</text>
+      <text x="330" y="480" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">poll · parse · branch</text>
+
+      <!-- CASE A -->
+      <rect x="452" y="128" width="168" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="452" y="128" width="168" height="64" rx="6" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1.4"/>
+      <rect x="460" y="136" width="52" height="12" rx="2" fill="transparent" stroke="rgba(235,108,54,0.50)" stroke-width="0.8"/>
+      <text x="486" y="145" fill="#eb6c36" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CASE A</text>
+      <text x="536" y="164" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">List empty</text>
+      <text x="536" y="180" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">null / [ ]</text>
+
+      <rect x="668" y="112" width="128" height="96" rx="6" fill="#f5f5f5"/>
+      <rect x="668" y="112" width="128" height="96" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <rect x="676" y="120" width="56" height="12" rx="2" fill="transparent" stroke="rgba(79,93,117,0.45)" stroke-width="0.8"/>
+      <text x="704" y="129" fill="#4f5d75" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RM READ</text>
+      <text x="732" y="152" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Primary</text>
+      <text x="732" y="168" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">strategy</text>
+      <text x="732" y="186" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">account_company</text>
+      <text x="732" y="200" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">competitors_client</text>
+
+      <!-- CASE B -->
+      <rect x="452" y="736" width="168" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="452" y="736" width="168" height="64" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="460" y="744" width="52" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.35)" stroke-width="0.8"/>
+      <text x="486" y="753" fill="rgba(45,49,66,0.75)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">CASE B</text>
+      <text x="536" y="772" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">List filled</text>
+      <text x="536" y="788" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">explicit URLs</text>
+
+      <rect x="668" y="720" width="128" height="96" rx="6" fill="#f5f5f5"/>
+      <rect x="668" y="720" width="128" height="96" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="676" y="728" width="44" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.35)" stroke-width="0.8"/>
+      <text x="698" y="737" fill="rgba(45,49,66,0.75)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">FILTER</text>
+      <text x="732" y="760" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Keep valid</text>
+      <text x="732" y="776" fill="#2d3142" font-size="11" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">URLs</text>
+      <text x="732" y="794" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">drop bad · dedupe</text>
+
+      <!-- ROUTE -->
+      <rect x="940" y="416" width="144" height="72" rx="6" fill="#f5f5f5"/>
+      <rect x="940" y="416" width="144" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="948" y="424" width="44" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.35)" stroke-width="0.8"/>
+      <text x="970" y="433" fill="rgba(45,49,66,0.75)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">COUNT</text>
+      <text x="1012" y="454" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">URL set size</text>
+      <text x="1012" y="472" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">0 skip · 1 · 2+</text>
+
+      <rect x="1044" y="320" width="152" height="64" rx="6" fill="#f5f5f5"/>
+      <rect x="1044" y="320" width="152" height="64" rx="6" fill="rgba(45,49,66,0.02)" stroke="rgba(45,49,66,0.25)" stroke-width="1" stroke-dasharray="4,3"/>
+      <rect x="1052" y="328" width="44" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.30)" stroke-width="0.8"/>
+      <text x="1074" y="337" fill="rgba(45,49,66,0.65)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">ASYNC</text>
+      <text x="1120" y="356" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Fan-out</text>
+      <text x="1120" y="372" fill="#4f5d75" font-size="9" font-family="'Geist Mono', monospace" text-anchor="middle">1 child / URL → SQS</text>
+
+      <rect x="1120" y="416" width="144" height="72" rx="6" fill="#f5f5f5"/>
+      <rect x="1120" y="416" width="144" height="72" rx="6" fill="#ffffff" stroke="#2d3142" stroke-width="1"/>
+      <rect x="1128" y="424" width="52" height="12" rx="2" fill="transparent" stroke="rgba(45,49,66,0.35)" stroke-width="0.8"/>
+      <text x="1154" y="433" fill="rgba(45,49,66,0.75)" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">PROCESS</text>
+      <text x="1192" y="454" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">One competitor</text>
+      <text x="1192" y="472" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">discover or snapshot</text>
+
+      <!-- STORAGE -->
+      <rect x="1340" y="280" width="260" height="140" rx="6" fill="#f5f5f5"/>
+      <rect x="1340" y="280" width="260" height="140" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <rect x="1348" y="288" width="56" height="12" rx="2" fill="transparent" stroke="rgba(79,93,117,0.45)" stroke-width="0.8"/>
+      <text x="1376" y="297" fill="#4f5d75" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">DYNAMODB</text>
+      <text x="1470" y="328" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Targets table</text>
+      <text x="1470" y="348" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">competitors_analysis_</text>
+      <text x="1470" y="362" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">monitoring_targets</text>
+      <text x="1470" y="386" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Snapshots table</text>
+      <text x="1470" y="406" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">competitors_analysys_snapshots</text>
+
+      <rect x="1340" y="520" width="260" height="140" rx="6" fill="#f5f5f5"/>
+      <rect x="1340" y="520" width="260" height="140" rx="6" fill="rgba(45,49,66,0.05)" stroke="#4f5d75" stroke-width="1"/>
+      <rect x="1348" y="528" width="56" height="12" rx="2" fill="transparent" stroke="rgba(79,93,117,0.45)" stroke-width="0.8"/>
+      <text x="1376" y="537" fill="#4f5d75" font-size="7" font-family="'Geist Mono', monospace" text-anchor="middle" letter-spacing="0.08em">RM MONGO</text>
+      <text x="1470" y="568" fill="#2d3142" font-size="12" font-weight="600" font-family="'Geist', sans-serif" text-anchor="middle">Lookup + changes</text>
+      <text x="1470" y="590" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">account_company</text>
+      <text x="1470" y="606" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">strategy_strategy</text>
+      <text x="1470" y="628" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">competitors_changes</text>
+      <text x="1470" y="646" fill="#7a8399" font-size="8" font-family="'Geist Mono', monospace" text-anchor="middle">host · RM_HOST</text>
+
+      <!-- Legend -->
+      <line x1="40" y1="912" x2="1640" y2="912" stroke="rgba(45,49,66,0.10)" stroke-width="0.8"/>
+      <text x="40" y="932" fill="#4f5d75" font-size="8" font-family="'Geist Mono', monospace" letter-spacing="0.14em">LEGEND</text>
+      <rect x="120" y="922" width="16" height="10" rx="2" fill="rgba(235,108,54,0.08)" stroke="#eb6c36" stroke-width="1"/>
+      <text x="144" y="931" fill="#2d3142" font-size="9" font-family="'Geist', sans-serif">Case A / focal</text>
+      <line x1="280" y1="927" x2="308" y2="927" stroke="#2e5aa8" stroke-width="1.2"/>
+      <text x="316" y="931" fill="#2d3142" font-size="9" font-family="'Geist', sans-serif">RM read / change write</text>
+      <line x1="500" y1="927" x2="528" y2="927" stroke="#4f5d75" stroke-width="1" stroke-dasharray="4,3"/>
+      <text x="536" y="931" fill="#2d3142" font-size="9" font-family="'Geist', sans-serif">Fan-out republish</text>
+      <text x="720" y="931" fill="#7a8399" font-size="9" font-family="'Geist Mono', monospace">~80px gutters between blocks · scroll horizontally if needed</text>
+    </svg>
+    </div>
+
+    <div class="cards">
+      <div class="card focal">
+        <p class="eyebrow">INPUT SCHEMA</p>
+        <h3>SQS message body</h3>
+        <pre>{
+  "company_domain_id": "marketingeye.com.au",
+  "competitor_lst": ["https://…"] | null,
+  "host": "dev" | "prod"
+}</pre>
+        <p style="margin-top:0.65rem">
+          <code>company_domain_id</code> = client tenant ·
+          empty/null <code>competitor_lst</code> → Case A ·
+          omitted <code>host</code> defaults to <code>dev</code>.
+        </p>
+      </div>
+      <div class="card">
+        <p class="eyebrow">CASE A · EMPTY</p>
+        <h3><code>competitor_lst</code> is null or []</h3>
+        <p>
+          Do not invent URLs. Read RM Mongo by message <code>host</code>:
+          <code>account_company</code> → Primary <code>strategy_strategy</code> →
+          non-blank <code>competitors_client.website</code> values.
+          No match / no Primary / zero URLs → acknowledge and skip.
+        </p>
+      </div>
+      <div class="card">
+        <p class="eyebrow">CASE B · FILLED</p>
+        <h3><code>competitor_lst</code> has entries</h3>
+        <p>
+          Skip RM strategy lookup. Drop malformed URLs, dedupe the rest.
+          The surviving list is the URL set for routing — same merge point as Case A.
+        </p>
+      </div>
+      <div class="card">
+        <p class="eyebrow">AFTER BOTH CASES</p>
+        <h3>Same routing rules</h3>
+        <p>
+          <strong>0</strong> → skip · <strong>2+</strong> → fan-out to SQS ·
+          <strong>1</strong> → discover or snapshot that competitor, then DynamoDB / RM writes.
+        </p>
+      </div>
+    </div>
+
+    <footer>
+      diagram-design · default skin · architecture · docs/diagrams/production-ingestion-workflow.html
+    </footer>
+  </div>
+</body>
+</html>
