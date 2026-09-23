@@ -236,23 +236,41 @@ recorded as `DISCARDED`; no leaf URL is guessed as a substitute. This keeps
 liveness validation in the final Stage 1 discovery step, before classification
 and before any candidate can be offered for Layer 2 activation.
 
-### Stage 2 — Classification (rule-first, LLM only as fallback)
+### Stage 2 — Classification (rule-first, configured provider fallback)
 
 1. Try keyword/pattern rules first (free): match normalized path segments and
    page title against known terms — pricing, blog, news, product, press,
    about, careers, team, CEO. A confident rule match classifies the candidate
    directly; no LLM call is made.
-2. Only candidates the rules can't confidently classify go to an LLM call.
-   Batch all of a competitor's unresolved candidates into a single structured
-   (JSON) request rather than one call per URL. Use a low-cost model
-   (e.g. `gpt-5-nano`) for this — it's a coarse relevance filter, not a task
-   that needs a frontier model. See §22 Cost Strategy.
+2. Only candidates the rules can't confidently classify go to the configured
+   `DISCOVERY_CLASSIFIER_PROVIDER` (`openai`, `openrouter`, or `open-jev`).
+   OpenAI and OpenRouter use one batched structured-JSON request per competitor.
+   Open-Jev is a separate HTTP service and receives one candidate state at a
+   time, returning typed `Choice` answers rather than generated JSON. See §22
+   Cost Strategy and the Open-Jev deployment note below.
 3. Output for every candidate: `page_type`, `discovery_status`
-   (`SUGGESTED` or `DISCARDED`), and `classification_method` (`RULE` or
-   `LLM`). Discarded candidates are **not** deleted — they stay visible at low
-   priority so a wrong LLM/rule call doesn't silently hide a page the user
-   would have wanted. Only `SUGGESTED` candidates need to become active
-   Layer 2 targets on their own; the user still decides (§19 Layer 1 UX).
+   (`SUGGESTED` or `DISCARDED`), and `classification_method` (`RULE`, `LLM`,
+   `JEV`, or `FALLBACK`). Discarded candidates are **not** deleted — they stay
+   visible at low priority so a wrong provider/rule call doesn't silently hide
+   a page the user would have wanted. A provider failure fails closed for the
+   affected batch with deterministic `OTHER`/`DISCARDED` rows marked
+   `FALLBACK`; it does not call a second provider. Only `SUGGESTED` candidates
+   need to become active Layer 2 targets on their own; the user still decides
+   (§19 Layer 1 UX).
+
+Open-Jev deployments are operated outside Flask. Flask installs no PyTorch,
+Transformers, or model weights and communicates with
+`OPEN_JEV_ENDPOINT` (default `http://127.0.0.1:8791/v1/systemone`) over HTTP.
+The deployment must pin both the Open-Jev checkpoint revision and the exact
+base-model revision: the published [Open-Jev 2B model
+card](https://huggingface.co/ZefanCai/Open-Jev-2B) describes an adapter and
+decision head, not a standalone generic Qwen 2B model. The
+[Open-Jev API](https://github.com/Zefan-Cai/Open-Jev) service should therefore be deployed
+with the intended compatible base model and checkpoint revisions explicitly
+recorded by the operator. Deployment review must reject floating `main`,
+`latest`, or unpinned model references; record the immutable Open-Jev
+checkpoint revision and compatible base-model revision alongside the service
+configuration.
 
 ---
 
@@ -566,7 +584,7 @@ url                       # normalized URL — this is what gets monitored
 page_type
 discovery_source          # ROBOTS | SITEMAP | LINKS | MANUAL
 discovery_status          # SUGGESTED | DISCARDED | ACTIVE
-classification_method     # RULE | LLM | MANUAL
+classification_method     # RULE | LLM | JEV | FALLBACK | MANUAL
 active
 check_interval_minutes
 last_checked_at

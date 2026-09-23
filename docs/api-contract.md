@@ -116,6 +116,13 @@ collection. A candidate is persisted with `active=false` until activation.
 
 `DISCARDED` rows remain queryable and are never hidden by deletion.
 
+`classification_method` is one of `RULE`, `LLM`, `JEV`, `FALLBACK`, or
+`MANUAL`. `JEV` identifies a successful Open-Jev typed-decision result.
+`FALLBACK` identifies a deterministic `OTHER`/`DISCARDED` row created when the
+configured discovery provider failed; the affected batch is not retried with a
+second provider. Confidence values used by Open-Jev gating remain internal and
+are not exposed in this API.
+
 ### `POST /competitors/<id>/candidates`
 
 Add a manual candidate for later review (Step 1.3b).

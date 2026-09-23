@@ -9,10 +9,15 @@ from unittest.mock import patch
 
 from backend.flask.discovery.classification import (
     CandidateForClassification,
+    ClassificationError,
+    ClassifierConfigurationError,
     ClassificationResult,
     DeterministicStubClassifier,
+    OpenJevClassifier,
+    OpenJevClassifierConfigurationError,
     OpenAIClassifier,
     OpenAIClassifierConfigurationError,
+    build_classifier_from_env,
     classify_by_rules,
     classify_candidates,
     resolve_classifier_batch_size,
@@ -365,6 +370,57 @@ class _RecordingLLMProvider:
             }
         )
         return self.payload
+
+
+def _open_jev_payload(
+    *,
+    page_type="SERVICES",
+    discovery_status="SUGGESTED",
+    page_type_confidence=0.9,
+    status_confidence=0.9,
+):
+    page_type_labels = ["BLOG", "NEWS", "PRICING", "PRODUCTS", "SERVICES", "PRESS", "OTHER"]
+    page_type_rest = (1 - page_type_confidence) / (len(page_type_labels) - 1)
+    page_type_probabilities = {
+        label: (page_type_confidence if label == page_type else page_type_rest)
+        for label in page_type_labels
+    }
+    status_labels = ["SUGGESTED", "DISCARDED"]
+    status_probabilities = {
+        label: (status_confidence if label == discovery_status else 1 - status_confidence)
+        for label in status_labels
+    }
+    return {
+        "answers": {
+            "page_type": {
+                "type": "choice",
+                "choice": page_type,
+                "probabilities": page_type_probabilities,
+                "confidence": page_type_confidence,
+            },
+            "discovery_status": {
+                "type": "choice",
+                "choice": discovery_status,
+                "probabilities": status_probabilities,
+                "confidence": status_confidence,
+            },
+        }
+    }
+
+
+class _RecordingOpenJevProvider:
+    def __init__(self, payload):
+        self.payload = payload
+        self.calls = []
+
+    def ask(self, state, questions):
+        self.calls.append({"state": state, "questions": questions})
+        return self.payload
+
+
+class _FailingOpenJevProvider:
+    def ask(self, state, questions):
+        raise RuntimeError("Open-Jev unavailable")
 
 
 class _FailingClassifier:
@@ -1602,6 +1658,168 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(result.discovery_status, "DISCARDED")
         self.assertEqual(result.classification_method, "LLM")
 
+    def test_open_jev_classifier_parses_typed_choices_and_sends_candidate_state(self):
+        candidate = CandidateForClassification(
+            "https://example.com/raw-services",
+            "https://example.com/services",
+            title="Services",
+            meta_description="Our service categories",
+            sources=("SITEMAP", "LINKS"),
+        )
+        provider = _RecordingOpenJevProvider(_open_jev_payload())
+
+        result = OpenJevClassifier(provider=provider).classify((candidate,))[0]
+
+        self.assertEqual(result.page_type, "SERVICES")
+        self.assertEqual(result.discovery_status, "SUGGESTED")
+        self.assertEqual(result.classification_method, "JEV")
+        self.assertEqual(
+            provider.calls[0]["state"],
+            {
+                "url": "https://example.com/services",
+                "title": "Services",
+                "meta_description": "Our service categories",
+                "discovery_sources": ["SITEMAP", "LINKS"],
+            },
+        )
+        self.assertEqual(
+            set(provider.calls[0]["questions"]),
+            {"page_type", "discovery_status"},
+        )
+        self.assertTrue(
+            all(
+                question["type"] == "choice"
+                for question in provider.calls[0]["questions"].values()
+            )
+        )
+
+    def test_open_jev_confidence_gate_is_inclusive_at_threshold(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        for confidence, expected_status in (
+            (0.74, "DISCARDED"),
+            (0.75, "SUGGESTED"),
+            (0.76, "SUGGESTED"),
+        ):
+            with self.subTest(confidence=confidence):
+                classifier = OpenJevClassifier(
+                    provider=_RecordingOpenJevProvider(
+                        _open_jev_payload(
+                            page_type_confidence=confidence,
+                            status_confidence=confidence,
+                        )
+                    )
+                )
+                result = classifier.classify((candidate,))[0]
+                self.assertEqual(result.discovery_status, expected_status)
+                self.assertEqual(result.classification_method, "JEV")
+
+    def test_open_jev_other_is_always_discarded(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        result = OpenJevClassifier(
+            provider=_RecordingOpenJevProvider(
+                _open_jev_payload(
+                    page_type="OTHER",
+                    discovery_status="SUGGESTED",
+                    page_type_confidence=0.99,
+                    status_confidence=0.99,
+                )
+            )
+        ).classify((candidate,))[0]
+
+        self.assertEqual(result.page_type, "OTHER")
+        self.assertEqual(result.discovery_status, "DISCARDED")
+        self.assertEqual(result.classification_method, "JEV")
+
+    def test_open_jev_rejects_malformed_incomplete_and_unexpected_answers(self):
+        candidate = CandidateForClassification("raw", "https://example.com/opaque")
+        malformed_payloads = []
+
+        missing_answer = _open_jev_payload()
+        del missing_answer["answers"]["page_type"]
+        malformed_payloads.append(missing_answer)
+
+        extra_answer = _open_jev_payload()
+        extra_answer["answers"]["unexpected"] = {}
+        malformed_payloads.append(extra_answer)
+
+        wrong_type = _open_jev_payload()
+        wrong_type["answers"]["page_type"]["type"] = "text"
+        malformed_payloads.append(wrong_type)
+
+        invalid_choice = _open_jev_payload()
+        invalid_choice["answers"]["page_type"]["choice"] = "CAREERS"
+        malformed_payloads.append(invalid_choice)
+
+        missing_probability = _open_jev_payload()
+        del missing_probability["answers"]["page_type"]["probabilities"]["OTHER"]
+        malformed_payloads.append(missing_probability)
+
+        out_of_range_probability = _open_jev_payload()
+        out_of_range_probability["answers"]["page_type"]["probabilities"]["SERVICES"] = 1.1
+        malformed_payloads.append(out_of_range_probability)
+
+        invalid_confidence = _open_jev_payload()
+        invalid_confidence["answers"]["discovery_status"]["confidence"] = -0.01
+        malformed_payloads.append(invalid_confidence)
+
+        for payload in malformed_payloads:
+            with self.subTest(payload=payload), self.assertRaises(ClassificationError):
+                OpenJevClassifier(
+                    provider=_RecordingOpenJevProvider(payload)
+                ).classify((candidate,))
+
+    def test_classifier_factory_selects_open_jev_and_validates_configuration(self):
+        classifier = build_classifier_from_env(
+            {
+                "DISCOVERY_CLASSIFIER_PROVIDER": "open-jev",
+                "OPEN_JEV_ENDPOINT": "http://jev.test/v1/systemone",
+                "OPEN_JEV_MODEL": "jev-test",
+                "OPEN_JEV_TIMEOUT_SECONDS": "4.5",
+                "DISCOVERY_JEV_MIN_CONFIDENCE": "0.76",
+            },
+            opener=lambda request, timeout: None,
+        )
+
+        self.assertIsInstance(classifier, OpenJevClassifier)
+        self.assertEqual(classifier.endpoint, "http://jev.test/v1/systemone")
+        self.assertEqual(classifier.model, "jev-test")
+        self.assertEqual(classifier.timeout_seconds, 4.5)
+        self.assertEqual(classifier.min_confidence, 0.76)
+
+        with self.assertRaises(ClassifierConfigurationError):
+            build_classifier_from_env({"DISCOVERY_CLASSIFIER_PROVIDER": "anthropic"})
+        with self.assertRaises(OpenJevClassifierConfigurationError):
+            build_classifier_from_env(
+                {
+                    "DISCOVERY_CLASSIFIER_PROVIDER": "open-jev",
+                    "DISCOVERY_JEV_MIN_CONFIDENCE": "1.1",
+                },
+                opener=lambda request, timeout: None,
+            )
+
+    def test_classifier_factory_keeps_openai_as_default(self):
+        classifier = build_classifier_from_env(
+            {"OPENAI_KEY": "test-key-not-used"},
+            client=_FakeOpenAIClient({"classifications": []}),
+        )
+        self.assertIsInstance(classifier, OpenAIClassifier)
+
+    def test_classifier_factory_selects_openrouter_without_changing_llm_contract(self):
+        classifier = build_classifier_from_env(
+            {
+                "DISCOVERY_CLASSIFIER_PROVIDER": "openrouter",
+                "OPENROUTER_API_KEY": "test-key-not-used",
+            },
+            client=_FakeChatClient(
+                json.dumps(
+                    {
+                        "classifications": [],
+                    }
+                )
+            ),
+        )
+        self.assertIsInstance(classifier, OpenAIClassifier)
+
     def test_openai_classifier_uses_configured_model_and_structured_batch(self):
         candidates = (
             CandidateForClassification(
@@ -1858,7 +2076,21 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(classifier.calls, 1)
         self.assertEqual(results[0].page_type, "OTHER")
         self.assertEqual(results[0].discovery_status, "DISCARDED")
-        self.assertEqual(results[0].classification_method, "LLM")
+        self.assertEqual(results[0].classification_method, "FALLBACK")
+
+    def test_open_jev_failure_degrades_to_fallback_without_a_second_provider(self):
+        classifier = OpenJevClassifier(provider=_FailingOpenJevProvider())
+        candidate = CandidateForClassification(
+            "https://example.com/opaque",
+            "https://example.com/opaque",
+        )
+
+        results = classify_candidates((candidate,), classifier)
+
+        self.assertEqual(classifier.call_count, 1)
+        self.assertEqual(results[0].page_type, "OTHER")
+        self.assertEqual(results[0].discovery_status, "DISCARDED")
+        self.assertEqual(results[0].classification_method, "FALLBACK")
 
     def test_discovery_continues_after_one_failed_classifier_batch(self):
         target_repository = _FakeTargetRepository()
@@ -2196,13 +2428,13 @@ class DiscoveryTests(unittest.TestCase):
         self.assertEqual(persisted[0]["url"], "https://example.com/ambiguous")
         self.assertEqual(persisted[0]["page_type"], "OTHER")
         self.assertEqual(persisted[0]["discovery_status"], "DISCARDED")
-        self.assertEqual(persisted[0]["classification_method"], "LLM")
+        self.assertEqual(persisted[0]["classification_method"], "FALLBACK")
 
     def test_discovery_service_defaults_to_stub_when_provider_is_unconfigured(self):
         target_repository = _FakeTargetRepository()
         with patch(
-            "backend.flask.discovery.service.OpenAIClassifier.from_env",
-            side_effect=OpenAIClassifierConfigurationError("OPENAI_KEY is not configured"),
+            "backend.flask.discovery.service.build_classifier_from_env",
+            side_effect=ClassifierConfigurationError("OPENAI_KEY is not configured"),
         ):
             service = DiscoveryService(
                 _FakeCompetitorRepository(

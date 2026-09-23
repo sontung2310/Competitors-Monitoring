@@ -237,7 +237,7 @@ DISCARDED) and the finalized monitored set (`active`/`discovery_status=ACTIVE`).
 ever needs the second half of that — pages actually being watched — so the DynamoDB table is
 deliberately narrower:
 
-- Only rows with `discovery_status = "SUGGESTED"` (the label the rule-based/LLM classifier already
+- Only rows with `discovery_status = "SUGGESTED"` (the label the rule-based/configured provider classifier already
   produces) are written. `DISCARDED` candidates are never written to DynamoDB at all, to avoid
   paying to store rows production has no reviewer to look at.
 - A row's mere presence in the table means it is currently tracked — there is no separate
@@ -271,7 +271,7 @@ which isn't enough on its own:
 | --- | --- | --- | --- |
 | `_id` | ObjectId, Mongo-generated | `_id` (String) | DynamoDB doesn't auto-generate ids; minted ourselves before every `PutItem`, in Mongo ObjectId *format*, just stringified, so nothing downstream has to care the id "looks different." |
 | `competitor_id` | ObjectId | `competitor_id` (String) | Same value, stringified — the competitor itself is unaffected and still lives in Mongo. |
-| `raw_url`, `url`, `page_type`, `discovery_source`, `classification_method`, `check_interval_minutes`, `last_checked_at`, `last_changed_at` | as today | unchanged, same meaning | Timestamps become ISO-8601 strings (DynamoDB has no native datetime type). |
+| `raw_url`, `url`, `page_type`, `discovery_source`, `classification_method`, `check_interval_minutes`, `last_checked_at`, `last_changed_at` | as today | unchanged, same meaning | `classification_method` is `RULE`, `LLM`, `JEV`, `FALLBACK`, or `MANUAL`. Timestamps become ISO-8601 strings (DynamoDB has no native datetime type). |
 | `discovery_status` | `SUGGESTED`/`ACTIVE`/`DISCARDED` | always `"SUGGESTED"` | `DISCARDED` rows are never written. Every row that exists is tracked, so this value never varies — kept only as a label of how it got here (classifier output), not a lifecycle. |
 | `active` | boolean | **dropped** | With "row exists = tracked," this flag would always be `true` for any row you could find — redundant, so it isn't stored. |
 | `created_at`, `updated_at` | datetime | ISO-8601 strings | Same meaning. |

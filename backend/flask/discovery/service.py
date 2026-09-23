@@ -30,9 +30,9 @@ from .audit import (
 from .classification import (
     CandidateClassifier,
     CandidateForClassification,
+    ClassifierConfigurationError,
     DeterministicStubClassifier,
-    OpenAIClassifier,
-    OpenAIClassifierConfigurationError,
+    build_classifier_from_env,
     classify_by_rules,
     classify_candidates,
     resolve_classifier_batch_size,
@@ -1216,7 +1216,7 @@ def _normalize_candidate_status(status: str) -> str:
 
 
 def _default_classifier() -> CandidateClassifier:
-    """Use configured OpenAI classification without making configuration fatal.
+    """Use the configured candidate classifier without making configuration fatal.
 
     Discovery remains usable in environments without an API key. Runtime
     provider failures are handled by ``classify_candidates``; configuration
@@ -1224,14 +1224,14 @@ def _default_classifier() -> CandidateClassifier:
     """
 
     try:
-        return OpenAIClassifier.from_env()
-    except OpenAIClassifierConfigurationError as exc:
+        return build_classifier_from_env()
+    except ClassifierConfigurationError as exc:
         logger.warning(
-            "OpenAI candidate classifier is unavailable; using deterministic "
+            "candidate classifier is unavailable; using deterministic "
             "discarded fallback: %s",
             exc,
         )
-        return DeterministicStubClassifier()
+        return DeterministicStubClassifier(classification_method="FALLBACK")
 
 
 def _default_discovery_audit() -> DiscoveryAuditClassifier:
