@@ -9,8 +9,11 @@ provider boundary without coupling LLM plumbing to either data path.
 from __future__ import annotations
 
 import json
+import math
 import os
 from typing import Any, Mapping, Protocol
+from urllib.error import HTTPError, URLError
+from urllib.request import Request, urlopen
 
 
 OPENAI_API_KEY_ENV_VAR = "OPENAI_KEY"
@@ -23,6 +26,13 @@ OPENROUTER_API_KEY_ENV_VAR = "OPENROUTER_API_KEY"
 OPENROUTER_MODEL_ENV_VAR = "OPENROUTER_MODEL"
 DEFAULT_OPENROUTER_MODEL = "deepseek/deepseek-v4-flash-0731"
 OPENROUTER_BASE_URL = "https://openrouter.ai/api/v1"
+
+OPEN_JEV_ENDPOINT_ENV_VAR = "OPEN_JEV_ENDPOINT"
+DEFAULT_OPEN_JEV_ENDPOINT = "http://127.0.0.1:8791/v1/systemone"
+OPEN_JEV_MODEL_ENV_VAR = "OPEN_JEV_MODEL"
+DEFAULT_OPEN_JEV_MODEL = "open-jev"
+OPEN_JEV_TIMEOUT_ENV_VAR = "OPEN_JEV_TIMEOUT_SECONDS"
+DEFAULT_OPEN_JEV_TIMEOUT_SECONDS = 30.0
 
 
 class LLMProviderError(RuntimeError):
@@ -321,6 +331,124 @@ class OpenRouterProvider:
         return decoded
 
 
+class OpenJevProvider:
+    """HTTP adapter for a local Open-Jev typed-decision server.
+
+    Open-Jev does not generate JSON text. It returns an ``answers`` mapping
+    containing typed decisions, so this provider deliberately exposes ``ask``
+    instead of pretending to implement the text-generation provider contract.
+    """
+
+    def __init__(
+        self,
+        *,
+        endpoint: str = DEFAULT_OPEN_JEV_ENDPOINT,
+        model: str = DEFAULT_OPEN_JEV_MODEL,
+        timeout_seconds: float = DEFAULT_OPEN_JEV_TIMEOUT_SECONDS,
+        opener: Any | None = None,
+    ) -> None:
+        if not isinstance(endpoint, str) or not endpoint.strip():
+            raise LLMProviderConfigurationError(
+                "Open-Jev endpoint must be a non-empty URL"
+            )
+        if not isinstance(model, str) or not model.strip():
+            raise LLMProviderConfigurationError("Open-Jev model must be non-empty")
+        if (
+            isinstance(timeout_seconds, bool)
+            or not isinstance(timeout_seconds, (int, float))
+            or timeout_seconds <= 0
+            or not math.isfinite(timeout_seconds)
+        ):
+            raise LLMProviderConfigurationError(
+                "Open-Jev timeout_seconds must be positive"
+            )
+        self.endpoint = endpoint.strip()
+        self.model = model.strip()
+        self.timeout_seconds = float(timeout_seconds)
+        self.opener = urlopen if opener is None else opener
+
+    @classmethod
+    def from_env(
+        cls,
+        environ: Mapping[str, str] | None = None,
+        *,
+        opener: Any | None = None,
+    ) -> "OpenJevProvider":
+        if environ is None:
+            _load_dotenv()
+            values: Mapping[str, str] = os.environ
+        else:
+            values = environ
+
+        raw_timeout = values.get(
+            OPEN_JEV_TIMEOUT_ENV_VAR,
+            str(DEFAULT_OPEN_JEV_TIMEOUT_SECONDS),
+        )
+        try:
+            timeout_seconds = float(raw_timeout)
+        except (TypeError, ValueError) as exc:
+            raise LLMProviderConfigurationError(
+                f"{OPEN_JEV_TIMEOUT_ENV_VAR} must be positive"
+            ) from exc
+        return cls(
+            endpoint=values.get(OPEN_JEV_ENDPOINT_ENV_VAR, DEFAULT_OPEN_JEV_ENDPOINT),
+            model=values.get(OPEN_JEV_MODEL_ENV_VAR, DEFAULT_OPEN_JEV_MODEL),
+            timeout_seconds=timeout_seconds,
+            opener=opener,
+        )
+
+    def ask(
+        self,
+        state: Mapping[str, Any],
+        questions: Mapping[str, Any],
+    ) -> Mapping[str, Any]:
+        if not isinstance(state, Mapping):
+            raise ValueError("Open-Jev state must be a mapping")
+        if not isinstance(questions, Mapping) or not questions:
+            raise ValueError("Open-Jev questions must be a non-empty mapping")
+
+        body = json.dumps(
+            {
+                "model": self.model,
+                "state": dict(state),
+                "questions": dict(questions),
+            },
+            ensure_ascii=False,
+            allow_nan=False,
+        ).encode("utf-8")
+        request = Request(
+            self.endpoint,
+            data=body,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with self.opener(request, timeout=self.timeout_seconds) as response:
+                raw_response = response.read()
+        except HTTPError as exc:
+            raise LLMProviderError(
+                f"Open-Jev request failed with HTTP {exc.code}"
+            ) from exc
+        except (OSError, URLError, TimeoutError) as exc:
+            raise LLMProviderError("Open-Jev request failed") from exc
+
+        try:
+            decoded = json.loads(raw_response)
+        except (TypeError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise LLMProviderResponseError(
+                "Open-Jev response was not valid JSON"
+            ) from exc
+        if not isinstance(decoded, Mapping):
+            raise LLMProviderResponseError(
+                "Open-Jev response must be an object"
+            )
+        if "error" in decoded:
+            raise LLMProviderResponseError(
+                f"Open-Jev response contained an error: {decoded['error']}"
+            )
+        return decoded
+
+
 def _to_chat_completions_response_format(
     response_format: Mapping[str, Any],
 ) -> dict[str, Any]:
@@ -394,6 +522,13 @@ __all__ = [
     "OPENROUTER_API_KEY_ENV_VAR",
     "OPENROUTER_MODEL_ENV_VAR",
     "OPENROUTER_BASE_URL",
+    "OPEN_JEV_ENDPOINT_ENV_VAR",
+    "DEFAULT_OPEN_JEV_ENDPOINT",
+    "OPEN_JEV_MODEL_ENV_VAR",
+    "DEFAULT_OPEN_JEV_MODEL",
+    "OPEN_JEV_TIMEOUT_ENV_VAR",
+    "DEFAULT_OPEN_JEV_TIMEOUT_SECONDS",
     "OpenAIProvider",
     "OpenRouterProvider",
+    "OpenJevProvider",
 ]

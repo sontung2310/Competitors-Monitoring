@@ -3,12 +3,14 @@ from __future__ import annotations
 import json
 import unittest
 from types import SimpleNamespace
+from urllib.error import HTTPError, URLError
 
 from backend.flask.llm_provider import (
     LLMProviderConfigurationError,
     LLMProviderError,
     LLMProviderResponseError,
     OpenAIProvider,
+    OpenJevProvider,
     OpenRouterProvider,
 )
 
@@ -35,6 +37,33 @@ class _FailingResponses:
 
 class _FailingClient:
     responses = _FailingResponses()
+
+
+class _FakeHTTPResponse:
+    def __init__(self, payload):
+        self.payload = payload
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback):
+        return False
+
+    def read(self):
+        return self.payload
+
+
+class _RecordingOpener:
+    def __init__(self, payload=None, error=None):
+        self.payload = payload
+        self.error = error
+        self.calls = []
+
+    def __call__(self, request, *, timeout):
+        self.calls.append({"request": request, "timeout": timeout})
+        if self.error is not None:
+            raise self.error
+        return _FakeHTTPResponse(self.payload)
 
 
 class LLMProviderTests(unittest.TestCase):
@@ -228,6 +257,78 @@ class OpenRouterProviderTests(unittest.TestCase):
         )
         with self.assertRaisesRegex(LLMProviderError, "OpenRouter request failed"):
             failing_provider.generate("make a fixture", instructions="return text")
+
+
+class OpenJevProviderTests(unittest.TestCase):
+    def test_provider_uses_environment_configuration_and_returns_typed_response(self):
+        payload = {"answers": {"page_type": {"type": "choice"}}}
+        opener = _RecordingOpener(json.dumps(payload).encode("utf-8"))
+        provider = OpenJevProvider.from_env(
+            {
+                "OPEN_JEV_ENDPOINT": "http://jev.test/v1/systemone",
+                "OPEN_JEV_MODEL": "jev-test",
+                "OPEN_JEV_TIMEOUT_SECONDS": "4.5",
+            },
+            opener=opener,
+        )
+
+        result = provider.ask(
+            {
+                "url": "https://example.com/services",
+                "title": "Services",
+                "meta_description": None,
+                "discovery_sources": ["SITEMAP"],
+            },
+            {"page_type": {"type": "choice"}},
+        )
+
+        self.assertEqual(result, payload)
+        call = opener.calls[0]
+        self.assertEqual(call["timeout"], 4.5)
+        self.assertEqual(call["request"].full_url, "http://jev.test/v1/systemone")
+        self.assertEqual(
+            json.loads(call["request"].data.decode("utf-8")),
+            {
+                "model": "jev-test",
+                "state": {
+                    "url": "https://example.com/services",
+                    "title": "Services",
+                    "meta_description": None,
+                    "discovery_sources": ["SITEMAP"],
+                },
+                "questions": {"page_type": {"type": "choice"}},
+            },
+        )
+
+    def test_provider_rejects_invalid_configuration(self):
+        with self.assertRaises(LLMProviderConfigurationError):
+            OpenJevProvider(endpoint="", model="jev")
+        with self.assertRaises(LLMProviderConfigurationError):
+            OpenJevProvider(endpoint="http://jev.test", model="jev", timeout_seconds=0)
+        with self.assertRaises(LLMProviderConfigurationError):
+            OpenJevProvider(
+                endpoint="http://jev.test", model="jev", timeout_seconds=float("nan")
+            )
+        with self.assertRaises(LLMProviderConfigurationError):
+            OpenJevProvider.from_env({"OPEN_JEV_TIMEOUT_SECONDS": "not-a-number"})
+
+    def test_provider_wraps_timeout_connection_and_http_failures(self):
+        errors = [
+            TimeoutError("timed out"),
+            URLError("connection refused"),
+            HTTPError("http://jev.test", 400, "bad request", {}, None),
+            HTTPError("http://jev.test", 500, "server error", {}, None),
+        ]
+        for error in errors:
+            with self.subTest(error=error), self.assertRaises(LLMProviderError):
+                OpenJevProvider(opener=_RecordingOpener(error=error)).ask({}, {"q": {}})
+
+    def test_provider_rejects_malformed_or_error_json(self):
+        for payload in (b"not json", b"[]", b'{"error":"inference failed"}'):
+            with self.subTest(payload=payload), self.assertRaises(LLMProviderResponseError):
+                OpenJevProvider(opener=_RecordingOpener(payload=payload)).ask(
+                    {}, {"q": {}}
+                )
 
 
 if __name__ == "__main__":

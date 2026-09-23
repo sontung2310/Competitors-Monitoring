@@ -11,7 +11,9 @@ deferred to roadmap Step 5.
 
 - Python 3.11 or newer
 - A MongoDB database, typically MongoDB Atlas for the live PoC data
-- An OpenAI API key for discovery fallback classification and optional narrative enrichment
+- Either an OpenAI/OpenRouter configuration for discovery fallback classification
+  or a separately running Open-Jev service; an OpenAI key is still used for
+  optional narrative enrichment
 - Chromium for Playwright’s browser-fetch fallback
 
 ## Installation
@@ -44,6 +46,14 @@ MONGODB_DATABASE=competitor_monitoring
 # OPENAI_API_KEY is also accepted for compatibility.
 OPENAI_KEY=<your-openai-api-key>
 OPENAI_MODEL=<model-name>
+
+# Optional discovery provider: openai (default), openrouter, or open-jev
+DISCOVERY_CLASSIFIER_PROVIDER=openai
+# Open-Jev is an external HTTP service; Flask does not install its model stack.
+# OPEN_JEV_ENDPOINT=http://127.0.0.1:8791/v1/systemone
+# OPEN_JEV_MODEL=open-jev
+# OPEN_JEV_TIMEOUT_SECONDS=30
+# DISCOVERY_JEV_MIN_CONFIDENCE=0.75
 
 APP_USER_ID=default-user
 DJANGO_SECRET_KEY=<local-development-secret>
